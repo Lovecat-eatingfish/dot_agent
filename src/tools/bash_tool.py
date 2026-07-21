@@ -65,13 +65,81 @@ def run_bash(
     """
 
     :param state:
-    :param command:
-    :param timeout_seconds:
+    :param command: 要执行的bash命令
+    :param timeout_seconds: 超时时间，单位秒
     :param run_in_background:  是不是后台运行
-    :return:
+    :return: 命令执行结果: 就是subprocess.Popen对象的字典表示
     """
+    # 参数校验和处理
     if not command.strip():
-        pass
+        return {"ok": False, "error": "command must not be empty"}
+    max_timeout = _state_int(state, "bash_max_timeout_seconds", DEFAULT_MAX_TIMEOUT_SECONDS)
+    timeout = _coerce_timeout(timeout_seconds)
+    if timeout_seconds is None:
+        timeout = _state_int(state, "bash_default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    if timeout <= 0 or timeout > max_timeout:
+        return {"ok": False, "error": f"timeout_seconds must be between 1 and {max_timeout}"}
+    normalized_command = _normalize_command(command)
+    background = _coerce_bool(run_in_background)
+
+    # 处理tail命令
+    handled = _handle_tail_command(state, normalized_command)
+    if handled is not None:
+        return handled
+    # 处理工作区查询命令
+    handled = _handle_workspace_query(state, normalized_command)
+    if handled is not None:
+        return handled
+
+    # 判断是否危险命令
+    blocked = _looks_dangerous(normalized_command)
+    if blocked:
+        return {"ok": False, "error": f"blocked potentially dangerous command pattern: {blocked}"}
+
+    # 处理审批
+    approval = _resolve_approval(state, normalized_command)
+    if approval is not None and not approval.get("approved"):
+        return approval
+
+    started = time.perf_counter()
+    # 构建命令执行时的环境变量
+    env, env_error = _build_env(state)
+    if env_error is not None:
+        return {"ok": False, "error": env_error}
+    max_output_chars = _state_int(state, "bash_max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
+    if background:
+        return _run_background(state, normalized_command, env, approval)
+    try:
+        # 执行命令
+        completed = subprocess.run(
+            normalized_command,
+            cwd=state.workspace,
+            shell=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "timed_out": True,
+            "exit_code": None,
+            **_format_captured_output(state, _decode_output(exc.stdout), _decode_output(exc.stderr), max_output_chars),
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+            **(approval or {}),
+        }
+
+    output = _format_captured_output(state, _decode_output(completed.stdout), _decode_output(completed.stderr),
+                                     max_output_chars)
+    return {
+        "ok": completed.returncode == 0,
+        "timed_out": False,
+        "command": normalized_command,
+        "exit_code": completed.returncode,
+        **output,
+        "duration_ms": round((time.perf_counter() - started) * 1000),
+        **(approval or {}),
+    }
 
 
 def _resolve_approval(state: RuntimeState, command: str) -> dict[str, Any] | None:
@@ -81,10 +149,12 @@ def _resolve_approval(state: RuntimeState, command: str) -> dict[str, Any] | Non
     :param command:
     :return:
     """
+    # 分类命令风险等级
     risk_reason = classify_command_risk(command)
     if risk_reason is None:
         return None
 
+    # 如果是高风险命令，创建审批请求对象
     request = make_approval_request(command, risk_reason)
     base = {
         "requires_approval": True,
@@ -92,6 +162,7 @@ def _resolve_approval(state: RuntimeState, command: str) -> dict[str, Any] | Non
         "risk_reason": risk_reason,
         "command": command,
     }
+    # 根据不同审批模式 返回不同的结果字典
     if state.approval_mode == "auto":
         return {**base, "approved": True}
     if state.approval_mode == "deny" or state.approval_handler is None:
@@ -102,6 +173,7 @@ def _resolve_approval(state: RuntimeState, command: str) -> dict[str, Any] | Non
             "error": f"human approval required for high-risk command: {risk_reason}",
         }
 
+    # 如果是严格模式，调用审批操作函数获取审批决策
     decision = state.approval_handler(request)
     if isinstance(decision, ApprovalDecision):
         approved = decision.approved
@@ -212,6 +284,7 @@ def _looks_dangerous(command: str) -> str | None:
     return None
 
 
+# 解码输出： 合并所有可能的编码方式，尝试解码，直到成功或使用默认的 utf-8 编码
 def _decode_output(output: bytes | str | None) -> str:
     if output is None:
         return ""
@@ -225,6 +298,7 @@ def _decode_output(output: bytes | str | None) -> str:
     return output.decode("utf-8", errors="replace")
 
 
+# 从state中反射获取 字段 对应的值的整数属性，确保它是一个非负整数
 def _state_int(state: RuntimeState, name: str, default: int) -> int:
     try:
         value = int(getattr(state, name, default))
@@ -233,14 +307,16 @@ def _state_int(state: RuntimeState, name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def _coerce_bool(value: bool | str) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+# 构建命令执行时的环境变量
 def _build_env(state: RuntimeState) -> tuple[dict[str, str], str | None]:
+    # 复制当前Python进程的所有环境变量
+    # 这样子进程就能继承系统的PATH、HOME等配置
     env = os.environ.copy()
+    # PYTHONIOENCODING=utf-8：强制Python的stdout/stderr使用UTF-8编码
+    # PYTHONUTF8=1：启用Python的UTF-8模式（Python 3.7+）
+    # 这两个设置确保命令输出能正确处理中文等非ASCII字符
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
     _prepend_harness_paths(state, env)
@@ -253,6 +329,9 @@ def _build_env(state: RuntimeState) -> tuple[dict[str, str], str | None]:
     return env, None
 
 
+# 把Python、pip、node_modules等路径加到PATH前面
+# 确保执行的python/pip是当前虚拟环境中的，而不是系统全局的
+# 具体逻辑见下面的详细说明
 def _prepend_harness_paths(state: RuntimeState, env: dict[str, str]) -> None:
     path_candidates = [
         _ensure_toolchain_shims(state),
@@ -271,7 +350,7 @@ def _prepend_harness_paths(state: RuntimeState, env: dict[str, str]) -> None:
         env.setdefault("VIRTUAL_ENV", sys.prefix)
 
 
-# 解析幻觉文件
+# 解析state 的环境变量配置文件
 def _parse_env_file(path, base_env: dict[str, str]) -> dict[str, str]:
     parsed: dict[str, str] = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
@@ -304,8 +383,10 @@ def _expand_env_value(value: str, env: dict[str, str]) -> str:
     return re.sub(r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*)", replace_var, value)
 
 
+# 格式化捕获的输出
 def _format_captured_output(state: RuntimeState, stdout: str, stderr: str, max_output_chars: int) -> dict[str, Any]:
     output: dict[str, Any] = {}
+    # 输出的目录文件
     output_dir = state.workspace / ".mokioclaw" / "bash-outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
     if len(stdout) > max_output_chars:

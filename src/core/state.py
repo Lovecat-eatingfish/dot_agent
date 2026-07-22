@@ -1,7 +1,8 @@
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
-
+from typing import Callable, TypedDict, Annotated, Any
+from langchain_core.messages import BaseMessage
+from langgraph.graph import add_messages
 from core.approval import ApprovalRequest, ApprovalDecision
 
 
@@ -13,6 +14,14 @@ class FileSnapshot:
     complete: bool
 
 
+# web search 的搜索结果
+class SourceItem(TypedDict, total=False):
+    title: str
+    url: str
+    content: str
+    score: float
+
+
 @dataclass
 class RuntimeState:
     workspace: Path  # 绝对路径。
@@ -22,6 +31,8 @@ class RuntimeState:
 
     # 审批的操作
     approval_handler: Callable[[ApprovalRequest], ApprovalDecision | bool] | None = None
+
+    source: list[SourceItem] = field(default_factory=list)
 
     # bash操作的配置项目
     bash_default_timeout_seconds: int = 120
@@ -52,3 +63,71 @@ class RuntimeState:
 
     def snapshot_for(self, path):
         return self.read_files.get(path.resolve())
+
+
+# 每一项的todo plan计划
+class TodoItem(TypedDict):
+    id: str
+    content: str
+    status: str
+    note: str
+
+
+# 校验节点的结果， 使用命令校验的结果
+class VerificationResult(TypedDict):
+    command: str
+    ok: bool
+    exit_code: int | None
+    stdout: str
+    stderr: str
+
+
+# agent 的交接流程
+class AgentHandoff(TypedDict, total=False):
+    from_agent: str
+    to_agent: str
+    instruction: str
+    result: str
+
+
+# 检查节点结果
+class VerificationCheck(TypedDict, total=False):
+    name: str
+    passed: bool
+    detail: str
+
+
+class CompressionEvent(TypedDict, total=False):
+    before_tokens: int
+    after_tokens: int
+    removed_messages: int
+    summary: str
+    next_node: str
+
+
+class LayeredMemory(TypedDict, total=False):
+    rules: dict[str, Any]
+    working_memory: dict[str, Any]
+    history_summary_store: dict[str, Any]
+
+
+class DotAgentGraphState(TypedDict, total=False):
+    task: str
+    runtime: RuntimeState
+
+    # 上下文信息
+    session_context: str
+    message: Annotated[list[BaseMessage], add_messages]
+
+    # 意图信息
+    intent_route: str  # chat | plan
+    intent_reason: str  # 意图的原因
+    intent_confidence: float  # 置信度
+    chat_response: str  # 聊天返回地结果
+
+    # 计划信息：
+    plan_summary: str
+    todos: list[TodoItem]
+    acceptance_criteria: list[str]
+    verification_commands: list[str]
+    verification_results: list[VerificationResult]

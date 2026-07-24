@@ -15,8 +15,9 @@ class FileSnapshot:
 
 
 # web search 的搜索结果
+@dataclass(frozen=True)
 class SourceItem(TypedDict, total=False):
-    title: str
+    title: str | None
     url: str
     content: str
     score: float
@@ -117,7 +118,7 @@ class DotAgentGraphState(TypedDict, total=False):
 
     # 上下文信息
     session_context: str
-    message: Annotated[list[BaseMessage], add_messages]
+    messages: Annotated[list[BaseMessage], add_messages]  # 完整的对话消息列表，包含用户消息、AI 回复、工具调用记录等
 
     # 意图信息
     intent_route: str  # chat | plan
@@ -131,3 +132,53 @@ class DotAgentGraphState(TypedDict, total=False):
     acceptance_criteria: list[str]
     verification_commands: list[str]
     verification_results: list[VerificationResult]
+    step_count: int  # 当前任务执行的累计步骤数（跨多轮对话） final_node 中 +1，跨轮次传递
+
+    # 验证的结果
+    passed: bool
+    attempts: int  # 重试的次数
+    max_attempts: int
+
+    # 意图选择的信息
+    intent_route: str
+    intent_reason: str
+    intent_confidence: float
+
+    # 意图选择的是 聊天
+    chat_response: str
+
+    # 重试的次数
+    attempts: int
+    max_attempts: int
+    iteration: int  # 当前轮次内的循环次数（planner → monitor → verifier 循环）
+    max_iterations: int
+
+    # 搜索agent的相关信息
+    research_notes: str
+    sources: list[SourceItem]
+
+    agent_handoffs: list[AgentHandoff]
+    code_agent_summary: str
+    verifier_summary: str
+    verification_checks: list[VerificationCheck]
+
+    # 会话的信息
+    session_id: str
+    session_turn: int
+    session_context: str
+    last_actor_summary: str
+
+    # 上下文压缩相关的
+    context_tokens: int #  当前消息列表消耗的 token 数量估算值
+    context_monitor_counter: int # 上下文监控计数器，每经过一个节点 +1
+    is_context_overflow: bool # 上下文是否溢出（token 超过 context_threshold）
+    context_summary: str
+    context_token_count: int
+    context_token_limit: int
+    context_should_compress: bool
+    context_next_node: str
+    compression_events: list[CompressionEvent]
+    memory_snapshot: LayeredMemory
+    history_summary: str
+    last_error: str
+    metadata: dict[str, Any]

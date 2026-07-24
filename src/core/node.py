@@ -1,12 +1,23 @@
 import json
+import os
 import re
 from typing import Any
 
+import load_dotenv
+from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
-from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage
-from core.state import DotAgentGraphState, TodoItem
+from langchain_core.messages import BaseMessage, SystemMessage, HumanMessage, ToolMessage, AIMessage
+from langgraph.types import StreamWriter
+
+from agents.code_agent import run_code_agent, _last_ai_content
+from agents.search_agent import run_search_agent, _dedupe_sources
+from agents.workflow import verifier_route
+from core.state import DotAgentGraphState, TodoItem, VerificationCheck
+from memory.memory import build_layered_memory, memory_event
 from model.openai_provider import create_model
-from tools.todo_tool import persist_todos
+from prompt.prompt import PLANNER_PROMPT, VERIFIER_PROMPT
+from tools.registry import build_read_only_tools
+from tools.todo_tool import persist_todos, write_todos
 
 AMIYA_TODOS = [
     "研究阿米娅并收集可靠来源链接。",
@@ -54,6 +65,8 @@ CHAT_RESPONDER_PROMPT = """你是 MokioClaw 的轻量级聊天节点。
 
 如果提供了会话上下文，你可以使用最近的对话摘要来回应用户的跟进问题，但不要虚构工作区的事实。
 """
+
+DEFAULT_CONTEXT_TOKEN_LIMIT = 400000
 
 
 # 意图识别节点
@@ -142,7 +155,7 @@ def planner_node(state: DotAgentGraphState) -> dict[str, Any]:
         )
 
     # 构建短期记忆
-    memory = build_layered_memory(working_state, node="planner")
+    memory = build_layered_memory(**working_state, node="planner")
     writer(memory_event(memory, node="planner"))
     model = create_model()
     planner = model.bind_tools(_build_planner_tools(working_state, writer))
@@ -163,10 +176,12 @@ def planner_node(state: DotAgentGraphState) -> dict[str, Any]:
         }
     )
 
+    # 最多调用 8 此工具
     for _ in range(8):
         response = planner.invoke(messages)
         produced_messages.append(response)
         messages.append(response)
+        # 从对象里面获取字段
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
             break
@@ -195,6 +210,375 @@ def planner_node(state: DotAgentGraphState) -> dict[str, Any]:
         "history_summary": final_memory.get("history_summary_store", {}).get("history_summary", ""),
         "metadata": metadata,
         "context_next_node": "verifier",
+    }
+
+
+def context_monitor_node(state: DotAgentGraphState) -> dict[str, Any]:
+    writer = _get_writer()
+    token_limit = get_context_token_limit()
+    token_count = estimate_context_tokens(state)
+    should_compress = token_count >= token_limit
+    next_node = state.get("context_next_node") or "verifier"
+    event = {
+        "type": "context_monitor",
+        "token_count": token_count,
+        "token_limit": token_limit,
+        "should_compress": should_compress,
+        "next_node": next_node,
+        "message_count": len(state.get("messages", [])),
+    }
+    writer(event)
+    return {
+        "context_token_count": token_count,
+        "context_token_limit": token_limit,
+        "context_should_compress": should_compress,
+        "context_next_node": next_node,
+    }
+
+
+def get_context_token_limit() -> int:
+    load_dotenv()
+    raw = os.getenv("MOKIO_CONTEXT_TOKEN_LIMIT", str(DEFAULT_CONTEXT_TOKEN_LIMIT))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_CONTEXT_TOKEN_LIMIT
+    return value if value > 0 else DEFAULT_CONTEXT_TOKEN_LIMIT
+
+
+def verifier_node(state: DotAgentGraphState) -> dict[str, Any]:
+    writer = _get_writer()
+    memory = build_layered_memory(state, node="verifier")
+    writer(memory_event(memory, node="verifier"))
+    writer(
+        {
+            "type": "plan_snapshot",
+            "node": "verifier",
+            "plan_summary": state.get("plan_summary", ""),
+            "todos": state.get("todos", []),
+            "verification_commands": state.get("verification_commands", []),
+        }
+    )
+
+    model = create_model()
+    verifier = model.bind_tools(build_read_only_tools(state["runtime"]))
+    messages: list[Any] = [
+        SystemMessage(content=VERIFIER_PROMPT),
+        HumanMessage(content=_verifier_input(state, memory)),
+    ]
+    produced_messages: list[Any] = []
+    tool_events: list[dict[str, Any]] = []
+
+    for _ in range(8):
+        response = verifier.invoke(messages)
+        produced_messages.append(response)
+        messages.append(response)
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            break
+        for call in tool_calls:
+            writer({"type": "tool_call", "node": "verifier", "name": call.get("name"), "args": call.get("args", {})})
+            tool_message = _execute_read_only_tool(state, call)
+            event = _tool_result_event(tool_message, node="verifier")
+            tool_events.append(event)
+            writer(event)
+            produced_messages.append(tool_message)
+            messages.append(tool_message)
+    else:
+        produced_messages.append(
+            AIMessage(
+                content=json.dumps(
+                    {
+                        "passed": False,
+                        "reason": "Verifier stopped after the maximum tool loop count.",
+                        "checks": [],
+                        "recommended_next_instruction": "Inspect the workspace and complete the unfinished task.",
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        )
+
+    parsed = _extract_json(_last_ai_content(produced_messages)) or {
+        "passed": False,
+        "reason": "Verifier did not return valid JSON.",
+        "checks": [
+            {
+                "name": "verifier_json",
+                "passed": False,
+                "detail": _last_ai_content(produced_messages)[:800],
+            }
+        ],
+        "recommended_next_instruction": "Return valid verifier JSON after inspecting the result.",
+    }
+    checks = _normalize_checks(parsed.get("checks"))
+    passed = bool(parsed.get("passed"))
+    reason = str(parsed.get("reason") or "")
+    recommended = str(parsed.get("recommended_next_instruction") or "")
+    attempts = state.get("attempts", 0) + 1
+    todos = [dict(todo) for todo in state.get("todos", [])]
+    if passed:
+        todos = [
+            {
+                **todo,
+                "status": "completed" if todo.get("status") != "blocked" else todo.get("status", "blocked"),
+                "note": todo.get("note") or "verified",
+            }
+            for todo in todos
+        ]
+        writer(
+            {
+                "type": "todo_update",
+                "node": "verifier",
+                "plan_summary": state.get("plan_summary", ""),
+                "todos": todos,
+                "verification_commands": state.get("verification_commands", []),
+            }
+        )
+    last_error = "" if passed else _format_verifier_error(reason, recommended, tool_events)
+
+    return {
+        "messages": produced_messages,
+        "verification_results": _tool_events_to_verification_results(tool_events),
+        "verification_checks": checks,
+        "verifier_summary": reason,
+        "passed": passed,
+        "attempts": attempts,
+        "last_error": last_error,
+        "todos": todos,
+        "memory_snapshot": memory,
+        "history_summary": memory.get("history_summary_store", {}).get("history_summary", ""),
+        "context_next_node": verifier_route({**state, "passed": passed, "attempts": attempts}),
+    }
+
+
+def _normalize_checks(raw: Any) -> list[VerificationCheck]:
+    if not isinstance(raw, list):
+        return []
+    checks: list[VerificationCheck] = []
+    for item in raw:
+        if isinstance(item, dict):
+            checks.append(
+                {
+                    "name": str(item.get("name") or "check"),
+                    "passed": bool(item.get("passed")),
+                    "detail": str(item.get("detail") or ""),
+                }
+            )
+    return checks
+
+
+def _tool_events_to_verification_results(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    results = []
+    for event in events:
+        result = event.get("result", {})
+        if not isinstance(result, dict):
+            continue
+        results.append(
+            {
+                "command": result.get("command") or event.get("name", ""),
+                "ok": bool(result.get("ok")),
+                "exit_code": result.get("exit_code"),
+                "stdout": str(result.get("stdout", "")),
+                "stderr": str(result.get("stderr") or result.get("error", "")),
+            }
+        )
+    return results
+
+
+def _format_verifier_error(reason: str, recommended: str, tool_events: list[dict[str, Any]]) -> str:
+    event_text = json.dumps(tool_events[-3:], ensure_ascii=False, default=str)[:1600]
+    return (
+        f"Verifier failed: {reason}\n"
+        f"Recommended next instruction: {recommended}\n"
+        f"Recent verifier tool events:\n{event_text}"
+    )
+
+
+def _verifier_input(state: DotAgentGraphState, memory: dict[str, Any]) -> str:
+    parts = [f"Task: {state['task']}"]
+    if state.get("session_context"):
+        parts.append("Session context for this multi-turn coding session:\n" + str(state.get("session_context", "")))
+    parts.append("Layered memory snapshot:\n" + format_layered_memory_for_prompt(memory))
+    parts.append("Inspect the workspace with tools and return only verifier JSON.")
+    return "\n\n".join(parts)
+
+
+def _execute_read_only_tool(state: DotAgentGraphState, call: dict[str, Any]) -> ToolMessage:
+    name = call.get("name", "")
+    args = call.get("args") or {}
+    tools = {tool.name: tool for tool in build_read_only_tools(state["runtime"])}
+    tool = tools.get(name)
+    if tool is None:
+        result = {"ok": False, "error": f"unknown tool: {name}"}
+    else:
+        try:
+            result = tool.invoke(args)
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return ToolMessage(
+        content=json.dumps(result, ensure_ascii=False),
+        name=name,
+        tool_call_id=call.get("id") or f"{name}-call",
+    )
+
+
+def estimate_context_tokens(state: DotAgentGraphState) -> int:
+    messages = list(state.get("messages", []))
+    payload = build_layered_memory(state, node="context_monitor")
+    payload_message = HumanMessage(content=json.dumps(payload, ensure_ascii=False, default=str))
+    try:
+        model = create_model()
+        return int(model.get_num_tokens_from_messages(messages + [payload_message]))
+    except Exception:
+        text = "\n".join(_message_text(message) for message in messages)
+        text += "\n" + payload_message.content
+        return max(1, len(text) // 4)
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content
+    return json.dumps(content, ensure_ascii=False, default=str)
+
+
+def _execute_planner_tool(state: DotAgentGraphState, writer, call: dict[str, Any]) -> ToolMessage:
+    name = call.get("name", "")
+    args = call.get("args") or {}
+    writer({"type": "tool_call", "node": "planner", "name": name, "args": args})
+    tools = {tool.name: tool for tool in _build_planner_tools(state, writer)}
+    tool = tools.get(name)
+    if tool is None:
+        result = {"ok": False, "error": f"unknown tool: {name}"}
+    else:
+        try:
+            result = tool.invoke(args)
+        except Exception as exc:
+            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    tool_message = ToolMessage(
+        content=json.dumps(result, ensure_ascii=False),
+        name=name,
+        tool_call_id=call.get("id") or f"{name}-call",
+    )
+    writer(_tool_result_event(tool_message, node="planner"))
+    return tool_message
+
+
+def _planner_input(state: DotAgentGraphState, memory: dict[str, Any]) -> str:
+    parts = [
+        f"Task: {state['task']}",
+        f"Attempt: {state.get('attempts', 0) + 1}",
+    ]
+    if state.get("session_context"):
+        parts.append("Session context for this multi-turn coding session:\n" + str(state.get("session_context", "")))
+    parts.append("Layered memory snapshot:\n" + format_layered_memory_for_prompt(memory))
+    return "\n\n".join(parts)
+
+
+def format_layered_memory_for_prompt(memory: dict[str, Any]) -> str:
+    return json.dumps(memory, ensure_ascii=False, indent=2, default=str)
+
+
+def _build_planner_tools(state: DotAgentGraphState, writer) -> list[StructuredTool]:
+    return [
+        StructuredTool.from_function(
+            name="TodoWriteTool",
+            func=lambda todos, acceptance_criteria, verification_commands, plan_summary="": _todo_write_tool(
+                state, writer, todos, acceptance_criteria, verification_commands, plan_summary
+            ),
+            description=(
+                "Publish or revise plan state. Args: todos, acceptance_criteria, "
+                "verification_commands, optional plan_summary."
+            ),
+        ),
+        StructuredTool.from_function(
+            name="CallSearchAgentTool",
+            func=lambda instruction: _call_search_agent_tool(state, writer, instruction),
+            description="Delegate research work to searchAgent. Args: instruction.",
+        ),
+        StructuredTool.from_function(
+            name="CallCodeAgentTool",
+            func=lambda instruction: _call_code_agent_tool(state, writer, instruction),
+            description="Delegate implementation work to codeAgent. Args: instruction.",
+        ),
+    ]
+
+
+def _call_search_agent_tool(state: DotAgentGraphState, writer, instruction: str) -> dict[str, Any]:
+    writer({"type": "handoff", "from": "planner", "to": "searchAgent", "instruction": instruction})
+    result = run_search_agent(state, instruction, writer=writer)
+    existing_sources = list(state.get("sources", []))
+    state["research_notes"] = _join_notes(state.get("research_notes", ""), result.get("summary", ""))
+    state["sources"] = _dedupe_sources(existing_sources + list(result.get("sources", [])))
+    handoff = {
+        "from_agent": "planner",
+        "to_agent": "searchAgent",
+        "instruction": instruction,
+        "result": result.get("summary", ""),
+    }
+    state["agent_handoffs"] = list(state.get("agent_handoffs", [])) + [handoff]
+    writer({"type": "handoff_result", "from": "searchAgent", "to": "planner", "result": result.get("summary", "")})
+    return {
+        "ok": True,
+        "summary": result.get("summary", ""),
+        "sources": state.get("sources", []),
+        "queries": result.get("queries", []),
+    }
+
+
+def _call_code_agent_tool(state: DotAgentGraphState, writer, instruction: str) -> dict[str, Any]:
+    writer({"type": "handoff", "from": "planner", "to": "codeAgent", "instruction": instruction})
+    result = run_code_agent(state, instruction, writer=writer)
+    state["todos"] = result.get("todos", state.get("todos", []))
+    state["code_agent_summary"] = result.get("summary", "")
+    state["last_actor_summary"] = result.get("summary", "")
+    handoff = {
+        "from_agent": "planner",
+        "to_agent": "codeAgent",
+        "instruction": instruction,
+        "result": result.get("summary", ""),
+    }
+    state["agent_handoffs"] = list(state.get("agent_handoffs", [])) + [handoff]
+    writer({"type": "handoff_result", "from": "codeAgent", "to": "planner", "result": result.get("summary", "")})
+    return {"ok": True, "summary": result.get("summary", ""), "todos": state.get("todos", [])}
+
+
+def _todo_write_tool(
+        state: DotAgentGraphState,
+        writer,
+        todos: Any,
+        acceptance_criteria: Any,
+        verification_commands: Any,
+        plan_summary: str = "",
+) -> dict[str, Any]:
+    result = write_todos(todos, acceptance_criteria, verification_commands)
+    if result.get("ok"):
+        state["plan_summary"] = plan_summary or state.get("plan_summary") or "MultiAgent plan"
+        state["todos"] = _todo_items(result["todos"], existing=state.get("todos", []))
+        state["acceptance_criteria"] = result["acceptance_criteria"]
+        state["verification_commands"] = result["verification_commands"]
+        persist_todos(
+            state["runtime"],
+            state["todos"],
+            state["acceptance_criteria"],
+            state["verification_commands"],
+            state.get("plan_summary", ""),
+        )
+        writer(
+            {
+                "type": "plan_snapshot",
+                "node": "planner",
+                "plan_summary": state.get("plan_summary", ""),
+                "todos": state.get("todos", []),
+                "verification_commands": state.get("verification_commands", []),
+                "acceptance_criteria": state.get("acceptance_criteria", []),
+            }
+        )
+    return {
+        **result,
+        "plan_summary": state.get("plan_summary", ""),
+        "todo_items": state.get("todos", []),
     }
 
 
@@ -285,3 +669,19 @@ def _todo_items(todos: list[str], *, existing: list[dict[str, Any]] | None = Non
 # 校验任务的验证命令
 def _verification_commands_for_task(task: str, parsed: dict[str, Any]) -> list[str]:
     return [str(item) for item in parsed.get("verification_commands") or []]
+
+
+def _tool_result_event(tool_message: ToolMessage, *, node: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(tool_message.content))
+    except json.JSONDecodeError:
+        parsed = tool_message.content
+    return {"type": "tool_result", "node": node, "name": tool_message.name, "result": parsed}
+
+
+def _join_notes(existing: str, new: str) -> str:
+    if not existing:
+        return new
+    if not new:
+        return existing
+    return existing + "\n\n" + new

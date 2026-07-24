@@ -1,8 +1,8 @@
 from typing import Any
-
+import json
 from core import RuntimeState
 from tools.file_tool import read_text_lossy
-from tools.notepad_tool import read_notepad
+from tools.notepad_tool import read_notepad, NOTEPAD_FILE
 
 HISTORY_SUMMARY_FILE = "HISTORY_SUMMARY.md"
 
@@ -18,13 +18,33 @@ RULES_LAYER = {
     ],
 }
 
+# 不同记忆系统文件长度
+MAX_TEXT_CHARS = {
+    "research_notes": 1600,
+    "agent_handoff_instruction": 500,
+    "agent_handoff_result": 700,
+    "code_agent_summary": 1000,
+    "verifier_summary": 1000,
+    "last_error": 1400,
+    "context_summary": 1600,
+    "session_context": 1800,
+    "notepad": 1800,
+    "history_summary": 2200,
+}
+
 
 def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[str, Any]:
     runtime = state["runtime"]
     # 读取重要持久笔记
     notepad = read_notepad(runtime)
     history = read_history_summary(runtime)
-
+    sources = [
+        {
+            "title": source.get("title", ""),
+            "url": source.get("url", ""),
+        }
+        for source in state.get("sources", [])
+    ]
     working_memory = {
         "node": node,
         "task": state.get("task", ""),
@@ -72,3 +92,67 @@ def read_history_summary(state: RuntimeState) -> dict[str, Any]:
     content = read_text_lossy(path)
     state.record_read(path, complete=True)
     return {"ok": True, "path": HISTORY_SUMMARY_FILE, "content": content, "exists": True}
+
+
+def persist_history_summary(state: RuntimeState, summary: str) -> dict[str, Any]:
+    path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
+    if not path.exists():
+        return {"ok": True, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": False}
+    content = read_text_lossy(path)
+    state.record_read(path, complete=True)
+    return {"ok": True, "path": HISTORY_SUMMARY_FILE, "content": content, "exists": True}
+
+
+def memory_event(memory: dict[str, Any], *, node: str) -> dict[str, Any]:
+    working = memory.get("working_memory", {})
+    history = memory.get("history_summary_store", {})
+    return {
+        "type": "memory_snapshot",
+        "node": node,
+        "rules_count": len(memory.get("rules", {}).get("rules", [])),
+        "todo_count": len(working.get("todos", [])),
+        "source_count": len(working.get("sources", [])),
+        "handoff_count": len(working.get("agent_handoffs", [])),
+        "notepad_exists": bool(history.get("notepad_exists")),
+        "history_exists": bool(history.get("history_exists")),
+        "history_path": history.get("history_path", HISTORY_SUMMARY_FILE),
+        "layers": {
+            "rules": _event_layer_summary(memory.get("rules", {})),
+            "working_memory": _event_layer_summary(working),
+            "history_summary_store": _event_layer_summary(history),
+        },
+    }
+
+
+def _event_layer_summary(layer: dict[str, Any]) -> str:
+    if not layer:
+        return "(empty)"
+    text = json.dumps(layer, ensure_ascii=False, default=str)
+    return _short_text(text, 420)
+
+
+def _short_text(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+# 截取最近最多 6 条智能体交接（agent handoff）记录，清洗结构、超长文本截断，返回精简后的交接日志数组。
+def _trim_handoffs(handoffs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    trimmed = []
+    # 1. 只取列表【最后6条】记录
+    for handoff in handoffs[-6:]:
+        trimmed.append(
+            {
+                "from_agent": handoff.get("from_agent", ""),
+                "to_agent": handoff.get("to_agent", ""),
+                # 2. instruction 文本截断到最大字符限制
+                "instruction": _short_text(
+                    str(handoff.get("instruction", "")),
+                    MAX_TEXT_CHARS["agent_handoff_instruction"],
+                ),
+                # 3. result 文本同样截断
+                "result": _short_text(str(handoff.get("result", "")), MAX_TEXT_CHARS["agent_handoff_result"]),
+            }
+        )
+    return trimmed

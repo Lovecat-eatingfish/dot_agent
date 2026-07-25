@@ -1,10 +1,7 @@
-# Python-generated files
+.env
+.mokioclaw/
+.pytest_cache/
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# Virtual environments
-.venv
+*.pyc
+.agent-sync/
+.agent-sync-store/

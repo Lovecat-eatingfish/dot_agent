@@ -1,6 +1,5 @@
-def main():
-    print("Hello from dot-agent!")
+from mokioclaw.cli.app import app
 
 
 if __name__ == "__main__":
-    main()
+    app()

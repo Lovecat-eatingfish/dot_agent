@@ -86,6 +86,8 @@ flowchart TD
     Trace --> TraceTimeline["timeline.md"]
 ```
 
+![img.png](img.png)
+
 ## 一次任务的时间线
 
 ```mermaid
@@ -135,6 +137,8 @@ sequenceDiagram
     C-->>U: Rich 面板展示最终总结和 Trace Summary
 ```
 
+![img_1.png](img_1.png)
+
 ## 真实案例拆解
 
 这个 workspace 的最终 checkpoint 显示：
@@ -173,9 +177,11 @@ attempts: 1 / 3
 ...
 ```
 
-`RECOVERY.md` 是恢复用摘要。它会把任务、计划、todo、验收标准、验证命令、来源、最近总结和近期文件整理到一个短文档里。轻量恢复时，模型主要靠它和 workspace 文件理解“之前做到哪了”。
+`RECOVERY.md` 是恢复用摘要。它会把任务、计划、todo、验收标准、验证命令、来源、最近总结和近期文件整理到一个短文档里。轻量恢复时，模型主要靠它和
+workspace 文件理解“之前做到哪了”。
 
-旧版 `RECOVERY.md` 的 Task 里可能看到多层 `Continue this MokioClaw task from the checkpoint:`，通常说明这个 workspace 曾经被 `--resume` 恢复过多次。当前实现会在 light resume 时去掉已有恢复前缀，再统一加一次恢复语义，避免任务描述越来越长。
+旧版 `RECOVERY.md` 的 Task 里可能看到多层 `Continue this MokioClaw task from the checkpoint:`，通常说明这个 workspace
+曾经被 `--resume` 恢复过多次。当前实现会在 light resume 时去掉已有恢复前缀，再统一加一次恢复语义，避免任务描述越来越长。
 
 ## 目录什么时候创建
 
@@ -240,7 +246,9 @@ attempts: 1 / 3
 └─ git/
 ```
 
-运行过程中，checkpoint 会在关键安全点刷新：开始运行、graph update、失败/审批类工具结果、中断和结束。普通 custom event 只进入 trace，不再每次都触发 workspace manifest 和 git snapshot。任务结束时会写入 `status: finished`。如果用户按 `Ctrl+C`，会写入 `status: interrupted`，CLI 会提示：
+运行过程中，checkpoint 会在关键安全点刷新：开始运行、graph update、失败/审批类工具结果、中断和结束。普通 custom event 只进入
+trace，不再每次都触发 workspace manifest 和 git snapshot。任务结束时会写入 `status: finished`。如果用户按 `Ctrl+C`
+，会写入 `status: interrupted`，CLI 会提示：
 
 ```text
 uv run mokioclaw --resume <workspace>
@@ -278,7 +286,9 @@ uv run mokioclaw --resume <workspace>
 - 它只给 checkpoint 文件快照使用，不会污染项目主仓库。
 - 它会排除 `.mokioclaw/checkpoints/` 自身、`.venv/`、`node_modules/` 等目录。
 
-注意：早期 checkpoint 如果 workspace 是相对路径，可能会在 `checkpoint.json` 里看到 git snapshot error。这个错误不影响 `RECOVERY.md` 和 `checkpoint.json` 恢复。当前实现已改为对 git snapshot 使用绝对路径，后续新 checkpoint 会更稳定。
+注意：早期 checkpoint 如果 workspace 是相对路径，可能会在 `checkpoint.json` 里看到 git snapshot
+error。这个错误不影响 `RECOVERY.md` 和 `checkpoint.json` 恢复。当前实现已改为对 git snapshot 使用绝对路径，后续新
+checkpoint 会更稳定。
 
 ### strict 模式的 state.json 和 events.jsonl
 
@@ -299,6 +309,8 @@ events.jsonl
 
 ### .mokioclaw/shims/
 
+shims 不是下载 Python，而是给当前已有的 Python 创建"快捷方式"，让 Agent 无论在哪里执行 python/pip 都走同一个解释器。
+
 创建时机：第一次真正执行 `BashTool` 命令时。
 
 更准确地说，`BashTool` 通过危险命令检查和审批检查后，会构造执行环境。构造环境时会调用 `_ensure_toolchain_shims()`，创建：
@@ -317,7 +329,8 @@ events.jsonl
 - 把 `pip` 和 `pip3` 固定为 `python -m pip`，必要时自动 `ensurepip`。
 - 把 shims 目录放到 `PATH` 前面，减少系统 Python、conda Python、workspace venv 混用造成的漂移。
 
-这解决的是一个很常见的问题：Agent 运行 `pip install` 装到了系统 Python，但后面 `python app.py` 用的是另一个 Python。shims 让这两个命令尽量走同一套解释器。
+这解决的是一个很常见的问题：Agent 运行 `pip install` 装到了系统 Python，但后面 `python app.py` 用的是另一个 Python。shims
+让这两个命令尽量走同一套解释器。
 
 这个案例里 `shims` 存在，说明至少执行过一次 BashTool 验证命令。
 
@@ -393,6 +406,8 @@ flowchart LR
     Resume --> Read --> Task --> Planner --> Finish
 ```
 
+![img_2.png](img_2.png)
+
 优点：
 
 - 实现简单。
@@ -424,7 +439,16 @@ flowchart LR
     State -.失败.-> Fallback
 ```
 
-当前 strict 的定位是 state-backed restart，也就是尽量把已有 plan、todos、messages、sources、attempts 等 state 放回 workflow，然后从 workflow 入口重新推进；它不是精确恢复到上一个 tool call 的下一行。它比 light 带的信息更多，但仍然保持安全降级，不会因为 state 反序列化失败而让任务无法继续。
+
+![img_3.png](img_3.png)
+
+
+
+
+
+当前 strict 的定位是 state-backed restart，也就是尽量把已有 plan、todos、messages、sources、attempts 等 state 放回
+workflow，然后从 workflow 入口重新推进；它不是精确恢复到上一个 tool call 的下一行。它比 light 带的信息更多，但仍然保持安全降级，不会因为
+state 反序列化失败而让任务无法继续。
 
 ## 这套设计在教学上展示了什么
 

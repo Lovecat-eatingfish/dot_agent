@@ -1,3 +1,24 @@
+"""
+CLI 入口模块
+
+基于 Typer 框架构建命令行接口，提供两种运行模式：
+
+1. Rich 模式（默认）：mokioclaw "任务描述"
+   - 单次执行，事件通过 Rich 渲染到终端
+   - 适合快速任务和脚本调用
+
+2. TUI 模式：mokioclaw tui
+   - 基于 Textual 的终端 UI，支持多轮会话
+   - 适合长时间交互式开发
+
+Typer 框架要点：
+- @app.callback(invoke_without_command=True) 定义"默认命令"
+  当没有匹配的子命令时执行（如 mokioclaw "task"）
+- @app.command("tui") 定义子命令（如 mokioclaw tui）
+- Annotated[type, typer.Option(...)] 声明命令行选项
+- typer.Argument(...) 声明位置参数
+- typer.Context 传递运行上下文（如子命令信息）
+"""
 from __future__ import annotations
 
 import sys
@@ -15,7 +36,16 @@ from mokioclaw.core.agent import stream_agent_events
 
 
 class MokioClawGroup(TyperGroup):
-    """Let ``mokioclaw "task"`` coexist with real subcommands."""
+    """自定义参数解析组，让 ``mokioclaw "task"`` 和子命令共存。
+
+    默认 Typer 行为：未匹配的参数会报错。
+    此类重写 parse_args，将非命令、非选项的内容收集为 task_arg。
+
+    解析逻辑：
+    1. 遇到已知子命令名或 --help → 剩余参数交给子命令处理
+    2. 遇到 -开头的选项 → 当作选项处理（支持 --key=value 和 --key value）
+    3. 其余所有内容 → 拼接为 task_arg 存入 ctx.obj
+    """
 
     def parse_args(self, ctx, args):  # type: ignore[no-untyped-def]
         commands = set(self.commands)
@@ -24,17 +54,21 @@ class MokioClawGroup(TyperGroup):
         index = 0
         while index < len(args):
             arg = args[index]
+            # 已知子命令或 --help，后面的内容交给子命令
             if arg in commands or arg == "--help":
                 remaining.extend(args[index:])
                 break
+            # 选项（-开头），收集到 remaining
             if arg.startswith("-"):
                 remaining.append(arg)
+                # --key value 形式：下一个参数也属于这个选项
                 if "=" not in arg and index + 1 < len(args) and not args[index + 1].startswith("-"):
                     remaining.append(args[index + 1])
                     index += 2
                     continue
                 index += 1
                 continue
+            # 非命令非选项 → 当作任务描述，后续全部作为任务内容
             task_parts.extend(args[index:])
             break
         if task_parts:
@@ -43,6 +77,8 @@ class MokioClawGroup(TyperGroup):
         return super().parse_args(ctx, remaining)
 
 
+# Typer 应用实例
+# cls=MokioClawGroup 使用自定义参数解析
 app = typer.Typer(
     cls=MokioClawGroup,
     help='mokioclaw: a teaching-first mini CodeAgent. Use `mokioclaw "task"` for Rich output or `mokioclaw tui` for Textual TUI.',
@@ -50,6 +86,10 @@ app = typer.Typer(
 
 
 def configure_console() -> None:
+    """配置标准输出/错误流为 UTF-8 编码。
+
+    Windows 终端默认编码可能是 GBK，Rich/Textual 需要 UTF-8。
+    """
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
@@ -84,6 +124,19 @@ def main(
         typer.Option("--resume", help="Resume from an existing MokioClaw workspace."),
     ] = None,
 ) -> None:
+    """默认命令：执行 Agent 任务（Rich 终端输出）。
+
+    当用户运行 mokioclaw "task" 时触发。
+    如果调用了子命令（如 mokioclaw tui），则跳过此函数。
+
+    执行流程：
+    1. 检查是否调了子命令 → 是则跳过
+    2. 从 ctx.obj 获取 MokioClawGroup 解析出的 task_arg
+    3. 如果没有 task 也没有 resume → 显示 help
+    4. 调用 stream_agent_events() 获取事件流
+    5. 逐个事件通过 formatter.print_event() 渲染到终端
+    """
+    # 如果用户调了子命令（如 tui），callback 只做参数解析，不执行主逻辑
     if ctx.invoked_subcommand is not None:
         return
     configure_console()
@@ -95,7 +148,9 @@ def main(
         raise typer.Exit()
 
     safe_secho("mokioclaw stage 5: MultiAgent + context/harness engineering", fg=typer.colors.MAGENTA)
+    # inline 模式：危险命令时在终端弹出确认提示
     approval_handler = _inline_approval_handler if approval_mode == "inline" else None
+    # stream_agent_events 是生成器，逐个 yield 事件字典
     for event in stream_agent_events(
         task,
         workspace=workspace,
@@ -137,7 +192,11 @@ def tui(
         typer.Option("--resume", help="Resume from an existing MokioClaw workspace."),
     ] = None,
 ) -> None:
-    """Open the Textual terminal interface."""
+    """打开 Textual 终端 UI 界面。
+
+    运行方式：mokioclaw tui [task]
+    延迟导入 MokioClawTuiApp 避免启动 Rich 模式时加载 Textual 依赖。
+    """
     configure_console()
     from mokioclaw.cli.tui import MokioClawTuiApp
 
@@ -153,6 +212,19 @@ def tui(
 
 
 def _inline_approval_handler(request: ApprovalRequest) -> ApprovalDecision:
+    """Rich 模式的审批处理器。
+
+    当 BashTool 检测到危险命令时调用：
+    1. 用 Rich Panel 显示命令内容和风险原因
+    2. 用 typer.prompt() 等待用户输入 y/N
+    3. 返回 ApprovalDecision
+
+    Args:
+        request: 审批请求，包含命令、工具名、风险原因
+
+    Returns:
+        审批决定（通过/拒绝）
+    """
     from mokioclaw.cli.formatter import console
 
     console.print(

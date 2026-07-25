@@ -1,3 +1,28 @@
+"""
+分层记忆系统
+
+实现了三层记忆机制，帮助智能体在长对话中保持上下文：
+
+1. 规则层（rules）：
+   - 持久化的工作规则
+   - 跨任务保持不变
+   - 定义工作区约束和行为准则
+
+2. 工作记忆层（working_memory）：
+   - 当前任务的关键信息
+   - 包含任务、计划、待办事项、研究笔记等
+   - 随任务进展动态更新
+
+3. 历史摘要层（history_summary_store）：
+   - 过往对话的压缩总结
+   - 保存在 HISTORY_SUMMARY.md 文件中
+   - 上下文压缩时自动更新
+
+存储文件：
+- TODO.md: 待办事项和计划
+- NOTEPAD.md: 持久化笔记
+- HISTORY_SUMMARY.md: 历史对话摘要
+"""
 from __future__ import annotations
 
 import json
@@ -5,11 +30,14 @@ from datetime import datetime
 from typing import Any
 
 from mokioclaw.core.state import RuntimeState
+from mokioclaw.core.utils import truncate, trim_handoffs
 from mokioclaw.tools.file_tools import read_text_lossy
 from mokioclaw.tools.notepad_tool import NOTEPAD_FILE, read_notepad
 
+# 历史摘要文件名
 HISTORY_SUMMARY_FILE = "HISTORY_SUMMARY.md"
 
+# 规则层配置：定义智能体的工作规则
 RULES_LAYER = {
     "scope": "workspace",
     "storage": "internal",
@@ -22,21 +50,36 @@ RULES_LAYER = {
     ],
 }
 
+# 各字段的最大字符数限制，防止上下文溢出
 MAX_TEXT_CHARS = {
-    "research_notes": 1600,
-    "agent_handoff_instruction": 500,
-    "agent_handoff_result": 700,
-    "code_agent_summary": 1000,
-    "verifier_summary": 1000,
-    "last_error": 1400,
-    "context_summary": 1600,
-    "session_context": 1800,
-    "notepad": 1800,
-    "history_summary": 2200,
+    "research_notes": 1600,          # 研究笔记
+    "agent_handoff_instruction": 500, # 智能体交接指令
+    "agent_handoff_result": 700,     # 智能体交接结果
+    "code_agent_summary": 1000,      # 代码智能体摘要
+    "verifier_summary": 1000,        # 校验器摘要
+    "last_error": 1400,              # 最近错误
+    "context_summary": 1600,         # 上下文摘要
+    "session_context": 1800,         # 会话上下文
+    "notepad": 1800,                 # 笔记本内容
+    "history_summary": 2200,         # 历史摘要
 }
 
 
 def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[str, Any]:
+    """构建分层记忆结构
+
+    从当前状态和持久化文件中组装三层记忆：
+    1. 规则层：静态配置
+    2. 工作记忆：当前任务的动态信息
+    3. 历史摘要：过往对话的压缩总结
+
+    Args:
+        state: 当前工作流状态
+        node: 当前节点名称，用于标记记忆来源
+
+    Returns:
+        分层记忆字典，包含 rules, working_memory, history_summary_store
+    """
     runtime = state["runtime"]
     notepad = read_notepad(runtime)
     history = read_history_summary(runtime)
@@ -47,6 +90,7 @@ def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[
         }
         for source in state.get("sources", [])
     ]
+    # 工作记忆层：
     working_memory = {
         "node": node,
         "task": state.get("task", ""),
@@ -69,6 +113,7 @@ def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[
         "context_next_node": state.get("context_next_node", ""),
     }
     history_summary = state.get("history_summary") or history.get("content", "")
+    # 历史记忆总结相关信息：总结信息路径， 是不是存在， 总结内容（压缩后）， 重要信息摘要路径，存在与否， 上下文摘要， 上下文压缩事件
     history_summary_store = {
         "history_path": HISTORY_SUMMARY_FILE,
         "history_exists": history.get("exists", False),
@@ -87,10 +132,27 @@ def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[
 
 
 def format_layered_memory_for_prompt(memory: dict[str, Any]) -> str:
+    """将分层记忆格式化为 JSON 字符串，用于 LLM 提示词
+
+    Args:
+        memory: 分层记忆字典
+
+    Returns:
+        格式化后的 JSON 字符串
+    """
     return json.dumps(memory, ensure_ascii=False, indent=2, default=str)
 
 
 def memory_event(memory: dict[str, Any], *, node: str) -> dict[str, Any]:
+    """生成记忆快照事件，用于实时输出
+
+    Args:
+        memory: 分层记忆字典
+        node: 当前节点名称
+
+    Returns:
+        事件字典，包含各层的摘要信息
+    """
     working = memory.get("working_memory", {})
     history = memory.get("history_summary_store", {})
     return {
@@ -112,6 +174,14 @@ def memory_event(memory: dict[str, Any], *, node: str) -> dict[str, Any]:
 
 
 def read_history_summary(state: RuntimeState) -> dict[str, Any]:
+    """读取历史摘要文件
+
+    Args:
+        state: 运行时状态
+
+    Returns:
+        包含历史摘要内容的字典
+    """
     path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
     if not path.exists():
         return {"ok": True, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": False}
@@ -121,6 +191,15 @@ def read_history_summary(state: RuntimeState) -> dict[str, Any]:
 
 
 def persist_history_summary(state: RuntimeState, summary: str) -> dict[str, Any]:
+    """持久化历史摘要到文件
+
+    Args:
+        state: 运行时状态
+        summary: 要保存的摘要内容
+
+    Returns:
+        操作结果字典
+    """
     path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -138,23 +217,14 @@ def _event_layer_summary(layer: dict[str, Any]) -> str:
 
 
 def _trim_handoffs(handoffs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    trimmed = []
-    for handoff in handoffs[-6:]:
-        trimmed.append(
-            {
-                "from_agent": handoff.get("from_agent", ""),
-                "to_agent": handoff.get("to_agent", ""),
-                "instruction": _short_text(
-                    str(handoff.get("instruction", "")),
-                    MAX_TEXT_CHARS["agent_handoff_instruction"],
-                ),
-                "result": _short_text(str(handoff.get("result", "")), MAX_TEXT_CHARS["agent_handoff_result"]),
-            }
-        )
-    return trimmed
+    """截断智能体交接记录，使用 memory 模块的长度限制"""
+    return trim_handoffs(
+        handoffs,
+        instruction_limit=MAX_TEXT_CHARS["agent_handoff_instruction"],
+        result_limit=MAX_TEXT_CHARS["agent_handoff_result"],
+    )
 
 
 def _short_text(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
+    """截断文本到指定长度"""
+    return truncate(text, limit)

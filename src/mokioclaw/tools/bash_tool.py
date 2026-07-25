@@ -1,3 +1,18 @@
+"""
+Bash 命令执行工具
+
+提供安全的 Shell 命令执行能力，主要特性：
+1. 平台自适应：自动检测 Windows/macOS/Linux 并调整命令语法
+2. 安全防护：危险命令检测 + 人工审批机制
+3. 超时控制：防止长时间运行的命令阻塞 Agent
+4. 输出截断：超长输出自动保存到文件，避免上下文溢出
+5. 后台执行：支持长时间运行的命令（如开发服务器）
+
+安全机制：
+- DANGEROUS_PATTERNS: 危险命令正则匹配列表
+- approval_mode: inline（人工确认）/ auto（自动批准）/ deny（自动拒绝）
+- 路径限制：所有命令都在 workspace 目录内执行
+"""
 from __future__ import annotations
 
 import os
@@ -13,22 +28,30 @@ from typing import Any
 from mokioclaw.core.approval import ApprovalDecision, classify_command_risk, make_approval_request
 from mokioclaw.core.state import RuntimeState
 
-DEFAULT_TIMEOUT_SECONDS = 120
-DEFAULT_MAX_TIMEOUT_SECONDS = 600
-DEFAULT_MAX_OUTPUT_CHARS = 6000
+# ========== 默认配置常量 ==========
+DEFAULT_TIMEOUT_SECONDS = 120      # 单次命令默认超时（秒）
+DEFAULT_MAX_TIMEOUT_SECONDS = 600  # 最大允许超时（秒）
+DEFAULT_MAX_OUTPUT_CHARS = 6000    # 输出截断阈值（字符）
 
+# ========== 危险命令模式列表 ==========
+# 匹配到这些模式的命令会被阻止或要求人工审批
 DANGEROUS_PATTERNS = [
-    r"\brm\s+-rf\b",
-    r"\bRemove-Item\b.*\b-Recurse\b.*\b-Force\b",
-    r"\bdel\s+/[sq]\b",
-    r"\bformat\b",
-    r"\bshutdown\b",
-    r"\breboot\b",
-    r"(?:^|[^0-9])>\s*(?:[A-Za-z]:\\|/(?!dev/null\b))",
+    r"\brm\s+-rf\b",                                    # Unix 递归删除
+    r"\bRemove-Item\b.*\b-Recurse\b.*\b-Force\b",       # PowerShell 递归删除
+    r"\bdel\s+/[sq]\b",                                 # Windows 静默删除
+    r"\bformat\b",                                       # 格式化磁盘
+    r"\bshutdown\b",                                     # 关机
+    r"\breboot\b",                                       # 重启
+    r"(?:^|[^0-9])>\s*(?:[A-Za-z]:\\|/(?!dev/null\b))", # 重定向到非 /dev/null
 ]
 
 
 def bash_tool_description() -> str:
+    """生成 BashTool 的使用说明，根据当前平台动态调整
+
+    Returns:
+        包含平台特定说明的工具描述字符串
+    """
     system = platform.system().lower()
     common = (
         "Run a safe development shell command inside the workspace with timeout and output capture. "
@@ -59,6 +82,14 @@ def bash_tool_description() -> str:
 
 
 def _coerce_timeout(timeout_seconds: int | str | float) -> int:
+    """将超时值转换为整数，无效值返回默认值
+
+    Args:
+        timeout_seconds: 超时值，支持 int/str/float
+
+    Returns:
+        整数类型的超时秒数
+    """
     if timeout_seconds is None:
         return DEFAULT_TIMEOUT_SECONDS
     try:
@@ -68,6 +99,20 @@ def _coerce_timeout(timeout_seconds: int | str | float) -> int:
 
 
 def _normalize_command(command: str) -> str:
+    """规范化命令字符串，处理平台差异
+
+    Windows 平台会自动转换：
+    - python3 → python
+    - ls → dir
+    - cat → type
+    - 移除无效的 cd /workspace
+
+    Args:
+        command: 原始命令字符串
+
+    Returns:
+        规范化后的命令
+    """
     if os.name == "nt":
         normalized = re.sub(r"^\s*python3(\.exe)?\b", "python", command, count=1, flags=re.IGNORECASE)
         normalized = re.sub(
@@ -92,6 +137,17 @@ def _normalize_command(command: str) -> str:
 
 
 def _handle_tail_command(state: RuntimeState, command: str) -> dict[str, Any] | None:
+    """处理 tail 命令，避免在 Windows 上执行不支持的命令
+
+    将 tail -N file.txt 转换为 Python 实现，确保跨平台兼容。
+
+    Args:
+        state: 运行时状态
+        command: 命令字符串
+
+    Returns:
+        命令执行结果，如果不匹配 tail 格式则返回 None
+    """
     match = re.fullmatch(r"\s*tail(?:\s+-n)?\s+(\d+)\s+(.+?)\s*", command)
     if not match:
         match = re.fullmatch(r"\s*tail\s+-(\d+)\s+(.+?)\s*", command)
@@ -132,6 +188,14 @@ def _handle_workspace_query(state: RuntimeState, command: str) -> dict[str, Any]
 
 
 def _looks_dangerous(command: str) -> str | None:
+    """检查命令是否匹配危险模式
+
+    Args:
+        command: 命令字符串
+
+    Returns:
+        匹配到的危险模式，如果不危险则返回 None
+    """
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, command, re.IGNORECASE):
             return pattern
@@ -157,6 +221,32 @@ def run_bash(
     timeout_seconds: int | str | float | None = None,
     run_in_background: bool | str = False,
 ) -> dict[str, Any]:
+    """执行 Bash 命令
+
+    核心执行流程：
+    1. 参数校验和超时计算
+    2. 命令规范化（处理平台差异）
+    3. 特殊命令处理（tail、cd/pwd）
+    4. 危险命令检测
+    5. 人工审批（如果需要）
+    6. 执行命令并捕获输出
+    7. 输出截断处理
+
+    Args:
+        state: 运行时状态，包含工作区路径和配置
+        command: 要执行的命令字符串
+        timeout_seconds: 超时时间（秒），None 使用默认值
+        run_in_background: 是否后台执行
+
+    Returns:
+        命令执行结果字典，包含：
+        - ok: 是否成功
+        - command: 实际执行的命令
+        - exit_code: 退出码
+        - stdout: 标准输出
+        - stderr: 标准错误
+        - duration_ms: 执行耗时（毫秒）
+    """
     if not command.strip():
         return {"ok": False, "error": "command must not be empty"}
     max_timeout = _state_int(state, "bash_max_timeout_seconds", DEFAULT_MAX_TIMEOUT_SECONDS)

@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import json
 import time
-from dataclasses import asdict, is_dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from langchain_core.messages import BaseMessage, message_to_dict
+from mokioclaw.core.utils import json_safe, utc_now, write_json
 
 
 VALID_TRACE_MODES = {"on", "off"}
@@ -218,24 +216,6 @@ def compact_payload(value: Any, *, limit: int = MAX_PAYLOAD_TEXT) -> Any:
     return _trim_nested(safe, limit=limit)
 
 
-def json_safe(value: Any) -> Any:
-    if isinstance(value, BaseMessage):
-        return message_to_dict(value)
-    if isinstance(value, Path):
-        return str(value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return json_safe(asdict(value))
-    if isinstance(value, dict):
-        return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [json_safe(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    try:
-        json.dumps(value)
-        return value
-    except TypeError:
-        return repr(value)
 
 
 def format_timeline_line(line: dict[str, Any]) -> str:
@@ -281,19 +261,8 @@ def build_timeline_markdown(summary: dict[str, Any], timeline: list[str]) -> str
     return "\n".join(lines).rstrip() + "\n"
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    tmp.replace(path)
-
-
 def normalize_trace_path(path: Path) -> Path:
     return path.resolve()
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
 
 
 def _trim_nested(value: Any, *, limit: int) -> Any:

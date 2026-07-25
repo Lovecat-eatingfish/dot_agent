@@ -1,12 +1,12 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from mokioclaw.core.checkpoint import workspace_manifest
+from mokioclaw.core.utils import truncate, utc_now
 
 
 SESSION_ROOT = Path(".mokioclaw") / "session"  # 会话存储根目录
@@ -200,14 +200,8 @@ def build_session_summary_markdown(workspace: Path, session: dict[str, Any]) -> 
 
 
 def trim_text(text: str, limit: int) -> str:
-    text = text or ""
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 3)] + "..."
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """截断文本（兼容 None 输入）"""
+    return truncate(text or "", limit)
 
 
 #  保证会话字典字段永远齐全，缺失自动填充默认值：

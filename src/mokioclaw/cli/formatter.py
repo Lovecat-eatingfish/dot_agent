@@ -1,3 +1,23 @@
+"""
+Rich 终端格式化器
+
+将 Agent 事件渲染为 Rich 终端输出。用于 mokioclaw "task" 的 Rich 模式。
+
+核心组件（Rich 库）：
+- Console: 终端输出入口，替代 print()，支持样式和富文本
+- Panel: 带标题和边框的面板，用于包裹每条事件
+- Table: 表格，用于展示 todo 列表、校验结果等结构化数据
+- Text: 带样式的文本对象
+
+事件渲染流程：
+  print_event(event)
+    ├─ type="workspace"    → Panel 显示工作区路径
+    ├─ type="custom_event" → print_custom_event() 按事件子类型分发
+    ├─ type="graph_event"  → print_graph_event() 按节点名分发
+    └─ 其他                → 直接打印截断内容
+
+每个 render_* 函数负责一种事件类型的 Rich 渲染。
+"""
 from __future__ import annotations
 
 import json
@@ -9,7 +29,25 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from mokioclaw.core.utils import truncate_json
+
+# 全局 Console 实例，所有输出通过它完成
 console = Console()
+
+# 待办事项状态对应的显示符号和样式
+STATUS_SYMBOLS = {
+    "pending": "[ ]",        # 未开始
+    "in_progress": "[>]",    # 进行中
+    "completed": "[x]",      # 已完成
+    "blocked": "[!]",        # 阻塞
+}
+
+STATUS_STYLES = {
+    "pending": "dim",
+    "in_progress": "bold yellow",
+    "completed": "bold green",
+    "blocked": "bold red",
+}
 
 STATUS_SYMBOLS = {
     "pending": "[ ]",
@@ -27,22 +65,30 @@ STATUS_STYLES = {
 
 
 def safe_echo(message: Any = "", **_: Any) -> None:
+    """安全打印（替代 click.echo），统一走 Rich Console"""
     console.print(str(message))
 
 
 def safe_secho(message: Any = "", **kwargs: Any) -> None:
+    """安全打印带颜色（替代 click.secho），fg/style 参数映射到 Rich style"""
     color = kwargs.get("fg") or kwargs.get("style")
     console.print(str(message), style=color)
 
 
 def _shorten(value: Any, limit: int = 260) -> str:
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
+    """截断任意值（先 JSON 序列化再截断）"""
+    return truncate_json(value, limit)
 
 
 def print_event(event: dict[str, Any]) -> None:
+    """事件渲染入口：根据 event["type"] 分发到对应的 render 函数
+
+    事件有三层嵌套结构：
+    - 顶层 type: "workspace" / "custom_event" / "graph_event"
+    - custom_event 的子类型在 event["event"]["type"] 中
+    - graph_event 的节点名在 event["event"] 的 key 中
+    """
+
     event_type = event.get("type")
     if event_type == "workspace":
         console.print(Panel(str(event["path"]), title="Workspace", border_style="blue", box=box.ROUNDED))
@@ -57,6 +103,22 @@ def print_event(event: dict[str, Any]) -> None:
 
 
 def print_custom_event(event: dict[str, Any]) -> None:
+    """渲染自定义事件：按 event["type"] 分发到具体的 render 函数
+
+    支持的事件类型：
+    - intent_decision: 意图路由决策
+    - chat_response: 聊天回复
+    - session_*: 会话生命周期事件
+    - plan_snapshot/todo_update: 计划和待办变更
+    - tool_call/tool_result: 工具调用和结果
+    - handoff/handoff_result: 智能体交接
+    - search_results/search_summary: 搜索结果
+    - memory_snapshot: 记忆快照
+    - context_monitor/compression: 上下文管理
+    - checkpoint_*: 检查点保存/恢复
+    - trace_summary: 追踪摘要
+    """
+
     event_type = event.get("type")
     if event_type == "intent_decision":
         render_intent_decision(event)

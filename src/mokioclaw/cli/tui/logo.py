@@ -1,3 +1,22 @@
+"""
+Logo 渲染模块
+
+将 PNG 图片渲染为终端字符画，用于 TUI 界面顶部。
+
+渲染原理：
+- 使用 Unicode 半块字符（▀ 上半块、▄ 下半块）实现双倍垂直分辨率
+- 每个终端字符可以显示两个像素的颜色（前景=上半，背景=下半）
+- 对图片每两行像素，逐列生成一个字符
+
+流程：
+1. 加载 PNG → 裁剪透明边缘 → 缩放到目标尺寸
+2. 遍历像素，每两行合并为一行字符
+3. 上半像素有颜色 → 用 ▀ 的前景色
+4. 下半像素有颜色 → 用 ▄ 的背景色
+5. 两行都有 → ▀ 前景+背景
+
+如果 PNG 加载失败（文件不存在、PIL 未安装等），回退到 ASCII art。
+"""
 from __future__ import annotations
 
 from functools import lru_cache
@@ -9,6 +28,7 @@ from rich.text import Text
 from mokioclaw.core.paths import find_project_root
 
 
+# 回退 ASCII art logo（PNG 加载失败时使用）
 FALLBACK_LOGO = [
     "  <      >  ",
     "   /\\__/\\   ",
@@ -19,10 +39,21 @@ FALLBACK_LOGO = [
 
 
 def default_logo_path() -> Path:
+    """获取默认 logo PNG 路径（项目根目录/assets/logo-no-words.png）"""
     return find_project_root() / "assets" / "logo-no-words.png"
 
 
 def render_logo(path: Path | None = None, *, max_width: int = 36, max_rows: int = 12) -> Text:
+    """渲染 logo 为 Rich Text 对象
+
+    Args:
+        path: PNG 文件路径，None 则用默认路径
+        max_width: 最大字符宽度
+        max_rows: 最大行数（实际像素行数 = max_rows * 2）
+
+    Returns:
+        Rich Text 对象，可直接传给 Static() 组件
+    """
     logo_path = path or default_logo_path()
     try:
         return _render_png_logo(str(logo_path), max_width=max_width, max_rows=max_rows)
@@ -86,6 +117,13 @@ def _pad_bottom(image: "Image.Image") -> "Image.Image":
 
 
 def _pixel_char(upper: tuple[int, int, int, int], lower: tuple[int, int, int, int]) -> str:
+    """根据上下两个像素选择半块字符
+
+    上半有颜色 → ▀（前景色显示上半像素）
+    下半有颜色 → ▄（背景色显示下半像素）
+    两行都有 → ▀（前景+背景同时显示）
+    都没有 → 空格
+    """
     upper_visible = _visible(upper)
     lower_visible = _visible(lower)
     if upper_visible and lower_visible:

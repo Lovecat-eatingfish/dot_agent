@@ -1,3 +1,21 @@
+"""
+Textual TUI 主应用
+
+基于 Textual 框架的终端 UI，支持多轮会话交互。
+
+Textual 框架要点：
+- App: 应用基类，类似 Web 框架的 Application
+- compose(): 声明组件树（类似 React 的 render）
+- CSS: 类似网页 CSS 的样式系统，用 Textual 选择器
+- Message: 组件间通信的消息类
+- post_message(): 从任意线程投递消息到主事件循环
+- handle_<MessageName>(): 消息处理函数（命名约定）
+
+线程模型：
+- 主线程：Textual 事件循环，处理 UI 更新和用户输入
+- 工作线程：执行 stream_session_events()，产生 agent 事件
+- 通过 Message 在两个线程间通信
+"""
 from __future__ import annotations
 
 import json
@@ -20,29 +38,70 @@ from mokioclaw.core.approval import ApprovalDecision, ApprovalRequest
 from mokioclaw.core.agent import stream_session_events
 from mokioclaw.core.paths import default_workspace
 
-
+# 流工厂类型：创建 agent 事件流的可调用对象
 StreamFactory = Callable[..., Iterable[dict[str, Any]]]
 
 
 class AgentEventMessage(Message):
+    """工作线程 → 主线程：agent 事件消息
+
+    工作线程每产生一个事件，通过 post_message(AgentEventMessage(event))
+    投递到主线程，主线程的 handle_agent_event_message() 处理 UI 更新。
+    """
+
     def __init__(self, event: dict[str, Any]) -> None:
         super().__init__()
         self.event = event
 
 
 class RunFinishedMessage(Message):
+    """工作线程 → 主线程：agent 执行完成消息
+
+    工作线程完成或异常退出时投递，主线程更新状态栏。
+    """
+
     def __init__(self, status: str) -> None:
         super().__init__()
         self.status = status
 
 
 class ApprovalRequestedMessage(Message):
+    """工作线程 → 主线程：审批请求消息
+
+    当 BashTool 检测到危险命令时，工作线程创建 ApprovalGate
+    并投递此消息，主线程弹出 ApprovalModal 模态对话框。
+    """
+
     def __init__(self, gate: ApprovalGate) -> None:
         super().__init__()
         self.gate = gate
 
 
 class MokioClawTuiApp(App[None]):
+    """Textual TUI 主应用
+
+    布局：
+    ┌─────────────────────────────────────┐
+    │ Header (时钟)                        │
+    ├─────────────────────────────────────┤
+    │ Logo │ MokioClaw (标题)              │
+    │      │ status: running              │
+    ├──────┴──────────────────────────────┤
+    │ 事件列表 (可滚动)  │ 侧边栏 (会话)   │
+    │ > Planner ...      │ Session         │
+    │ > Tool Call ...    │ todos: 3/5      │
+    │ > Verifier ...     │ turn: 2         │
+    ├─────────────────────────────────────┤
+    │ ❯ 输入框                            │
+    ├─────────────────────────────────────┤
+    │ Footer (快捷键提示)                  │
+    └─────────────────────────────────────┘
+
+    线程安全状态（通过 _state_lock 保护）：
+    - running: 是否有 agent 正在执行
+    - todos: 当前待办事项列表
+    - 最新 workspace/checkpoint/trace 路径
+    """
     CSS = """
     Screen {
         background: #101113;
@@ -196,16 +255,16 @@ class MokioClawTuiApp(App[None]):
     ]
 
     def __init__(
-        self,
-        *,
-        initial_task: str | None = None,
-        workspace: Path | None = None,
-        max_attempts: int = 3,
-        approval_mode: Literal["inline", "auto", "deny"] = "inline",
-        checkpoint_mode: Literal["light", "strict", "off"] = "light",
-        trace_mode: Literal["on", "off"] = "on",
-        resume: Path | None = None,
-        stream_factory: StreamFactory = stream_session_events,
+            self,
+            *,
+            initial_task: str | None = None,
+            workspace: Path | None = None,
+            max_attempts: int = 3,
+            approval_mode: Literal["inline", "auto", "deny"] = "inline",
+            checkpoint_mode: Literal["light", "strict", "off"] = "light",
+            trace_mode: Literal["on", "off"] = "on",
+            resume: Path | None = None,
+            stream_factory: StreamFactory = stream_session_events,
     ) -> None:
         super().__init__()
         self.initial_task = initial_task
@@ -262,11 +321,9 @@ class MokioClawTuiApp(App[None]):
             self.call_after_refresh(self.start_task, self.initial_task, self.resume)
 
     # 用户按 Enter 时触发：
-# 获取输入内容
-
-# 如果是 /new → 创建新会话
-
-# 否则 → 启动新任务
+    # 获取输入内容
+    # 如果是 /new → 创建新会话
+    # 否则 → 启动新任务
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "task-input":
             return
@@ -281,18 +338,14 @@ class MokioClawTuiApp(App[None]):
 
     # 收到 Agent 事件时触发：
     # 调用 _handle_event() 处理事件
-
     def on_agent_event_message(self, message: AgentEventMessage) -> None:
         self._handle_event(message.event)
 
     # 任务完成时触发：
-# 设置 running = False
-
-# 启用输入框
-
-# 更新状态为 "ready"
-
-# 刷新侧边栏
+    # 设置 running = False
+    # 启用输入框
+    # 更新状态为 "ready"
+    # 刷新侧边栏
     def on_run_finished_message(self, message: RunFinishedMessage) -> None:
         self.running = False
         self.resume = None
@@ -301,46 +354,34 @@ class MokioClawTuiApp(App[None]):
         self.query_one("#status", Static).update(f"{message.status}; ready for next task")
         self._refresh_sidebar()
 
-# 需要用户审批时触发：
-
-# 弹出审批对话框（ApprovalModal）
-
-# 等待用户选择"批准"或"拒绝"
+    # 需要用户审批时触发：
+    # 弹出审批对话框（ApprovalModal）
+    # 等待用户选择"批准"或"拒绝"
     def on_approval_requested_message(self, message: ApprovalRequestedMessage) -> None:
         workspace = self.latest_workspace or str(self.workspace or "")
         self.push_screen(ApprovalModal(message.gate.request, workspace), self._resolve_approval(message.gate))
 
-# Ctrl+C 快捷键：
+    # Ctrl+C 快捷键：
     def action_cancel_or_quit(self) -> None:
         if self.running:
             self.notify("A run is active. Press Ctrl+Q to quit and let checkpoint handle recovery.", severity="warning")
             return
         self.exit()
 
-
-# Ctrl+L 快捷键：
-
-# 清空事件流
-
-# 重新显示欢迎信息
+    # Ctrl+L 快捷键：
+    # 清空事件流
+    # 重新显示欢迎信息
     def action_clear_events(self) -> None:
         self.query_one("#events", VerticalScroll).remove_children()
         self._write_welcome()
 
-
-# 启动一个新任务：
-
-# 检查是否已在运行
-
-# 更新状态（running = True）
-
-# 清空待办列表
-
-# 禁用输入框
-
-# 在事件流中写入"任务开始"
-
-# 在后台线程中运行 _run_stream()
+    # 启动一个新任务：
+    # 检查是否已在运行
+    # 更新状态（running = True）
+    # 清空待办列表
+    # 禁用输入框
+    # 在事件流中写入"任务开始"
+    # 在后台线程中运行 _run_stream()
     def start_task(self, task: str, resume: Path | None = None) -> None:
         if self.running:
             self.notify("MokioClaw is already running a task.", severity="warning")
@@ -354,61 +395,52 @@ class MokioClawTuiApp(App[None]):
         self.query_one("#status", Static).update("running")
         self._refresh_sidebar()
         self._write_run_start(task, resume)
-        self.run_worker(lambda: self._run_stream(task, resume), thread=True, exclusive=False, name=f"mokioclaw-run-{self.run_count}")
+        self.run_worker(lambda: self._run_stream(task, resume), thread=True, exclusive=False,
+                        name=f"mokioclaw-run-{self.run_count}")
 
-# 在后台线程中执行 Agent（核心逻辑）：
-
-# 调用 stream_session_events() 获取事件流
-
-# 每个事件通过 post_message() 发送到主线程
-
-# 捕获异常（KeyboardInterrupt、普通异常）
-
-# 最后发送 RunFinishedMessage
+    # 在后台线程中执行 Agent（核心逻辑）：
+    # 调用 stream_session_events() 获取事件流
+    # 每个事件通过 post_message() 发送到主线程
+    # 捕获异常（KeyboardInterrupt、普通异常）
+    # 最后发送 RunFinishedMessage
     def _run_stream(self, task: str, resume: Path | None) -> None:
         status = "finished"
         try:
             approval_handler = self._approval_handler if self.approval_mode == "inline" else None
             for event in self.stream_factory(
-                task,
-                session_workspace=self.session_workspace,
-                max_attempts=self.max_attempts,
-                approval_mode=self.approval_mode,
-                approval_handler=approval_handler,
-                checkpoint_mode=self.checkpoint_mode,
-                resume_workspace=resume,
-                trace_mode=self.trace_mode,
+                    task,
+                    session_workspace=self.session_workspace,
+                    max_attempts=self.max_attempts,
+                    approval_mode=self.approval_mode,
+                    approval_handler=approval_handler,
+                    checkpoint_mode=self.checkpoint_mode,
+                    resume_workspace=resume,
+                    trace_mode=self.trace_mode,
             ):
                 self.call_from_thread(self.post_message, AgentEventMessage(event))
         except KeyboardInterrupt:
             status = "interrupted"
         except Exception as exc:
             status = "failed"
-            error_event = {"type": "custom_event", "event": {"type": "tui_error", "error": f"{type(exc).__name__}: {exc}"}}
+            error_event = {"type": "custom_event",
+                           "event": {"type": "tui_error", "error": f"{type(exc).__name__}: {exc}"}}
             self.call_from_thread(self.post_message, AgentEventMessage(error_event))
         finally:
             self.call_from_thread(self.post_message, RunFinishedMessage(status))
 
-# 审批处理器（被 Agent 调用）：
-
-# 创建 ApprovalGate（审批门，用于同步等待）
-
-# 发送 ApprovalRequestedMessage 到主线程
-
-# 阻塞等待用户做出决定（gate.wait()）
-
-# 返回 ApprovalDecision
+    # 审批处理器（被 Agent 调用）：
+    # 创建 ApprovalGate（审批门，用于同步等待）
+    # 发送 ApprovalRequestedMessage 到主线程
+    # 阻塞等待用户做出决定（gate.wait()）
+    # 返回 ApprovalDecision
     def _approval_handler(self, request: ApprovalRequest) -> ApprovalDecision:
         gate = ApprovalGate(request)
         self.call_from_thread(self.post_message, ApprovalRequestedMessage(gate))
         return gate.wait()
 
-
-# 审批回调（用户点击后执行）：
-
-# 用户选择后，调用 gate.resolve(approved) 解除阻塞
-
-# 刷新侧边栏
+    # 审批回调（用户点击后执行）：
+    # 用户选择后，调用 gate.resolve(approved) 解除阻塞
+    # 刷新侧边栏
     def _resolve_approval(self, gate: ApprovalGate) -> Callable[[bool | None], None]:
         def resolve(result: bool | None) -> None:
             approved = bool(result)
@@ -417,13 +449,10 @@ class MokioClawTuiApp(App[None]):
 
         return resolve
 
-# 处理一个 Agent 事件：
-
-# 更新内部状态（_update_state_from_event）
-
-# 如果该事件应该隐藏 → 只刷新侧边栏，不显示
-
-# 否则 → 生成摘要并写入事件流
+    # 处理一个 Agent 事件：
+    # 更新内部状态（_update_state_from_event）
+    # 如果该事件应该隐藏 → 只刷新侧边栏，不显示
+    # 否则 → 生成摘要并写入事件流
     def _handle_event(self, event: dict[str, Any]) -> None:
         self._update_state_from_event(event)
         if self._should_hide_event(event):
@@ -433,14 +462,10 @@ class MokioClawTuiApp(App[None]):
         self._write_summary(summary)
         self._refresh_sidebar()
 
-
-# 从事件中提取信息更新状态：
-
-# workspace → 更新工作区路径
-
-# graph_event → 遍历 payload，调用 _update_from_payload
-
-# custom_event → 调用 _update_from_payload
+    # 从事件中提取信息更新状态：
+    # workspace → 更新工作区路径
+    # graph_event → 遍历 payload，调用 _update_from_payload
+    # custom_event → 调用 _update_from_payload
     def _update_state_from_event(self, event: dict[str, Any]) -> None:
         with self._state_lock:
             if event.get("type") == "workspace":
@@ -455,20 +480,13 @@ class MokioClawTuiApp(App[None]):
             elif event.get("type") == "custom_event" and isinstance(payload, dict):
                 self._update_from_payload(payload)
 
-
-# 从 payload 中提取具体信息：
-
-# todos → 更新待办列表
-
-# tool_call → 工具调用计数 +1
-
-# tool_result → 记录成功/失败，记录审批次数
-
-# checkpoint_saved → 更新检查点路径
-
-# trace_summary → 更新追踪目录
-
-# session_started → 更新会话 ID 和轮次
+    # 从 payload 中提取具体信息：
+    # todos → 更新待办列表
+    # tool_call → 工具调用计数 +1
+    # tool_result → 记录成功/失败，记录审批次数
+    # checkpoint_saved → 更新检查点路径
+    # trace_summary → 更新追踪目录
+    # session_started → 更新会话 ID 和轮次
     def _update_from_payload(self, payload: dict[str, Any]) -> None:
         if isinstance(payload.get("todos"), list):
             self.todos = payload["todos"]
@@ -495,8 +513,7 @@ class MokioClawTuiApp(App[None]):
             self.session_turn = int(payload.get("turn", self.session_turn) or self.session_turn)
             self.last_route = str(payload.get("route", self.last_route))
 
-# 写入欢迎信息到事件流。
-
+    # 写入欢迎信息到事件流。
     def _write_welcome(self) -> None:
         self._mount_event_card(
             "MokioClaw",
@@ -505,11 +522,10 @@ class MokioClawTuiApp(App[None]):
             collapsed=True,
             detail="Persistent TUI sessions keep one workspace across turns. Workflow turns still use approval, checkpoint, trace, and layered memory.",
         )
-# 写入"任务开始"信息到事件流：
 
-# 显示任务内容（截断到 500 字符）
-
-# 显示工作区或恢复路径
+    # 写入"任务开始"信息到事件流：
+    # 显示任务内容（截断到 500 字符）
+    # 显示工作区或恢复路径
     def _write_run_start(self, task: str, resume: Path | None) -> None:
         mode = f"resume: {resume}" if resume is not None else f"workspace: {self.session_workspace}"
         self._mount_event_card(
@@ -520,13 +536,9 @@ class MokioClawTuiApp(App[None]):
             detail=mode,
         )
 
-
-
-# 写入事件摘要到事件流：
-
-# 根据摘要类型决定颜色、折叠状态
-
-# 调用 _mount_event_card 实际渲染
+    # 写入事件摘要到事件流：
+    # 根据摘要类型决定颜色、折叠状态
+    # 调用 _mount_event_card 实际渲染
     def _write_summary(self, summary: EventSummary) -> None:
         self._mount_event_card(
             summary.title,
@@ -536,13 +548,10 @@ class MokioClawTuiApp(App[None]):
             detail=summary.body,
         )
 
-# 刷新右侧状态面板：
-
-# 收集所有状态信息（状态、轮次、会话ID、工作区、检查点、追踪、工具统计、待办）
-
-# 用 Table 表格显示
-
-# 更新到 #side-state 组件
+    # 刷新右侧状态面板：
+    # 收集所有状态信息（状态、轮次、会话ID、工作区、检查点、追踪、工具统计、待办）
+    # 用 Table 表格显示
+    # 更新到 #side-state 组件
     def _refresh_sidebar(self) -> None:
         status = "running" if self.running else "ready"
         workspace = shorten(self.latest_workspace or str(self.session_workspace), 80)
@@ -580,13 +589,10 @@ class MokioClawTuiApp(App[None]):
         table.add_row("todos", todos)
         self.query_one("#side-state", Static).update(table)
 
-
-# def _todo_sidebar_text(self)
-# 生成待办事项的文本：
-
-# 统计各状态数量（pending/in_progress/done）
-
-# 如果有进行中的任务，显示其内容
+    # def _todo_sidebar_text(self)
+    # 生成待办事项的文本：
+    # 统计各状态数量（pending/in_progress/done）
+    # 如果有进行中的任务，显示其内容
     def _todo_sidebar_text(self) -> str:
         if not self.todos:
             return "(none yet)"
@@ -600,21 +606,18 @@ class MokioClawTuiApp(App[None]):
             return f"{count_text}\n{shorten(current.get('content', current.get('description', '')), 120)}"
         return count_text
 
-# 染一个事件卡片到事件流区域：
-
-# 左侧有颜色标记（运行中=黄色，成功=绿色，错误=红色）
-
-# 可折叠（Collapsible）或展开（Vertical）
-
-# 滚动到底部
+    # 染一个事件卡片到事件流区域：
+    # 左侧有颜色标记（运行中=黄色，成功=绿色，错误=红色）
+    # 可折叠（Collapsible）或展开（Vertical）
+    # 滚动到底部
     def _mount_event_card(
-        self,
-        title: str,
-        body: str,
-        *,
-        category: str = "info",
-        collapsed: bool = True,
-        detail: str | None = None,
+            self,
+            title: str,
+            body: str,
+            *,
+            category: str = "info",
+            collapsed: bool = True,
+            detail: str | None = None,
     ) -> None:
         events = self.query_one("#events", VerticalScroll)
         title_text = f"{self._category_marker(category)} {title}"
@@ -674,28 +677,23 @@ class MokioClawTuiApp(App[None]):
         if summary.category == "trace":
             status = self._line_value(body, "status")
             tools = self._line_value(body, "tools")
-            return " · ".join(part for part in [f"status {status}" if status else "", f"tools {tools}" if tools else ""] if part)
+            return " · ".join(
+                part for part in [f"status {status}" if status else "", f"tools {tools}" if tools else ""] if part)
         if summary.category == "final":
             return shorten(body.splitlines()[0] if body.splitlines() else body, 220)
         if summary.category == "verifier":
             return shorten(body.splitlines()[0] if body.splitlines() else body, 180)
         return shorten(body, 180)
 
-
-# 压缩事件主体，针对不同类型提取关键信息：
-
-# session → 提取 route/turn/workspace
-
-# tool_result → 提取 ok/path
-
-# final → 只显示第一行
-
-# 默认 → 截断到 180 字符
+    # 压缩事件主体，针对不同类型提取关键信息：
+    # session → 提取 route/turn/workspace
+    # tool_result → 提取 ok/path
+    # final → 只显示第一行
+    # 默认 → 截断到 180 字符
     def _should_collapse(self, summary: EventSummary) -> bool:
         return summary.category not in {"chat", "final", "verifier"}
 
-# 判断事件类别：running、success、error、info、user。用于决定颜色和样式。
-
+    # 判断事件类别：running、success、error、info、user。用于决定颜色和样式。
     def _event_category(self, summary: EventSummary) -> str:
         if summary.category in {"final", "trace"}:
             return "success"
@@ -704,8 +702,8 @@ class MokioClawTuiApp(App[None]):
         if summary.category in {"plan", "tool_call", "handoff", "context", "checkpoint"}:
             return "running"
         return "info"
-# 判断是否折叠：只有 chat、final、verifier 不折叠，其他都折叠。
 
+    # 判断是否折叠：只有 chat、final、verifier 不折叠，其他都折叠。
     def _should_hide_event(self, event: dict[str, Any]) -> bool:
         if event.get("type") == "workspace":
             return True
@@ -717,12 +715,9 @@ class MokioClawTuiApp(App[None]):
             return payload.get("type") in {"session_started", "session_turn_started", "memory_snapshot"}
         return False
 
-
-# 格式化详情内容：
-
-# 尝试解析 JSON → 用 Rich 的 Pretty 美化显示
-
-# 否则 → 显示纯文本
+    # 格式化详情内容：
+    # 尝试解析 JSON → 用 Rich 的 Pretty 美化显示
+    # 否则 → 显示纯文本
     def _detail_renderable(self, detail: str) -> Any:
         text = detail or "(no details)"
         if len(text) > 1600:
@@ -733,6 +728,7 @@ class MokioClawTuiApp(App[None]):
             return Text(text)
         return Pretty(parsed, max_depth=4)
 
+    # 事件类别对应的标记符号
     def _category_marker(self, category: str) -> str:
         return {
             "running": "•",
@@ -742,6 +738,7 @@ class MokioClawTuiApp(App[None]):
             "user": ">",
         }.get(category, "·")
 
+    # 事件类别对应的 CSS 样式
     def _category_style(self, category: str) -> str:
         return {
             "running": "#f4bf75",
@@ -751,6 +748,7 @@ class MokioClawTuiApp(App[None]):
             "user": "#f3ede3",
         }.get(category, "#d7d1c9")
 
+    # 事件类别对应的 CSS 类名
     def _category_class(self, category: str) -> str:
         return {
             "running": "event-running",
@@ -760,6 +758,7 @@ class MokioClawTuiApp(App[None]):
             "user": "event-user",
         }.get(category, "event-info")
 
+    # 提取事件主体中的指定键值对值
     def _line_value(self, body: str, key: str) -> str:
         prefix = f"{key}:"
         for line in body.splitlines():
@@ -767,6 +766,7 @@ class MokioClawTuiApp(App[None]):
                 return line.split(":", 1)[1].strip()
         return ""
 
+    # 提取事件主体中的第一个匹配行，用于显示在事件卡片中。
     def _first_matching_line(self, body: str, prefixes: tuple[str, ...]) -> str:
         for line in body.splitlines():
             stripped = line.strip()
@@ -774,6 +774,7 @@ class MokioClawTuiApp(App[None]):
                 return stripped
         return ""
 
+    # 开始新会话
     def start_new_session(self) -> None:
         if self.running:
             self.notify("MokioClaw is already running a task.", severity="warning")

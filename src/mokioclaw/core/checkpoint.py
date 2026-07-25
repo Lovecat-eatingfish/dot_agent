@@ -4,12 +4,12 @@ import json
 import shlex
 import shutil
 import subprocess
-from dataclasses import is_dataclass, asdict
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import BaseMessage, messages_from_dict, message_to_dict
+
+from mokioclaw.core.utils import json_safe, truncate_json, utc_now, write_json
 
 
 VALID_CHECKPOINT_MODES = {"light", "strict", "off"}
@@ -477,35 +477,9 @@ def resume_command(workspace: Path) -> str:
     return f"uv run mokioclaw --resume {shlex.quote(str(workspace))}"
 
 
-def json_safe(value: Any) -> Any:
-    if isinstance(value, BaseMessage):
-        return message_to_dict(value)
-    if isinstance(value, Path):
-        return str(value)
-    if is_dataclass(value) and not isinstance(value, type):
-        return json_safe(asdict(value))
-    if isinstance(value, dict):
-        return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [json_safe(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
-    try:
-        json.dumps(value)
-        return value
-    except TypeError:
-        return repr(value)
-
-
 def trim_text(value: Any, limit: int) -> str:
-    text = value if isinstance(value, str) else json.dumps(json_safe(value), ensure_ascii=False, default=str)
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    """截断任意值（先 JSON 序列化再截断）"""
+    return truncate_json(value, limit)
 
 
 def should_skip_workspace_path(rel: Path) -> bool:
@@ -536,11 +510,7 @@ def _markdown_items(items: list[Any]) -> list[str]:
     return [f"- {item}" for item in items if item] or ["- (none)"]
 
 
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    tmp.replace(path)
+_write_json = write_json
 
 
 def _git(workspace: Path, git_dir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:

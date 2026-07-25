@@ -1,3 +1,17 @@
+"""
+文件操作工具集
+
+提供安全的文件读写和编辑能力，主要特性：
+1. 路径安全：所有操作都限制在 workspace 目录内
+2. 编码容错：自动尝试多种编码（utf-8, gbk 等）
+3. 并发保护：通过 FileSnapshot 机制防止覆盖他人修改
+4. 差异追踪：写入/编辑操作返回 unified diff
+
+工具列表：
+- FileReadTool: 读取文件内容（支持 offset/limit 分页）
+- FileWriteTool: 创建或重写文件
+- FileEditTool: 精确替换文件中的文本片段
+"""
 from __future__ import annotations
 
 import difflib
@@ -6,11 +20,24 @@ from typing import Any
 
 from mokioclaw.core.state import RuntimeState
 
+# 单次读取的最大行数，防止读取超大文件导致内存溢出
 MAX_READ_LINES = 2000
+
+# 尝试的编码顺序，优先 UTF-8，兼容 Windows 中文环境
 TEXT_ENCODINGS = ("utf-8", "utf-8-sig", "gbk")
 
 
 def _strip_workspace_prefix(file_path: str) -> str:
+    """移除路径中的 workspace/ 前缀
+
+    LLM 有时会在路径前添加 workspace/，这个函数负责清理这种冗余前缀。
+
+    Args:
+        file_path: 原始路径字符串
+
+    Returns:
+        清理后的路径
+    """
     normalized = file_path.replace("\\", "/").strip()
     while normalized in {"workspace", "./workspace"} or normalized.startswith(("workspace/", "./workspace/")):
         if normalized in {"workspace", "./workspace"}:
@@ -23,6 +50,16 @@ def _strip_workspace_prefix(file_path: str) -> str:
 
 
 def read_text_lossy(path: Path) -> str:
+    """容错读取文本文件，自动尝试多种编码
+
+    按照 TEXT_ENCODINGS 的顺序尝试解码，如果都失败则使用 replace 策略。
+
+    Args:
+        path: 文件路径
+
+    Returns:
+        文件内容字符串
+    """
     last_error: UnicodeDecodeError | None = None
     for encoding in TEXT_ENCODINGS:
         try:
@@ -35,6 +72,24 @@ def read_text_lossy(path: Path) -> str:
 
 
 def resolve_workspace_path(state: RuntimeState, file_path: str) -> Path:
+    """将相对路径解析为工作区内的绝对路径
+
+    处理流程：
+    1. 移除 workspace/ 前缀
+    2. 展开 ~ 用户目录
+    3. 相对路径拼接 workspace
+    4. 安全检查（必须在 workspace 内）
+
+    Args:
+        state: 运行时状态
+        file_path: 文件路径字符串
+
+    Returns:
+        解析后的绝对路径
+
+    Raises:
+        ValueError: 如果路径不在工作区内
+    """
     raw = Path(_strip_workspace_prefix(file_path)).expanduser()
     if not raw.is_absolute():
         raw = state.workspace / raw
@@ -42,6 +97,17 @@ def resolve_workspace_path(state: RuntimeState, file_path: str) -> Path:
 
 
 def display_path(state: RuntimeState, path: Path) -> str:
+    """获取用于显示的相对路径
+
+    将绝对路径转换为相对于工作区的路径，便于在输出中展示。
+
+    Args:
+        state: 运行时状态
+        path: 文件路径
+
+    Returns:
+        相对路径字符串，如果无法计算则返回原路径
+    """
     try:
         return str(path.resolve().relative_to(state.workspace.resolve()))
     except ValueError:
@@ -54,6 +120,27 @@ def read_file(
     offset: int | str = 0,
     limit: int | str = MAX_READ_LINES,
 ) -> dict[str, Any]:
+    """读取文件内容（支持分页）
+
+    安全机制：
+    - 路径必须在工作区内
+    - 自动尝试多种编码
+    - 记录文件快照用于后续写入保护
+
+    Args:
+        state: 运行时状态
+        file_path: 文件路径（相对于工作区）
+        offset: 起始行号（从 0 开始）
+        limit: 读取的行数
+
+    Returns:
+        结果字典，包含：
+        - ok: 是否成功
+        - path: 文件相对路径
+        - total_lines: 文件总行数
+        - content: 带行号的文件内容
+        - complete: 是否完整读取
+    """
     try:
         path = resolve_workspace_path(state, file_path)
     except ValueError as exc:
@@ -92,6 +179,25 @@ def read_file(
 
 
 def write_file(state: RuntimeState, file_path: str, content: str) -> dict[str, Any]:
+    """创建或重写文件
+
+    安全机制：
+    - 新文件：直接创建
+    - 已有文件：必须先读取，且文件未被修改过
+
+    Args:
+        state: 运行时状态
+        file_path: 文件路径（相对于工作区）
+        content: 要写入的内容
+
+    Returns:
+        结果字典，包含：
+        - ok: 是否成功
+        - type: "create" 或 "update"
+        - path: 文件相对路径
+        - lines: 写入后的行数
+        - diff: unified diff 格式的变更
+    """
     try:
         path = resolve_workspace_path(state, file_path)
     except ValueError as exc:
@@ -131,6 +237,26 @@ def write_file(state: RuntimeState, file_path: str, content: str) -> dict[str, A
 
 
 def edit_file(state: RuntimeState, file_path: str, old_text: str, new_text: str) -> dict[str, Any]:
+    """精确编辑文件，替换唯一的文本片段
+
+    安全机制：
+    - 必须先读取文件
+    - 文件未被修改过
+    - old_text 必须唯一匹配
+
+    Args:
+        state: 运行时状态
+        file_path: 文件路径（相对于工作区）
+        old_text: 要替换的原文（必须唯一）
+        new_text: 替换后的新文本
+
+    Returns:
+        结果字典，包含：
+        - ok: 是否成功
+        - path: 文件相对路径
+        - replacements: 替换次数（总是 1）
+        - diff: unified diff 格式的变更
+    """
     try:
         path = resolve_workspace_path(state, file_path)
     except ValueError as exc:

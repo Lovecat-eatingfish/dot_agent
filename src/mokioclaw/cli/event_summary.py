@@ -1,12 +1,39 @@
+"""
+事件摘要器
+
+将 Agent 事件转换为 EventSummary 数据类，供 Textual TUI 使用。
+
+与 formatter.py 的区别：
+- formatter.py → 直接用 Rich 渲染到终端（print_event）
+- event_summary.py → 返回 EventSummary 结构化数据（summarize_event）
+  TUI 组件拿到 EventSummary 后自行决定如何展示
+
+两者处理相同的事件类型，但输出格式不同：
+- formatter: Console.print(Panel(...))  → 立即输出到终端
+- event_summary: return EventSummary(...) → 返回给调用方
+"""
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 from typing import Any
 
+from mokioclaw.core.utils import truncate_json
+
 
 @dataclass(frozen=True)
 class EventSummary:
+    """事件摘要数据类
+
+    Attributes:
+        title: 标题，如 "Planner"、"Verifier"、"Tool Call"
+        body: 正文内容（纯文本，可能包含多行）
+        category: 分类标签，TUI 根据此字段选择样式和折叠策略
+                  可选值: event/plan/tool_call/tool_result/verifier/
+                  handoff/search/memory/context/checkpoint/trace/chat/session
+        style: Rich 样式名，TUI 用于着色
+               可选值: cyan/green/red/yellow/magenta/blue/white/dim
+    """
     title: str
     body: str
     category: str = "event"
@@ -14,13 +41,17 @@ class EventSummary:
 
 
 def shorten(value: Any, limit: int = 260) -> str:
-    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
+    """截断任意值（先 JSON 序列化再截断）"""
+    return truncate_json(value, limit)
 
 
 def summarize_event(event: dict[str, Any]) -> EventSummary:
+    """事件摘要入口：将事件字典转为 EventSummary
+
+    与 print_event() 对应，但返回结构化数据而非直接打印。
+    TUI 的 _render_event() 调用此函数获取摘要后更新组件。
+    """
+
     event_type = event.get("type")
     if event_type == "workspace":
         return EventSummary("Workspace", str(event.get("path", "")), "workspace", "blue")

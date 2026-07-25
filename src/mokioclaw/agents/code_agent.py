@@ -1,21 +1,45 @@
+"""
+代码智能体模块
+
+代码智能体（codeAgent）是 MokioClaw 的核心执行者，负责：
+1. 创建和编辑文件
+2. 执行 Shell 命令
+3. 运行测试和检查
+4. 更新待办事项状态
+
+工具集：
+- FileReadTool: 读取文件
+- FileWriteTool: 写入文件
+- FileEditTool: 编辑文件
+- GrepTool: 搜索文件内容
+- BashTool: 执行 Shell 命令
+- NotepadReadTool: 读取笔记本
+- NotepadAppendTool: 写入笔记本
+- TodoUpdateTool: 更新待办事项状态
+
+执行流程：
+1. 接收 planner 的指令
+2. 分析任务需求
+3. 调用工具执行任务
+4. 更新待办事项状态
+5. 返回执行摘要
+"""
 from __future__ import annotations
 
 import json
-from typing import Any, Callable
+from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
 from mokioclaw.core.state import RuntimeState
+from mokioclaw.core.utils import Writer, last_ai_content, tool_result_event as build_tool_result_event
 from mokioclaw.graph.memory import build_layered_memory, format_layered_memory_for_prompt, memory_event
 from mokioclaw.graph.state import MokioGraphState
-from mokioclaw.prompts.stage3 import CODE_AGENT_PROMPT
+from mokioclaw.prompts.agent_prompt import CODE_AGENT_PROMPT
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools import build_tools
 from mokioclaw.tools.todo_tool import persist_todos, update_todo
-
-
-Writer = Callable[[dict[str, Any]], None]
 
 
 def run_code_agent(
@@ -25,9 +49,25 @@ def run_code_agent(
     writer: Writer | None = None,
     max_loops: int = 10,
 ) -> dict[str, Any]:
+    """执行代码智能体
+
+    Args:
+        state: 当前工作流状态
+        instruction: planner 委派的指令
+        writer: 事件写入器，用于实时输出执行过程, 用于 steam 输出的update 事件
+        max_loops: 最大工具调用循环次数
+
+    Returns:
+        执行结果字典，包含：
+        - ok: 是否成功
+        - summary: 执行摘要
+        - todos: 更新后的待办事项
+    """
     runtime = state["runtime"]
+    # 转字典列表
     todos = [dict(todo) for todo in state.get("todos", [])]
     writer = writer or (lambda _: None)
+    # 构建三层记忆： 规则层  工作记忆 历史摘要
     memory = build_layered_memory({**state, "todos": todos}, node="codeAgent")
     writer(memory_event(memory, node="codeAgent"))
     model = create_model()
@@ -67,7 +107,7 @@ def run_code_agent(
                 }
             )
             tool_result, todos = execute_code_agent_tool(runtime, todos, call)
-            event = tool_result_event(tool_result, node="codeAgent")
+            event = build_tool_result_event(tool_result, node="codeAgent")
             tool_events.append(event)
             writer(event)
             if call.get("name") == "TodoUpdateTool":
@@ -94,7 +134,7 @@ def run_code_agent(
             AIMessage(content="codeAgent stopped after the maximum tool loop count; verifier will inspect current files.")
         )
 
-    summary = _last_ai_content(produced_messages)
+    summary = last_ai_content(produced_messages)
     return {
         "ok": True,
         "summary": summary,
@@ -125,14 +165,6 @@ def execute_code_agent_tool(runtime: RuntimeState, todos: list[dict[str, str]], 
     return ToolMessage(content=json.dumps(result, ensure_ascii=False), name=name, tool_call_id=tool_call_id), todos
 
 
-def tool_result_event(tool_message: ToolMessage, *, node: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(str(tool_message.content))
-    except json.JSONDecodeError:
-        parsed = tool_message.content
-    return {"type": "tool_result", "node": node, "name": tool_message.name, "result": parsed}
-
-
 def _build_todo_update_tool(todos: list[dict[str, str]]) -> StructuredTool:
     return StructuredTool.from_function(
         name="TodoUpdateTool",
@@ -150,13 +182,3 @@ def _code_agent_input(state: MokioGraphState, instruction: str, memory: dict[str
         parts.append("Session context for this multi-turn coding session:\n" + str(state.get("session_context", "")))
     parts.append("Layered memory snapshot:\n" + format_layered_memory_for_prompt(memory))
     return "\n\n".join(parts)
-
-
-def _last_ai_content(messages: list[Any]) -> str:
-    for message in reversed(messages):
-        if isinstance(message, ToolMessage):
-            continue
-        content = getattr(message, "content", "")
-        if content:
-            return str(content)
-    return ""

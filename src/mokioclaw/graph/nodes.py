@@ -1,3 +1,36 @@
+"""
+LangGraph 工作流节点实现
+
+本模块实现了 MokioClaw 多智能体工作流的所有节点：
+
+1. intent_router_node - 意图路由器
+   - 判断用户输入是聊天还是工作流任务
+   - 输出 intent_route, intent_reason, intent_confidence
+
+2. chat_responder_node - 聊天回复器
+   - 处理轻量级对话（问候、感谢等）
+   - 不访问工作区，直接回复
+
+3. planner_node - 规划器（核心节点）
+   - 制定任务计划
+   - 委派任务给 search_agent 和 code_agent
+   - 管理待办事项
+
+4. context_monitor_node - 上下文监控器
+   - 监控消息列表的 token 数量
+   - 决定是否需要压缩上下文
+
+5. context_compressor_node - 上下文压缩器
+   - 压缩过长的消息列表
+   - 保留关键信息，移除冗余内容
+
+6. verifier_node - 校验器
+   - 验证任务是否完成
+   - 返回结构化的校验结果
+
+7. final_node - 结束节点
+   - 生成最终结果摘要
+"""
 from __future__ import annotations
 
 import json
@@ -13,6 +46,14 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from mokioclaw.agents.code_agent import run_code_agent
 from mokioclaw.agents.search_agent import run_search_agent
+from mokioclaw.core.utils import (
+    dedupe_sources,
+    execute_tool_by_name,
+    last_ai_content,
+    tool_result_event as build_tool_result_event,
+    truncate,
+    trim_handoffs as trim_handoffs_util,
+)
 from mokioclaw.graph.memory import (
     build_layered_memory,
     format_layered_memory_for_prompt,
@@ -20,15 +61,23 @@ from mokioclaw.graph.memory import (
     persist_history_summary,
 )
 from mokioclaw.graph.state import MokioGraphState, TodoItem, VerificationCheck
-from mokioclaw.prompts.stage3 import PLANNER_PROMPT, VERIFIER_PROMPT
-from mokioclaw.prompts.stage4 import CONTEXT_COMPRESSION_PROMPT
+from mokioclaw.prompts.agent_prompt import (
+    CHAT_RESPONDER_PROMPT,
+    INTENT_ROUTER_PROMPT,
+    PLANNER_PROMPT,
+    VERIFIER_PROMPT,
+)
+from mokioclaw.prompts.context_manager_prompt import CONTEXT_COMPRESSION_PROMPT
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools import build_read_only_tools
 from mokioclaw.tools.todo_tool import persist_todos, write_todos
 
 
-DEFAULT_CONTEXT_TOKEN_LIMIT = 400000
+# ========== 默认配置 ==========
+DEFAULT_CONTEXT_TOKEN_LIMIT = 400000  # 上下文 token 数量上限
 
+# ========== 演示任务配置（明日方舟阿米娅） ==========
+# 这些是用于演示的预设任务，实际使用时由 LLM 动态生成
 AMIYA_TODOS = [
     "Research Amiya and collect reliable source links.",
     "Create amiya_profile.html with a polished character introduction.",
@@ -53,36 +102,23 @@ DEFAULT_TODOS = [
     "Verify the generated result.",
 ]
 
-INTENT_ROUTER_PROMPT = """You are the intent router for MokioClaw.
-
-Classify the user's latest input into exactly one route:
-
-- chat: greetings, thanks, identity/help questions, ordinary conceptual Q&A, or conversational messages that do not need workspace access.
-- workflow: any request that needs creating/editing/reading files, running commands, installing packages, searching the web, checking the current project, verifying a result, or producing a concrete deliverable.
-
-When session context is provided, use it only to understand whether the latest
-input is a continuation of prior coding work. A short follow-up like "继续",
-"修一下", or "运行测试" should be workflow if it refers to prior workspace work.
-
-Return only JSON with this shape:
-{"route":"chat"|"workflow","reason":"brief reason","confidence":0.0}
-
-If uncertain, choose workflow.
-"""
-
-CHAT_RESPONDER_PROMPT = """You are MokioClaw's lightweight chat node.
-
-Answer the user directly and concisely. Do not claim that you read files,
-searched the web, ran commands, edited files, or inspected the workspace.
-If the user asks for work requiring tools or project context, say that it
-should be handled by the workflow route.
-
-If session context is provided, you may use the recent conversation summary to
-answer conversational follow-ups, but do not invent workspace facts.
-"""
-
-
 def intent_router_node(state: MokioGraphState) -> dict[str, Any]:
+    """意图路由器节点
+
+    分析用户输入，判断应该走聊天分支还是工作流分支。
+
+    决策逻辑：
+    1. 调用 LLM 分析用户输入
+    2. 解析返回的 JSON（route, reason, confidence）
+    3. 如果置信度 >= 0.55 且路由有效，则使用 LLM 的决策
+    4. 否则默认走工作流分支
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        更新的状态字段：intent_route, intent_reason, intent_confidence
+    """
     writer = _get_writer()
     route = "workflow"
     reason = "router fallback: default to workflow"
@@ -122,10 +158,28 @@ def intent_router_node(state: MokioGraphState) -> dict[str, Any]:
 
 
 def intent_route_fn(state: MokioGraphState) -> str:
+    """根据意图路由决定下一步执行的节点
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        "chat_responder" 或 "planner"
+    """
     return "chat_responder" if state.get("intent_route") == "chat" else "planner"
 
 
 def chat_responder_node(state: MokioGraphState) -> dict[str, Any]:
+    """聊天回复节点
+
+    处理轻量级对话，不调用任何工具，直接返回 LLM 的回复。
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        更新的状态字段：chat_response, final_answer
+    """
     writer = _get_writer()
     try:
         response = create_model().invoke(
@@ -150,6 +204,25 @@ def chat_responder_node(state: MokioGraphState) -> dict[str, Any]:
 
 
 def planner_node(state: MokioGraphState) -> dict[str, Any]:
+    """规划器节点（核心节点）
+
+    职责：
+    1. 制定或更新任务计划（todos, acceptance_criteria, verification_commands）
+    2. 委派任务给专业智能体（search_agent, code_agent）
+    3. 管理待办事项状态
+
+    可用工具：
+    - TodoWriteTool: 创建或更新任务计划
+    - CallSearchAgentTool: 委派搜索任务
+    - CallCodeAgentTool: 委派代码实现任务
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        更新的状态字段：plan_summary, todos, acceptance_criteria, verification_commands,
+        research_notes, sources, agent_handoffs, code_agent_summary, messages 等
+    """
     writer = _get_writer()
     working_state: MokioGraphState = {**state}
     if not working_state.get("todos"):
@@ -219,6 +292,29 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
 
 
 def verifier_node(state: MokioGraphState) -> dict[str, Any]:
+    """校验器节点
+
+    职责：
+    1. 使用只读工具检查工作区状态
+    2. 执行验证命令
+    3. 判断任务是否完成
+    4. 返回结构化的校验结果
+
+    校验结果格式：
+    {
+        "passed": true/false,
+        "reason": "校验说明",
+        "checks": [{"name": "...", "passed": true/false, "detail": "..."}],
+        "recommended_next_instruction": "失败时的修复建议"
+    }
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        更新的状态字段：verification_results, verification_checks, verifier_summary,
+        passed, attempts, last_error, todos
+    """
     writer = _get_writer()
     memory = build_layered_memory(state, node="verifier")
     writer(memory_event(memory, node="verifier"))
@@ -251,7 +347,7 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
         for call in tool_calls:
             writer({"type": "tool_call", "node": "verifier", "name": call.get("name"), "args": call.get("args", {})})
             tool_message = _execute_read_only_tool(state, call)
-            event = _tool_result_event(tool_message, node="verifier")
+            event = build_tool_result_event(tool_message, node="verifier")
             tool_events.append(event)
             writer(event)
             produced_messages.append(tool_message)
@@ -325,6 +421,26 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
 
 
 def context_monitor_node(state: MokioGraphState) -> dict[str, Any]:
+    """上下文监控节点
+
+    职责：
+    1. 估算当前消息列表的 token 数量
+    2. 与配置的上限进行比较
+    3. 决定是否需要压缩上下文
+
+    监控指标：
+    - token_count: 当前 token 数量
+    - token_limit: 配置的上限（默认 400000）
+    - should_compress: 是否需要压缩
+    - message_count: 当前消息数量
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        更新的状态字段：context_token_count, context_token_limit,
+        context_should_compress, context_next_node
+    """
     writer = _get_writer()
     token_limit = get_context_token_limit()
     token_count = estimate_context_tokens(state)
@@ -348,6 +464,20 @@ def context_monitor_node(state: MokioGraphState) -> dict[str, Any]:
 
 
 def context_monitor_route(state: MokioGraphState) -> str:
+    """上下文监控路由函数
+
+    根据上下文状态决定下一步：
+    - context_compressor: 需要压缩上下文
+    - verifier: 正常流程，进入校验
+    - planner: 需要重新规划
+    - final: 任务完成
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        下一个节点的名称
+    """
     if state.get("context_should_compress"):
         return "context_compressor"
     return state.get("context_next_node") or "verifier"
@@ -410,6 +540,18 @@ def context_compressor_route(state: MokioGraphState) -> str:
 
 
 def verifier_route(state: MokioGraphState) -> str:
+    """校验器路由函数
+
+    根据校验结果决定下一步：
+    - final: 校验通过或达到最大重试次数
+    - planner: 校验失败，需要重新规划
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        下一个节点的名称
+    """
     if state.get("passed"):
         return "final"
     if state.get("attempts", 0) >= state.get("max_attempts", 3):
@@ -418,6 +560,23 @@ def verifier_route(state: MokioGraphState) -> str:
 
 
 def final_node(state: MokioGraphState) -> dict[str, Any]:
+    """结束节点
+
+    生成任务执行的最终结果摘要，包括：
+    - 任务状态（PASSED/FAILED）
+    - 计划摘要
+    - 待办事项列表
+    - 研究来源
+    - 校验结果
+    - 上下文压缩统计
+    - 代码智能体摘要
+
+    Args:
+        state: 当前工作流状态
+
+    Returns:
+        包含 final_answer 的状态更新
+    """
     status = "PASSED" if state.get("passed") else "FAILED"
     checks = "\n".join(
         f"- {check.get('name', 'check')}: {'PASS' if check.get('passed') else 'FAIL'} - {check.get('detail', '')}"
@@ -573,44 +732,18 @@ def _call_code_agent_tool(state: MokioGraphState, writer, instruction: str) -> d
 
 
 def _execute_planner_tool(state: MokioGraphState, writer, call: dict[str, Any]) -> ToolMessage:
+    """执行 planner 的工具调用（带 writer 事件输出）"""
     name = call.get("name", "")
     args = call.get("args") or {}
     writer({"type": "tool_call", "node": "planner", "name": name, "args": args})
-    tools = {tool.name: tool for tool in _build_planner_tools(state, writer)}
-    tool = tools.get(name)
-    if tool is None:
-        result = {"ok": False, "error": f"unknown tool: {name}"}
-    else:
-        try:
-            result = tool.invoke(args)
-        except Exception as exc:
-            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    tool_message = ToolMessage(
-        content=json.dumps(result, ensure_ascii=False),
-        name=name,
-        tool_call_id=call.get("id") or f"{name}-call",
-    )
-    writer(_tool_result_event(tool_message, node="planner"))
+    tool_message = execute_tool_by_name(_build_planner_tools(state, writer), call)
+    writer(build_tool_result_event(tool_message, node="planner"))
     return tool_message
 
 
 def _execute_read_only_tool(state: MokioGraphState, call: dict[str, Any]) -> ToolMessage:
-    name = call.get("name", "")
-    args = call.get("args") or {}
-    tools = {tool.name: tool for tool in build_read_only_tools(state["runtime"])}
-    tool = tools.get(name)
-    if tool is None:
-        result = {"ok": False, "error": f"unknown tool: {name}"}
-    else:
-        try:
-            result = tool.invoke(args)
-        except Exception as exc:
-            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return ToolMessage(
-        content=json.dumps(result, ensure_ascii=False),
-        name=name,
-        tool_call_id=call.get("id") or f"{name}-call",
-    )
+    """执行只读工具调用"""
+    return execute_tool_by_name(build_read_only_tools(state["runtime"]), call)
 
 
 def _compress_context_with_model(state: MokioGraphState) -> dict[str, Any]:
@@ -734,17 +867,14 @@ def _verifier_input(state: MokioGraphState, memory: dict[str, Any]) -> str:
 
 
 def _router_input(state: MokioGraphState) -> str:
+    """构建路由器/聊天输入提示词"""
     parts = [f"User input:\n{state.get('task', '')}"]
     if state.get("session_context"):
         parts.append("Session context:\n" + str(state.get("session_context", "")))
     return "\n\n".join(parts)
 
 
-def _chat_input(state: MokioGraphState) -> str:
-    parts = [f"User input:\n{state.get('task', '')}"]
-    if state.get("session_context"):
-        parts.append("Session context:\n" + str(state.get("session_context", "")))
-    return "\n\n".join(parts)
+_chat_input = _router_input
 
 
 def _default_plan(task: str) -> dict[str, Any]:
@@ -814,12 +944,7 @@ def _coerce_confidence(value: Any) -> float:
     return max(0.0, min(1.0, confidence))
 
 
-def _tool_result_event(tool_message: ToolMessage, *, node: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(str(tool_message.content))
-    except json.JSONDecodeError:
-        parsed = tool_message.content
-    return {"type": "tool_result", "node": node, "name": tool_message.name, "result": parsed}
+_tool_result_event = build_tool_result_event
 
 
 def _tool_events_to_verification_results(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -873,46 +998,20 @@ def _join_notes(existing: str, new: str) -> str:
     return existing + "\n\n" + new
 
 
-def _dedupe_sources(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[str] = set()
-    deduped = []
-    for source in sources:
-        url = str(source.get("url", ""))
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        deduped.append(source)
-    return deduped
+_dedupe_sources = dedupe_sources
 
 
 def _trim_handoffs(handoffs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    trimmed = []
-    for handoff in handoffs[-6:]:
-        trimmed.append(
-            {
-                "from_agent": handoff.get("from_agent", ""),
-                "to_agent": handoff.get("to_agent", ""),
-                "instruction": _short_text(str(handoff.get("instruction", "")), 500),
-                "result": _short_text(str(handoff.get("result", "")), 700),
-            }
-        )
-    return trimmed
+    """截断智能体交接记录"""
+    return trim_handoffs_util(handoffs)
 
 
 def _short_text(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    return text[: limit - 3] + "..."
+    """截断文本到指定长度"""
+    return truncate(text, limit)
 
 
-def _last_ai_content(messages: list[Any]) -> str:
-    for message in reversed(messages):
-        if isinstance(message, ToolMessage):
-            continue
-        content = getattr(message, "content", "")
-        if content:
-            return str(content)
-    return ""
+_last_ai_content = last_ai_content
 
 
 def _todos_text(todos: list[dict[str, Any]]) -> str:

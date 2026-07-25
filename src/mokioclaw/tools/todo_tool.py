@@ -9,7 +9,7 @@ VALID_TODO_STATUSES = {"pending", "in_progress", "completed", "blocked"}
 TODO_FILE = "TODO.md"
 
 
-# AI 的任务拆解、待办清单管理、状态更新、落地写入本地 TODO.md 文件
+# AI 的任务拆解、待办清单管理、状态更新、落地写入本地 todolist.md 文件
 
 
 

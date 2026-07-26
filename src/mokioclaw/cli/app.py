@@ -33,6 +33,7 @@ from typer.core import TyperGroup
 from mokioclaw.cli.formatter import print_event, safe_echo, safe_secho
 from mokioclaw.core.approval import ApprovalDecision, ApprovalRequest
 from mokioclaw.core.agent import stream_agent_events
+from mokioclaw.core.log import setup_logging
 
 
 class MokioClawGroup(TyperGroup):
@@ -139,6 +140,9 @@ def main(
     # 如果用户调了子命令（如 tui），callback 只做参数解析，不执行主逻辑
     if ctx.invoked_subcommand is not None:
         return
+    setup_logging()
+    from dotenv import load_dotenv
+    load_dotenv()
     configure_console()
     task = None
     if isinstance(ctx.obj, dict):

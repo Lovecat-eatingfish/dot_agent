@@ -22,13 +22,123 @@ import json
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict
 
 from langchain_core.messages import AIMessage, BaseMessage, ToolMessage, message_to_dict
 
 
 # 事件写入器类型，用于向外部发送实时事件
 Writer = Callable[[dict[str, Any]], None]
+
+
+# ---------------------------------------------------------------------------
+# 工具返回类型（TypedDict）
+# ---------------------------------------------------------------------------
+
+class ToolResult(TypedDict, total=False):
+    """所有工具返回的基础类型
+
+    所有工具都至少返回 ok 字段。
+    失败时额外返回 error 字段。
+    """
+    ok: bool
+    error: str
+
+
+class BashResult(ToolResult, total=False):
+    """BashTool 返回类型"""
+    timed_out: bool
+    command: str
+    exit_code: int | None
+    stdout: str
+    stderr: str
+    duration_ms: int
+    stdout_path: str
+    stderr_path: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+    requires_approval: bool
+    approval_id: str
+    risk_reason: str
+    approved: bool
+    background: bool
+    pid: int
+
+
+class FileReadResult(ToolResult, total=False):
+    """FileReadTool 返回类型"""
+    path: str
+    total_lines: int
+    offset: int
+    limit: int
+    complete: bool
+    content: str
+
+
+class FileWriteResult(ToolResult, total=False):
+    """FileWriteTool 返回类型"""
+    type: str  # "create" | "update"
+    path: str
+    lines: int
+    diff: str
+
+
+class FileEditResult(ToolResult, total=False):
+    """FileEditTool 返回类型"""
+    path: str
+    replacements: int
+    diff: str
+
+
+class NotepadReadResult(ToolResult, total=False):
+    """NotepadReadTool 返回类型"""
+    path: str
+    content: str
+    exists: bool
+
+
+class NotepadAppendResult(ToolResult, total=False):
+    """NotepadAppendTool 返回类型"""
+    path: str
+    heading: str
+    lines: int
+
+
+class SearchResult(TypedDict, total=False):
+    """单条搜索结果条目"""
+    title: str
+    url: str
+    content: str
+    score: float
+
+
+class WebSearchResult(ToolResult, total=False):
+    """WebSearchTool 返回类型"""
+    query: str
+    answer: str
+    results: list[SearchResult]
+
+
+class TodoWriteResult(ToolResult, total=False):
+    """write_todos 返回类型"""
+    todos: list[str]
+    acceptance_criteria: list[str]
+    verification_commands: list[str]
+
+
+class TodoUpdateResult(ToolResult, total=False):
+    """update_todo 返回类型"""
+    todo_id: str
+    status: str
+    note: str
+    todos: list[dict[str, str]]
+
+
+class TodoPersistResult(ToolResult, total=False):
+    """persist_todos 返回类型"""
+    path: str
+    lines: int
+    todos: list[dict[str, Any]]
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +347,12 @@ def coerce_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "y", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "n", "off"}:
+            return False
+        return default
     return default
 
 

@@ -9,7 +9,6 @@ from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.graph.memory import build_layered_memory, persist_history_summary, read_history_summary
 from mokioclaw.graph.nodes import (
-    AMIYA_COMMANDS,
     _call_code_agent_tool,
     _call_search_agent_tool,
     chat_responder_node,
@@ -172,7 +171,6 @@ def test_chat_responder_node_returns_chat_response(monkeypatch) -> None:
 
 
 def test_context_token_limit_defaults_and_env(monkeypatch) -> None:
-    monkeypatch.setattr("mokioclaw.graph.nodes.load_dotenv", lambda: None)
     monkeypatch.delenv("MOKIO_CONTEXT_TOKEN_LIMIT", raising=False)
     assert get_context_token_limit() == 400000
 
@@ -279,7 +277,7 @@ def test_context_compressor_removes_old_messages_and_preserves_state(monkeypatch
     assert context_compressor_route({**state, **result}) == "verifier"
 
 
-def test_amiya_planner_uses_fixed_verifier_commands(monkeypatch, tmp_path: Path) -> None:
+def test_planner_generates_default_plan(monkeypatch, tmp_path: Path) -> None:
     class FakeBoundModel:
         def invoke(self, messages):
             return AIMessage(content="plan ready")
@@ -291,18 +289,16 @@ def test_amiya_planner_uses_fixed_verifier_commands(monkeypatch, tmp_path: Path)
     monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
     result = planner_node(
         {
-            "task": "帮我查阅明日方舟阿米娅，并编写一个 HTML 介绍人物",
+            "task": "Create a simple HTML page",
             "runtime": RuntimeState(workspace=tmp_path),
             "attempts": 0,
             "max_attempts": 3,
         }
     )
 
-    assert result["verification_commands"] == AMIYA_COMMANDS
     assert result["todos"][0]["id"] == "todo-1"
     assert result["todos"][0]["status"] == "pending"
     assert (tmp_path / "TODO.md").exists()
-    assert "amiya_profile.html" in (tmp_path / "TODO.md").read_text(encoding="utf-8")
 
 
 def test_call_search_agent_tool_updates_state(monkeypatch, tmp_path: Path) -> None:

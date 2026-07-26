@@ -35,7 +35,7 @@ class TodoItem(TypedDict):
 
     属性：
         id: 任务唯一标识符，如 "todo-1"
-        content: 任务描述，如 "创建 amiya_profile.html"
+        content: 任务描述，如 "创建 index.html"
         status: 当前状态 - pending/in_progress/completed/blocked
         note: 备注信息，如失败原因或阻塞说明
     """

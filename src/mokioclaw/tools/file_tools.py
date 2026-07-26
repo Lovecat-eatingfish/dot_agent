@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from mokioclaw.core.state import RuntimeState
+from mokioclaw.core.utils import FileEditResult, FileReadResult, FileWriteResult
 
 # 单次读取的最大行数，防止读取超大文件导致内存溢出
 MAX_READ_LINES = 2000
@@ -119,7 +120,7 @@ def read_file(
     file_path: str,
     offset: int | str = 0,
     limit: int | str = MAX_READ_LINES,
-) -> dict[str, Any]:
+) -> FileReadResult:
     """读取文件内容（支持分页）
 
     安全机制：
@@ -178,7 +179,7 @@ def read_file(
     }
 
 
-def write_file(state: RuntimeState, file_path: str, content: str) -> dict[str, Any]:
+def write_file(state: RuntimeState, file_path: str, content: str) -> FileWriteResult:
     """创建或重写文件
 
     安全机制：
@@ -236,7 +237,7 @@ def write_file(state: RuntimeState, file_path: str, content: str) -> dict[str, A
     }
 
 
-def edit_file(state: RuntimeState, file_path: str, old_text: str, new_text: str) -> dict[str, Any]:
+def edit_file(state: RuntimeState, file_path: str, old_text: str, new_text: str) -> FileEditResult:
     """精确编辑文件，替换唯一的文本片段
 
     安全机制：

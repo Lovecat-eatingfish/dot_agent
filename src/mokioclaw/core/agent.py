@@ -4,10 +4,12 @@ import os
 from pathlib import Path
 from typing import Any, Iterator
 
-from dotenv import load_dotenv
 from langgraph.graph import add_messages
 
 from mokioclaw.core.checkpoint import CheckpointManager, load_resume_inputs, normalize_checkpoint_mode
+from mokioclaw.core.log import get_logger
+
+logger = get_logger(__name__)
 from mokioclaw.core.paths import default_workspace
 from mokioclaw.core.session import (
     append_assistant_turn,
@@ -33,7 +35,6 @@ def create_runtime(
     resume_from: Path | None = None,
     trace_mode: str | None = None,
 ) -> RuntimeState:
-    load_dotenv()
     selected = workspace or resume_from or default_workspace()
     selected.mkdir(parents=True, exist_ok=True)
     return RuntimeState(
@@ -146,6 +147,16 @@ def stream_agent_events(
             trace.record_custom_event(saved)
             yield {"type": "custom_event", "event": saved}
         trace_event = trace.end(status="interrupted", latest_node=latest_node, final_state=current_state)
+        if trace_event:
+            yield {"type": "custom_event", "event": trace_event}
+        return
+    except Exception as exc:
+        logger.error("workflow failed: %s", exc, exc_info=True)
+        saved = manager.save(current_state, status="failed", latest_node=latest_node)
+        if saved:
+            trace.record_custom_event(saved)
+            yield {"type": "custom_event", "event": saved}
+        trace_event = trace.end(status="failed", latest_node=latest_node, final_state=current_state)
         if trace_event:
             yield {"type": "custom_event", "event": trace_event}
         return
@@ -321,6 +332,16 @@ def _stream_complex_workflow(
             trace.record_custom_event(saved)
             yield {"type": "custom_event", "event": saved}
         trace_event = trace.end(status="interrupted", latest_node=latest_node, final_state=current_state)
+        if trace_event:
+            yield {"type": "custom_event", "event": trace_event}
+        return
+    except Exception as exc:
+        logger.error("workflow failed: %s", exc, exc_info=True)
+        saved = manager.save(current_state, status="failed", latest_node=latest_node)
+        if saved:
+            trace.record_custom_event(saved)
+            yield {"type": "custom_event", "event": saved}
+        trace_event = trace.end(status="failed", latest_node=latest_node, final_state=current_state)
         if trace_event:
             yield {"type": "custom_event", "event": trace_event}
         return

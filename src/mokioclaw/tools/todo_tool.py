@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from mokioclaw.core.state import RuntimeState
+from mokioclaw.core.utils import TodoPersistResult, TodoUpdateResult, TodoWriteResult
 
 VALID_TODO_STATUSES = {"pending", "in_progress", "completed", "blocked"}
 TODO_FILE = "TODO.md"
@@ -46,7 +47,7 @@ def write_todos(
     todos: list[str],
     acceptance_criteria: list[str],
     verification_commands: list[str],
-) -> dict[str, Any]:
+) -> TodoWriteResult:
     cleaned_todos = _normalize_items(todos)
     cleaned_criteria = _normalize_items(acceptance_criteria)
     cleaned_commands = _normalize_items(verification_commands)
@@ -64,7 +65,7 @@ def update_todo(
     todo_id: str,
     status: str,
     note: str = "",
-) -> dict[str, Any]:
+) -> TodoUpdateResult:
     if status not in VALID_TODO_STATUSES:
         return {
             "ok": False,
@@ -93,7 +94,7 @@ def persist_todos(
     acceptance_criteria: list[str] | None = None,
     verification_commands: list[str] | None = None,
     plan_summary: str = "",
-) -> dict[str, Any]:
+) -> TodoPersistResult:
     path = state.assert_workspace_path(state.workspace / TODO_FILE)
     content = render_todo_markdown(todos, acceptance_criteria or [], verification_commands or [], plan_summary)
     path.parent.mkdir(parents=True, exist_ok=True)

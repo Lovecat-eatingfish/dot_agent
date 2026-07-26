@@ -33,6 +33,12 @@ RISK_PATTERNS = [
     (r"(?:^|&&|\|\||;)\s*(?:curl|wget)\b", "Network download command"),
     (r"(?:^|&&|\|\||;)\s*uvicorn\b", "Long-running development server"),
     (r"(?:^|&&|\|\||;)\s*python\s+-m\s+http\.server\b", "Long-running development server"),
+    (r"(?:^|&&|\|\||;)\s*git\s+push\b", "Git push to remote"),
+    (r"(?:^|&&|\|\||;)\s*git\s+reset\s+--hard\b", "Git hard reset (destructive)"),
+    (r"(?:^|&&|\|\||;)\s*docker\s+(?:run|exec)\b", "Docker container execution"),
+    (r"(?:^|&&|\|\||;)\s*ssh\b", "Remote shell access"),
+    (r"(?:^|&&|\|\||;)\s*scp\b", "Remote file copy"),
+    (r"(?:^|&&|\|\||;)\s*rsync\b", "Remote file sync"),
 ]
 
 

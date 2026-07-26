@@ -2,13 +2,10 @@ from __future__ import annotations
 
 import os
 
-from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 
 
 def create_model() -> ChatOpenAI:
-    load_dotenv()
-
     api_key = os.getenv("API_KEY")
     model = os.getenv("MODEL")
     base_url = os.getenv("BASE_URL")

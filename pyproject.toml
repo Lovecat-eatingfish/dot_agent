@@ -23,9 +23,6 @@ dev = [
     "pytest>=8.0.0",
 ]
 
-[tool.pytest.ini_options]
-addopts = "-p no:launch_testing -p no:launch_ros"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

@@ -24,7 +24,10 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
+from mokioclaw.core.log import get_logger
 from mokioclaw.core.utils import Writer, dedupe_sources, last_ai_content, parse_json_content, tool_result_event
+
+logger = get_logger(__name__)
 from mokioclaw.graph.state import MokioGraphState
 from mokioclaw.prompts.agent_prompt import SEARCH_AGENT_PROMPT
 from mokioclaw.providers.openai_provider import create_model
@@ -148,6 +151,7 @@ def _execute_search_tool(search_tool: Any, call: dict[str, Any]) -> ToolMessage:
         try:
             result = search_tool.invoke(args)
         except Exception as exc:
+            logger.warning("searchAgent tool %s failed: %s", name, exc, exc_info=True)
             result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     return ToolMessage(
         content=json.dumps(result, ensure_ascii=False),

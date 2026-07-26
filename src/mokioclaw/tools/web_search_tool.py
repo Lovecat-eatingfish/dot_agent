@@ -3,17 +3,17 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from dotenv import load_dotenv
 from langchain_core.tools import StructuredTool
+
+from mokioclaw.core.utils import WebSearchResult, coerce_bool
 
 
 def web_search(
     query: str,
     max_results: int | str = 5,
     include_answer: bool | str = True,
-) -> dict[str, Any]:
+) -> WebSearchResult:
     """Search the web with Tavily and return a compact structured result."""
-    load_dotenv()
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
         return {"ok": False, "error": "missing required .env setting: TAVILY_API_KEY"}
@@ -28,7 +28,7 @@ def web_search(
     except (TypeError, ValueError):
         max_value = 5
     max_value = max(1, min(max_value, 10))
-    answer_value = _coerce_bool(include_answer)
+    answer_value = coerce_bool(include_answer, default=True)
 
     try:
         client = TavilyClient(api_key=api_key)
@@ -69,9 +69,3 @@ def build_web_search_tool() -> StructuredTool:
             "Returns answer and result sources with title, url, content, and score."
         ),
     )
-
-
-def _coerce_bool(value: bool | str) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() not in {"false", "0", "no", "off"}

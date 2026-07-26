@@ -1,15 +1,15 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any
+from datetime import datetime, timezone
 
 from mokioclaw.core.state import RuntimeState
+from mokioclaw.core.utils import NotepadAppendResult, NotepadReadResult
 from mokioclaw.tools.file_tools import read_text_lossy
 
 NOTEPAD_FILE = "NOTEPAD.md"
 
 
-def read_notepad(state: RuntimeState) -> dict[str, Any]:
+def read_notepad(state: RuntimeState) -> NotepadReadResult:
     path = state.assert_workspace_path(state.workspace / NOTEPAD_FILE)
     if not path.exists():
         return {"ok": True, "path": NOTEPAD_FILE, "content": "", "exists": False}
@@ -18,14 +18,14 @@ def read_notepad(state: RuntimeState) -> dict[str, Any]:
     return {"ok": True, "path": NOTEPAD_FILE, "content": content, "exists": True}
 
 
-def append_notepad(state: RuntimeState, heading: str, content: str) -> dict[str, Any]:
+def append_notepad(state: RuntimeState, heading: str, content: str) -> NotepadAppendResult:
     if not content.strip():
         return {"ok": False, "error": "content must not be empty"}
     path = state.assert_workspace_path(state.workspace / NOTEPAD_FILE)
     path.parent.mkdir(parents=True, exist_ok=True)
     existing = read_text_lossy(path) if path.exists() else "# MokioClaw Notepad\n"
     title = heading.strip() or "Note"
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     entry = f"\n## {title}\n\n_Recorded: {timestamp}_\n\n{content.strip()}\n"
     updated = existing.rstrip() + "\n" + entry
     path.write_text(updated, encoding="utf-8")

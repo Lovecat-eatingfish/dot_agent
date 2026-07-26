@@ -27,6 +27,7 @@ from typing import Any
 
 from mokioclaw.core.approval import ApprovalDecision, classify_command_risk, make_approval_request
 from mokioclaw.core.state import RuntimeState
+from mokioclaw.core.utils import BashResult, coerce_bool
 
 # ========== 默认配置常量 ==========
 DEFAULT_TIMEOUT_SECONDS = 120      # 单次命令默认超时（秒）
@@ -43,6 +44,16 @@ DANGEROUS_PATTERNS = [
     r"\bshutdown\b",                                     # 关机
     r"\breboot\b",                                       # 重启
     r"(?:^|[^0-9])>\s*(?:[A-Za-z]:\\|/(?!dev/null\b))", # 重定向到非 /dev/null
+    r"\bmkfs\b",                                         # 创建文件系统
+    r"\bdd\s+",                                          # 磁盘镜像写入
+    r"\bchmod\s+777\b",                                  # 全开权限
+    r"\bchown\b",                                        # 修改所有者
+    r"\bkill\s+-9\b",                                    # 强制杀进程
+    r"\bpkill\b",                                        # 按名杀进程
+    r"\biptables\b",                                     # 防火墙操作
+    r"(?:^|[;&|])\s*eval\s",                             # eval 执行
+    r"(?:^|[;&|])\s*exec\s",                             # exec 替换进程
+    r"\|\s*(ba)?sh\b",                                   # pipe 到 shell
 ]
 
 
@@ -136,7 +147,7 @@ def _normalize_command(command: str) -> str:
     )
 
 
-def _handle_tail_command(state: RuntimeState, command: str) -> dict[str, Any] | None:
+def _handle_tail_command(state: RuntimeState, command: str) -> BashResult | None:
     """处理 tail 命令，避免在 Windows 上执行不支持的命令
 
     将 tail -N file.txt 转换为 Python 实现，确保跨平台兼容。
@@ -173,7 +184,7 @@ def _handle_tail_command(state: RuntimeState, command: str) -> dict[str, Any] | 
     }
 
 
-def _handle_workspace_query(state: RuntimeState, command: str) -> dict[str, Any] | None:
+def _handle_workspace_query(state: RuntimeState, command: str) -> BashResult | None:
     if not re.fullmatch(r"\s*(?:cd|pwd)\s*", command, flags=re.IGNORECASE):
         return None
     return {
@@ -220,7 +231,7 @@ def run_bash(
     command: str,
     timeout_seconds: int | str | float | None = None,
     run_in_background: bool | str = False,
-) -> dict[str, Any]:
+) -> BashResult:
     """执行 Bash 命令
 
     核心执行流程：
@@ -256,7 +267,7 @@ def run_bash(
     if timeout <= 0 or timeout > max_timeout:
         return {"ok": False, "error": f"timeout_seconds must be between 1 and {max_timeout}"}
     normalized_command = _normalize_command(command)
-    background = _coerce_bool(run_in_background)
+    background = coerce_bool(run_in_background)
 
     handled = _handle_tail_command(state, normalized_command)
     if handled is not None:
@@ -311,7 +322,103 @@ def run_bash(
     }
 
 
-def _resolve_approval(state: RuntimeState, command: str) -> dict[str, Any] | None:
+# ========== 只读 BashTool 白名单 ==========
+# verifier 专用：只允许不会修改文件系统的命令
+READ_ONLY_ALLOWED = {
+    "cat", "head", "tail", "grep", "egrep", "fgrep",
+    "ls", "dir", "find", "wc", "wcw",
+    "echo", "printf", "which", "where", "whereis",
+    "test", "true", "false",
+    "python", "python3", "node",
+    "uname", "whoami", "pwd", "date",
+}
+
+
+def run_bash_read_only(
+    state: RuntimeState,
+    command: str,
+    timeout_seconds: int | str | float | None = None,
+    run_in_background: bool | str = False,
+) -> BashResult:
+    """只读 Bash 命令执行（verifier 专用）
+
+    只允许白名单中的命令，拒绝一切可能修改文件系统的操作。
+    不走审批流程——只读命令天然安全。
+    """
+    if not command.strip():
+        return {"ok": False, "error": "command must not be empty"}
+
+    normalized_command = _normalize_command(command)
+
+    # 提取命令的第一个 token（处理 env var 前缀如 PYTHONIOENCODING=utf-8 python ...）
+    try:
+        tokens = shlex.split(normalized_command)
+    except ValueError:
+        tokens = normalized_command.split()
+    if not tokens:
+        return {"ok": False, "error": "empty command"}
+
+    # 跳过 VAR=val 前缀
+    cmd_name = ""
+    for token in tokens:
+        if "=" in token and token[0] != "=" and not token.startswith("-"):
+            continue
+        cmd_name = token
+        break
+    cmd_base = Path(cmd_name).stem.lower() if cmd_name else ""
+    # Windows 上 python.exe → python
+    if cmd_base.endswith(".exe"):
+        cmd_base = cmd_base[:-4]
+
+    if cmd_base not in READ_ONLY_ALLOWED:
+        return {
+            "ok": False,
+            "error": f"read-only mode: command '{cmd_base}' is not in the allowed list ({', '.join(sorted(READ_ONLY_ALLOWED))})",
+        }
+
+    timeout = _coerce_timeout(timeout_seconds)
+    if timeout_seconds is None:
+        timeout = _state_int(state, "bash_default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    max_timeout = _state_int(state, "bash_max_timeout_seconds", DEFAULT_MAX_TIMEOUT_SECONDS)
+    if timeout <= 0 or timeout > max_timeout:
+        timeout = min(timeout, max_timeout)
+
+    started = time.perf_counter()
+    env, env_error = _build_env(state)
+    if env_error is not None:
+        return {"ok": False, "error": env_error}
+    max_output_chars = _state_int(state, "bash_max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
+
+    try:
+        completed = subprocess.run(
+            normalized_command,
+            cwd=state.workspace,
+            shell=True,
+            capture_output=True,
+            timeout=timeout,
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "ok": False,
+            "timed_out": True,
+            "exit_code": None,
+            **_format_captured_output(state, _decode_output(exc.stdout), _decode_output(exc.stderr), max_output_chars),
+            "duration_ms": round((time.perf_counter() - started) * 1000),
+        }
+
+    output = _format_captured_output(state, _decode_output(completed.stdout), _decode_output(completed.stderr), max_output_chars)
+    return {
+        "ok": completed.returncode == 0,
+        "timed_out": False,
+        "command": normalized_command,
+        "exit_code": completed.returncode,
+        **output,
+        "duration_ms": round((time.perf_counter() - started) * 1000),
+    }
+
+
+def _resolve_approval(state: RuntimeState, command: str) -> BashResult | None:
     risk_reason = classify_command_risk(command)
     if risk_reason is None:
         return None
@@ -356,12 +463,6 @@ def _state_int(state: RuntimeState, name: str, default: int) -> int:
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
-
-
-def _coerce_bool(value: bool | str) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _build_env(state: RuntimeState) -> tuple[dict[str, str], str | None]:
@@ -477,7 +578,7 @@ def _expand_env_value(value: str, env: dict[str, str]) -> str:
     return re.sub(r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*)", replace_var, value)
 
 
-def _format_captured_output(state: RuntimeState, stdout: str, stderr: str, max_output_chars: int) -> dict[str, Any]:
+def _format_captured_output(state: RuntimeState, stdout: str, stderr: str, max_output_chars: int) -> dict[str, str | bool]:
     output: dict[str, Any] = {}
     output_dir = state.workspace / ".mokioclaw" / "bash-outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -501,7 +602,7 @@ def _run_background(
     command: str,
     env: dict[str, str],
     approval: dict[str, Any] | None,
-) -> dict[str, Any]:
+) -> BashResult:
     output_dir = state.workspace / ".mokioclaw" / "background"
     output_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.time_ns()

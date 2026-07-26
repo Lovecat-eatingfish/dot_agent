@@ -3,7 +3,7 @@ from __future__ import annotations
 from langchain_core.tools import StructuredTool
 
 from mokioclaw.core.state import RuntimeState
-from mokioclaw.tools.bash_tool import bash_tool_description, run_bash
+from mokioclaw.tools.bash_tool import bash_tool_description, run_bash, run_bash_read_only
 from mokioclaw.tools.file_tools import edit_file, read_file, write_file
 from mokioclaw.tools.grep_tool import grep
 from mokioclaw.tools.notepad_tool import append_notepad, read_notepad
@@ -70,7 +70,7 @@ def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
         ),
         StructuredTool.from_function(
             name="BashTool",
-            func=lambda command, timeout_seconds=None, run_in_background=False: run_bash(
+            func=lambda command, timeout_seconds=None, run_in_background=False: run_bash_read_only(
                 state, command, timeout_seconds, run_in_background
             ),
             description=bash_tool_description(),

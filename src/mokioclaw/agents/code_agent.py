@@ -32,8 +32,11 @@ from typing import Any
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 
+from mokioclaw.core.log import get_logger
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.core.utils import Writer, last_ai_content, tool_result_event as build_tool_result_event
+
+logger = get_logger(__name__)
 from mokioclaw.graph.memory import build_layered_memory, format_layered_memory_for_prompt, memory_event
 from mokioclaw.graph.state import MokioGraphState
 from mokioclaw.prompts.agent_prompt import CODE_AGENT_PROMPT
@@ -135,8 +138,13 @@ def run_code_agent(
         )
 
     summary = last_ai_content(produced_messages)
+    any_failed = any(
+        event.get("result", {}).get("ok") is False
+        for event in tool_events
+        if isinstance(event.get("result"), dict)
+    )
     return {
-        "ok": True,
+        "ok": not any_failed,
         "summary": summary,
         "todos": todos or state.get("todos", []),
         "messages": produced_messages,
@@ -160,6 +168,7 @@ def execute_code_agent_tool(runtime: RuntimeState, todos: list[dict[str, str]], 
             try:
                 result = tool.invoke(args)
             except Exception as exc:
+                logger.warning("codeAgent tool %s failed: %s", name, exc, exc_info=True)
                 result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     tool_call_id = call.get("id") or f"{name}-call"
     return ToolMessage(content=json.dumps(result, ensure_ascii=False), name=name, tool_call_id=tool_call_id), todos

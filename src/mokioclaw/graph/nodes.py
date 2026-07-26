@@ -38,7 +38,6 @@ import os
 import re
 from typing import Any
 
-from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.config import get_stream_writer
@@ -72,29 +71,12 @@ from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools import build_read_only_tools
 from mokioclaw.tools.todo_tool import persist_todos, write_todos
 
+from mokioclaw.core.log import get_logger
+
+logger = get_logger(__name__)
 
 # ========== 默认配置 ==========
 DEFAULT_CONTEXT_TOKEN_LIMIT = 400000  # 上下文 token 数量上限
-
-# ========== 演示任务配置（明日方舟阿米娅） ==========
-# 这些是用于演示的预设任务，实际使用时由 LLM 动态生成
-AMIYA_TODOS = [
-    "Research Amiya and collect reliable source links.",
-    "Create amiya_profile.html with a polished character introduction.",
-    "Include at least two source links in the HTML.",
-    "Run non-interactive checks for the generated HTML file.",
-]
-
-AMIYA_CRITERIA = [
-    "amiya_profile.html exists in the workspace.",
-    "The page mentions 阿米娅 and 明日方舟.",
-    "The page introduces identity, traits, abilities, and story role.",
-    "The page includes at least two source links.",
-]
-
-AMIYA_COMMANDS = [
-    "python -c \"from pathlib import Path; p=Path('amiya_profile.html'); s=p.read_text(encoding='utf-8'); assert '阿米娅' in s and '明日方舟' in s; assert s.lower().count('http') >= 2; print('amiya html ok')\"",
-]
 
 DEFAULT_TODOS = [
     "Clarify the deliverable and acceptance criteria.",
@@ -141,6 +123,7 @@ def intent_router_node(state: MokioGraphState) -> dict[str, Any]:
             reason = str(parsed.get("reason") or "router returned low-confidence or invalid route")
             confidence = parsed_confidence
     except Exception as exc:
+        logger.warning("intent_router failed: %s", exc, exc_info=True)
         reason = f"router error: {type(exc).__name__}: {exc}"
 
     event = {
@@ -190,6 +173,7 @@ def chat_responder_node(state: MokioGraphState) -> dict[str, Any]:
         )
         text = str(getattr(response, "content", "") or "").strip()
     except Exception as exc:
+        logger.warning("chat_responder failed: %s", exc, exc_info=True)
         text = f"这是轻量聊天分支，但模型回复暂不可用：{type(exc).__name__}: {exc}"
     if not text:
         text = "我在。你可以继续提问，或者直接描述一个需要我完成的任务。"
@@ -607,7 +591,6 @@ def final_node(state: MokioGraphState) -> dict[str, Any]:
 
 
 def get_context_token_limit() -> int:
-    load_dotenv()
     raw = os.getenv("MOKIO_CONTEXT_TOKEN_LIMIT", str(DEFAULT_CONTEXT_TOKEN_LIMIT))
     try:
         value = int(raw)
@@ -623,7 +606,8 @@ def estimate_context_tokens(state: MokioGraphState) -> int:
     try:
         model = create_model()
         return int(model.get_num_tokens_from_messages(messages + [payload_message]))
-    except Exception:
+    except Exception as exc:
+        logger.debug("token estimation fallback (model unavailable): %s", exc)
         text = "\n".join(_message_text(message) for message in messages)
         text += "\n" + payload_message.content
         return max(1, len(text) // 4)
@@ -763,6 +747,7 @@ def _compress_context_with_model(state: MokioGraphState) -> dict[str, Any]:
         if parsed:
             return parsed
     except Exception as exc:
+        logger.warning("context compression failed: %s", exc, exc_info=True)
         return _fallback_compression(state, error=f"{type(exc).__name__}: {exc}")
     return _fallback_compression(state, error="compressor model did not return valid JSON")
 
@@ -878,13 +863,6 @@ _chat_input = _router_input
 
 
 def _default_plan(task: str) -> dict[str, Any]:
-    if _is_amiya_task(task):
-        return {
-            "plan_summary": "Research Amiya from Arknights and build a sourced HTML character profile.",
-            "todos": AMIYA_TODOS,
-            "acceptance_criteria": AMIYA_CRITERIA,
-            "verification_commands": AMIYA_COMMANDS,
-        }
     return {
         "plan_summary": "Coordinate specialist agents to complete and verify the requested deliverable.",
         "todos": DEFAULT_TODOS,
@@ -901,8 +879,6 @@ def _apply_plan(state: MokioGraphState, plan: dict[str, Any]) -> None:
 
 
 def _verification_commands_for_task(task: str, parsed: dict[str, Any]) -> list[str]:
-    if _is_amiya_task(task):
-        return AMIYA_COMMANDS
     return [str(item) for item in parsed.get("verification_commands") or []]
 
 
@@ -926,11 +902,11 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     raw = fenced.group(1) if fenced else text
     start = raw.find("{")
-    end = raw.rfind("}")
-    if start == -1 or end == -1 or end < start:
+    if start == -1:
         return None
+    decoder = json.JSONDecoder()
     try:
-        parsed = json.loads(raw[start : end + 1])
+        parsed, _ = decoder.raw_decode(raw, start)
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
@@ -942,9 +918,6 @@ def _coerce_confidence(value: Any) -> float:
     except (TypeError, ValueError):
         return 0.0
     return max(0.0, min(1.0, confidence))
-
-
-_tool_result_event = build_tool_result_event
 
 
 def _tool_events_to_verification_results(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1012,22 +985,6 @@ def _short_text(text: str, limit: int) -> str:
 
 
 _last_ai_content = last_ai_content
-
-
-def _todos_text(todos: list[dict[str, Any]]) -> str:
-    return "\n".join(
-        f"- {todo.get('id', '')} [{todo.get('status', '')}] {todo.get('content', '')} {todo.get('note', '')}".strip()
-        for todo in todos
-    )
-
-
-def _list_text(items: list[str]) -> str:
-    return "\n".join(f"- {item}" for item in items)
-
-
-def _is_amiya_task(task: str) -> bool:
-    lowered = task.lower()
-    return "阿米娅" in task or "amiya" in lowered or "arknights" in lowered or "明日方舟" in task
 
 
 def _get_writer():

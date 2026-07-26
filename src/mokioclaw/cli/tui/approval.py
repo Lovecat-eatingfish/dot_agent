@@ -54,8 +54,10 @@ class ApprovalGate:
         self.decision = ApprovalDecision(approved=approved, reason=reason)
         self._ready.set()
 
-    def wait(self) -> ApprovalDecision:
-        self._ready.wait()
+    def wait(self, timeout: float = 300.0) -> ApprovalDecision:
+        self._ready.wait(timeout=timeout)
+        if not self._ready.is_set():
+            return ApprovalDecision(approved=False, reason="Approval timed out.")
         return self.decision or ApprovalDecision(approved=False, reason="Approval dialog closed.")
 
 

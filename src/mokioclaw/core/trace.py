@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -90,13 +92,16 @@ class TraceRecorder:
         elif event_type == "checkpoint_resumed":
             self._timeline(f"resume {event.get('mode', '')} fallback={event.get('fallback', False)}")
 
+        recorded_event = dict(event)
+        if event_type == "tool_call" and isinstance(recorded_event.get("args"), dict):
+            recorded_event["args"] = _sanitize_args(recorded_event["args"])
         self.record(
             f"custom:{event_type}",
             {
                 "event_type": event_type,
                 "node": event.get("node") or event.get("from") or "",
                 "name": event.get("name") or "",
-                "payload": compact_payload(event),
+                "payload": compact_payload(recorded_event),
             },
         )
 
@@ -278,3 +283,21 @@ def _trim_nested(value: Any, *, limit: int) -> Any:
 def _new_trace_id() -> str:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     return f"trace-{stamp}-{uuid4().hex[:6]}"
+
+
+_SENSITIVE_KEY_PATTERNS = re.compile(r"key|token|secret|password|credential|auth", re.IGNORECASE)
+
+
+def _sanitize_args(args: Any) -> Any:
+    """对工具调用参数做简单脱敏，替换敏感字段值为 ***"""
+    if not isinstance(args, dict):
+        return args
+    sanitized: dict[str, Any] = {}
+    for key, value in args.items():
+        if isinstance(value, str) and _SENSITIVE_KEY_PATTERNS.search(key):
+            sanitized[key] = "***"
+        elif isinstance(value, dict):
+            sanitized[key] = _sanitize_args(value)
+        else:
+            sanitized[key] = value
+    return sanitized

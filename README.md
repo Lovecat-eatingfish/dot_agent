@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="./logo.png" alt="MokioClaw Logo" width="460" />
+  <img src="assets/logo.png" alt="MokioClaw Logo" width="460" />
 </p>
 
 <h1 align="center">MokioClaw</h1>

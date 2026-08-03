@@ -21,6 +21,7 @@ Typer 框架要点：
 """
 from __future__ import annotations
 
+import signal
 import sys
 from pathlib import Path
 from typing import Annotated, Literal
@@ -33,7 +34,9 @@ from typer.core import TyperGroup
 from mokioclaw.cli.formatter import print_event, safe_echo, safe_secho
 from mokioclaw.core.approval import ApprovalDecision, ApprovalRequest
 from mokioclaw.core.agent import stream_agent_events
-from mokioclaw.core.log import setup_logging
+from mokioclaw.core.log import get_logger, setup_logging
+
+logger = get_logger(__name__)
 
 
 class MokioClawGroup(TyperGroup):
@@ -97,6 +100,23 @@ def configure_console() -> None:
             reconfigure(encoding="utf-8", errors="replace")
 
 
+def _install_signal_handlers() -> None:
+    """安装信号处理器，确保 Ctrl+C 优雅退出"""
+    if sys.platform == "win32":
+        # Windows 不支持 SIGINT 的自定义 handler 通过 signal 模块，
+        # 但 KeyboardInterrupt 仍然会被捕获
+        return
+
+    def _handle_sigint(signum, frame):
+        raise KeyboardInterrupt()
+
+    def _handle_sigterm(signum, frame):
+        raise KeyboardInterrupt("SIGTERM received")
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -144,6 +164,7 @@ def main(
     from dotenv import load_dotenv
     load_dotenv()
     configure_console()
+    _install_signal_handlers()
     task = None
     if isinstance(ctx.obj, dict):
         task = ctx.obj.get("task_arg")
@@ -155,17 +176,25 @@ def main(
     # inline 模式：危险命令时在终端弹出确认提示
     approval_handler = _inline_approval_handler if approval_mode == "inline" else None
     # stream_agent_events 是生成器，逐个 yield 事件字典
-    for event in stream_agent_events(
-        task,
-        workspace=workspace,
-        max_attempts=max_attempts,
-        approval_mode=approval_mode,
-        approval_handler=approval_handler,
-        checkpoint_mode=checkpoint_mode,
-        resume_workspace=resume,
-        trace_mode=trace_mode,
-    ):
-        print_event(event)
+    try:
+        for event in stream_agent_events(
+            task,
+            workspace=workspace,
+            max_attempts=max_attempts,
+            approval_mode=approval_mode,
+            approval_handler=approval_handler,
+            checkpoint_mode=checkpoint_mode,
+            resume_workspace=resume,
+            trace_mode=trace_mode,
+        ):
+            print_event(event)
+    except KeyboardInterrupt:
+        safe_secho("\nInterrupted by user. Checkpoint saved.", fg=typer.colors.YELLOW)
+        raise typer.Exit(130)
+    except Exception as exc:
+        logger.error("unexpected error: %s", exc, exc_info=True)
+        safe_secho(f"\nFatal error: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
 
 @app.command("tui")
@@ -202,17 +231,26 @@ def tui(
     延迟导入 MokioClawTuiApp 避免启动 Rich 模式时加载 Textual 依赖。
     """
     configure_console()
-    from mokioclaw.cli.tui import MokioClawTuiApp
+    _install_signal_handlers()
+    try:
+        from mokioclaw.cli.tui import MokioClawTuiApp
 
-    MokioClawTuiApp(
-        initial_task=task,
-        workspace=workspace,
-        max_attempts=max_attempts,
-        approval_mode=approval_mode,
-        checkpoint_mode=checkpoint_mode,
-        trace_mode=trace_mode,
-        resume=resume,
-    ).run()
+        MokioClawTuiApp(
+            initial_task=task,
+            workspace=workspace,
+            max_attempts=max_attempts,
+            approval_mode=approval_mode,
+            checkpoint_mode=checkpoint_mode,
+            trace_mode=trace_mode,
+            resume=resume,
+        ).run()
+    except KeyboardInterrupt:
+        safe_secho("\nTUI exited by user.", fg=typer.colors.YELLOW)
+        raise typer.Exit(130)
+    except Exception as exc:
+        logger.error("TUI crashed: %s", exc, exc_info=True)
+        safe_secho(f"\nTUI fatal error: {exc}", fg=typer.colors.RED)
+        raise typer.Exit(1)
 
 
 def _inline_approval_handler(request: ApprovalRequest) -> ApprovalDecision:

@@ -4,14 +4,17 @@ import json
 import shlex
 import shutil
 import subprocess
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import BaseMessage, messages_from_dict, message_to_dict
 
+from mokioclaw.core.log import get_logger
 from mokioclaw.core.utils import json_safe, truncate_json, utc_now, write_json
 
+logger = get_logger(__name__)
 
 VALID_CHECKPOINT_MODES = {"light", "strict", "off"}
 CHECKPOINT_ROOT = Path(".mokioclaw") / "checkpoints"
@@ -22,6 +25,12 @@ RECOVERY_FILE = "RECOVERY.md"
 GIT_DIR = "git"
 MAX_RECOVERY_TEXT = 6000
 MAX_MANIFEST_ITEMS = 160
+
+# 最大保留的 checkpoint 目录数（每个 workspace）
+MAX_CHECKPOINT_DIRS = 5
+
+# 事件文件写入锁（进程内线程安全）
+_events_lock = threading.Lock()
 
 
 def normalize_checkpoint_mode(mode: str | None) -> str:
@@ -69,15 +78,50 @@ class CheckpointManager:
         _write_json(self.root / CHECKPOINT_FILE, payload)
         (self.root / RECOVERY_FILE).write_text(build_recovery_markdown(payload), encoding="utf-8")
 
+        # 保存成功后清理旧 checkpoint（异步安全，失败不影响主流程）
+        try:
+            self.cleanup_old_checkpoints()
+        except Exception as exc:
+            logger.debug("checkpoint cleanup skipped: %s", exc)
+
         return checkpoint_saved_event(payload)
+
+    def cleanup_old_checkpoints(self, *, max_dirs: int = MAX_CHECKPOINT_DIRS) -> int:
+        """清理旧的 checkpoint 目录，只保留最近的 max_dirs 个
+
+        Returns:
+            删除的目录数量
+        """
+        parent = self.root.parent
+        if not parent.exists():
+            return 0
+
+        # 收集所有 checkpoint-* 目录
+        dirs = sorted(
+            [d for d in parent.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")],
+            key=lambda d: d.stat().st_mtime,
+            reverse=True,
+        )
+        removed = 0
+        for old_dir in dirs[max_dirs:]:
+            try:
+                shutil.rmtree(old_dir)
+                removed += 1
+            except OSError as exc:
+                logger.warning("failed to remove old checkpoint %s: %s", old_dir, exc)
+        return removed
 
     def _append_event(self, event: dict[str, Any]) -> None:
         line = {
             "timestamp": utc_now(),
             "event": json_safe(event),
         }
-        with (self.root / EVENTS_FILE).open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
+        with _events_lock:
+            try:
+                with (self.root / EVENTS_FILE).open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(line, ensure_ascii=False, default=str) + "\n")
+            except OSError as exc:
+                logger.warning("failed to append checkpoint event: %s", exc)
 
     def _payload(
         self,
@@ -261,7 +305,8 @@ def read_checkpoint(workspace: Path) -> dict[str, Any]:
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("checkpoint file corrupted or unreadable: %s — %s", path, exc)
         return {}
     return data if isinstance(data, dict) else {}
 

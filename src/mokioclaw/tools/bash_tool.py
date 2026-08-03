@@ -26,8 +26,17 @@ from pathlib import Path
 from typing import Any
 
 from mokioclaw.core.approval import ApprovalDecision, classify_command_risk, make_approval_request
+from mokioclaw.core.log import get_logger
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.core.utils import BashResult, coerce_bool
+
+logger = get_logger(__name__)
+
+# 后台进程注册表（进程内），用于退出时清理
+_background_processes: list[subprocess.Popen] = []
+
+# 输出文件保留天数
+_OUTPUT_RETENTION_DAYS = 3
 
 # ========== 默认配置常量 ==========
 DEFAULT_TIMEOUT_SECONDS = 120      # 单次命令默认超时（秒）
@@ -324,12 +333,13 @@ def run_bash(
 
 # ========== 只读 BashTool 白名单 ==========
 # verifier 专用：只允许不会修改文件系统的命令
+# 注意：python/node 不在此列——它们可以执行任意代码（os.remove 等），
+# 不属于"只读"。verifier 应通过文件工具检查结果，而非执行脚本。
 READ_ONLY_ALLOWED = {
     "cat", "head", "tail", "grep", "egrep", "fgrep",
     "ls", "dir", "find", "wc", "wcw",
     "echo", "printf", "which", "where", "whereis",
     "test", "true", "false",
-    "python", "python3", "node",
     "uname", "whoami", "pwd", "date",
 }
 
@@ -624,6 +634,8 @@ def _run_background(
     finally:
         stdout_handle.close()
         stderr_handle.close()
+    # 注册到进程表，退出时可清理
+    _background_processes.append(process)
     return {
         "ok": True,
         "timed_out": False,
@@ -638,3 +650,46 @@ def _run_background(
         "duration_ms": 0,
         **(approval or {}),
     }
+
+
+def cleanup_background_processes() -> int:
+    """终止所有后台进程，返回清理数量"""
+    killed = 0
+    for proc in _background_processes:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+                killed += 1
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    proc.kill()
+                    killed += 1
+                except OSError:
+                    pass
+    _background_processes.clear()
+    return killed
+
+
+def cleanup_old_outputs(workspace: Path, *, days: int = _OUTPUT_RETENTION_DAYS) -> int:
+    """清理超过指定天数的 bash 输出文件和后台日志
+
+    Returns:
+        删除的文件数量
+    """
+    import glob as glob_mod
+
+    removed = 0
+    cutoff = time.time() - days * 86400
+    for subdir in ("bash-outputs", "background"):
+        output_dir = workspace / ".mokioclaw" / subdir
+        if not output_dir.exists():
+            continue
+        for path in output_dir.iterdir():
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError as exc:
+                    logger.debug("failed to clean output file %s: %s", path, exc)
+    return removed

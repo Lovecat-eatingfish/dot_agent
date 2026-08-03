@@ -49,6 +49,7 @@ from mokioclaw.core.utils import (
     dedupe_sources,
     execute_tool_by_name,
     last_ai_content,
+    sanitize_user_input,
     tool_result_event as build_tool_result_event,
     truncate,
     trim_handoffs as trim_handoffs_util,
@@ -221,8 +222,23 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
 
     memory = build_layered_memory(working_state, node="planner")
     writer(memory_event(memory, node="planner"))
-    model = create_model()
-    planner = model.bind_tools(_build_planner_tools(working_state, writer))
+
+    try:
+        model = create_model()
+        planner = model.bind_tools(_build_planner_tools(working_state, writer))
+    except Exception as exc:
+        logger.error("planner model init failed: %s", exc, exc_info=True)
+        fallback = _default_plan(working_state["task"])
+        _apply_plan(working_state, fallback)
+        return {
+            "plan_summary": working_state.get("plan_summary", ""),
+            "todos": working_state.get("todos", []),
+            "acceptance_criteria": working_state.get("acceptance_criteria", []),
+            "verification_commands": working_state.get("verification_commands", []),
+            "messages": [AIMessage(content=f"planner model unavailable: {exc}")],
+            "context_next_node": "verifier",
+        }
+
     messages: list[Any] = [
         SystemMessage(content=PLANNER_PROMPT),
         HumanMessage(content=_planner_input(working_state, memory)),
@@ -241,7 +257,12 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
     )
 
     for _ in range(8):
-        response = planner.invoke(messages)
+        try:
+            response = planner.invoke(messages)
+        except Exception as exc:
+            logger.error("planner invoke failed: %s", exc, exc_info=True)
+            produced_messages.append(AIMessage(content=f"planner invocation error: {exc}"))
+            break
         produced_messages.append(response)
         messages.append(response)
         tool_calls = getattr(response, "tool_calls", None) or []
@@ -312,8 +333,20 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
         }
     )
 
-    model = create_model()
-    verifier = model.bind_tools(build_read_only_tools(state["runtime"]))
+    try:
+        model = create_model()
+        verifier = model.bind_tools(build_read_only_tools(state["runtime"]))
+    except Exception as exc:
+        logger.error("verifier model init failed: %s", exc, exc_info=True)
+        attempts = state.get("attempts", 0) + 1
+        return {
+            "messages": [AIMessage(content=f"verifier model unavailable: {exc}")],
+            "passed": False,
+            "attempts": attempts,
+            "last_error": f"Verifier model init failed: {exc}",
+            "context_next_node": verifier_route({**state, "passed": False, "attempts": attempts}),
+        }
+
     messages: list[Any] = [
         SystemMessage(content=VERIFIER_PROMPT),
         HumanMessage(content=_verifier_input(state, memory)),
@@ -322,7 +355,12 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
     tool_events: list[dict[str, Any]] = []
 
     for _ in range(8):
-        response = verifier.invoke(messages)
+        try:
+            response = verifier.invoke(messages)
+        except Exception as exc:
+            logger.error("verifier invoke failed: %s", exc, exc_info=True)
+            produced_messages.append(AIMessage(content=f"verifier invocation error: {exc}"))
+            break
         produced_messages.append(response)
         messages.append(response)
         tool_calls = getattr(response, "tool_calls", None) or []
@@ -427,7 +465,16 @@ def context_monitor_node(state: MokioGraphState) -> dict[str, Any]:
     """
     writer = _get_writer()
     token_limit = get_context_token_limit()
-    token_count = estimate_context_tokens(state)
+    try:
+        token_count = estimate_context_tokens(state)
+    except Exception as exc:
+        logger.warning("context monitor estimation failed, using fallback: %s", exc)
+        messages = state.get("messages", [])
+        text = "\n".join(_message_text(m) for m in messages)
+        # CJK-aware fallback: CJK chars ~1.5 tokens each, ASCII ~0.25 tokens each
+        cjk_count = sum(1 for ch in text if '一' <= ch <= '鿿')
+        ascii_count = len(text) - cjk_count
+        token_count = max(1, int(cjk_count * 1.5 + ascii_count * 0.25))
     should_compress = token_count >= token_limit
     next_node = state.get("context_next_node") or "verifier"
     event = {
@@ -610,7 +657,10 @@ def estimate_context_tokens(state: MokioGraphState) -> int:
         logger.debug("token estimation fallback (model unavailable): %s", exc)
         text = "\n".join(_message_text(message) for message in messages)
         text += "\n" + payload_message.content
-        return max(1, len(text) // 4)
+        # CJK-aware fallback: Chinese chars ~1.5 tokens, ASCII ~0.25 tokens
+        cjk_count = sum(1 for ch in text if '一' <= ch <= '鿿')
+        ascii_count = len(text) - cjk_count
+        return max(1, int(cjk_count * 1.5 + ascii_count * 0.25))
 
 
 def _build_planner_tools(state: MokioGraphState, writer) -> list[StructuredTool]:
@@ -833,7 +883,7 @@ def _important_files_from_state(state: MokioGraphState) -> list[str]:
 
 def _planner_input(state: MokioGraphState, memory: dict[str, Any]) -> str:
     parts = [
-        f"Task: {state['task']}",
+        f"Task: {sanitize_user_input(state['task'])}",
         f"Attempt: {state.get('attempts', 0) + 1}",
     ]
     if state.get("session_context"):
@@ -843,7 +893,7 @@ def _planner_input(state: MokioGraphState, memory: dict[str, Any]) -> str:
 
 
 def _verifier_input(state: MokioGraphState, memory: dict[str, Any]) -> str:
-    parts = [f"Task: {state['task']}"]
+    parts = [f"Task: {sanitize_user_input(state['task'])}"]
     if state.get("session_context"):
         parts.append("Session context for this multi-turn coding session:\n" + str(state.get("session_context", "")))
     parts.append("Layered memory snapshot:\n" + format_layered_memory_for_prompt(memory))
@@ -853,7 +903,7 @@ def _verifier_input(state: MokioGraphState, memory: dict[str, Any]) -> str:
 
 def _router_input(state: MokioGraphState) -> str:
     """构建路由器/聊天输入提示词"""
-    parts = [f"User input:\n{state.get('task', '')}"]
+    parts = [f"User input:\n{sanitize_user_input(state.get('task', ''))}"]
     if state.get("session_context"):
         parts.append("Session context:\n" + str(state.get("session_context", "")))
     return "\n\n".join(parts)

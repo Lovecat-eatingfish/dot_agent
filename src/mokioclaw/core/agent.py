@@ -11,6 +11,7 @@ from mokioclaw.core.log import get_logger
 
 logger = get_logger(__name__)
 from mokioclaw.core.paths import default_workspace
+from mokioclaw.tools.bash_tool import cleanup_background_processes, cleanup_old_outputs
 from mokioclaw.core.session import (
     append_assistant_turn,
     append_user_turn,
@@ -37,6 +38,13 @@ def create_runtime(
 ) -> RuntimeState:
     selected = workspace or resume_from or default_workspace()
     selected.mkdir(parents=True, exist_ok=True)
+
+    # 启动时清理旧输出文件（非阻塞，失败不影响启动）
+    try:
+        cleanup_old_outputs(selected)
+    except Exception as exc:
+        logger.debug("output cleanup skipped: %s", exc)
+
     return RuntimeState(
         workspace=selected,
         approval_mode=approval_mode,
@@ -142,6 +150,7 @@ def stream_agent_events(
                     trace.record_custom_event(saved)
                 yield {"type": "graph_event", "event": event}
     except KeyboardInterrupt:
+        cleanup_background_processes()
         saved = manager.save(current_state, status="interrupted", latest_node=latest_node)
         if saved:
             trace.record_custom_event(saved)
@@ -151,6 +160,7 @@ def stream_agent_events(
             yield {"type": "custom_event", "event": trace_event}
         return
     except Exception as exc:
+        cleanup_background_processes()
         logger.error("workflow failed: %s", exc, exc_info=True)
         saved = manager.save(current_state, status="failed", latest_node=latest_node)
         if saved:
@@ -161,6 +171,7 @@ def stream_agent_events(
             yield {"type": "custom_event", "event": trace_event}
         return
 
+    cleanup_background_processes()
     saved = manager.save(current_state, status="finished", latest_node=latest_node)
     if saved:
         trace.record_custom_event(saved)
@@ -327,6 +338,7 @@ def _stream_complex_workflow(
                     trace.record_custom_event(saved)
                 yield {"type": "graph_event", "event": event}
     except KeyboardInterrupt:
+        cleanup_background_processes()
         saved = manager.save(current_state, status="interrupted", latest_node=latest_node)
         if saved:
             trace.record_custom_event(saved)
@@ -336,6 +348,7 @@ def _stream_complex_workflow(
             yield {"type": "custom_event", "event": trace_event}
         return
     except Exception as exc:
+        cleanup_background_processes()
         logger.error("workflow failed: %s", exc, exc_info=True)
         saved = manager.save(current_state, status="failed", latest_node=latest_node)
         if saved:
@@ -346,6 +359,7 @@ def _stream_complex_workflow(
             yield {"type": "custom_event", "event": trace_event}
         return
 
+    cleanup_background_processes()
     saved = manager.save(current_state, status="finished", latest_node=latest_node)
     if saved:
         trace.record_custom_event(saved)

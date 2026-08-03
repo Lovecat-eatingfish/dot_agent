@@ -29,10 +29,13 @@ import json
 from datetime import datetime
 from typing import Any
 
+from mokioclaw.core.log import get_logger
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.core.utils import truncate, trim_handoffs
 from mokioclaw.tools.file_tools import read_text_lossy
 from mokioclaw.tools.notepad_tool import NOTEPAD_FILE, read_notepad
+
+logger = get_logger(__name__)
 
 # 历史摘要文件名
 HISTORY_SUMMARY_FILE = "HISTORY_SUMMARY.md"
@@ -81,8 +84,16 @@ def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[
         分层记忆字典，包含 rules, working_memory, history_summary_store
     """
     runtime = state["runtime"]
-    notepad = read_notepad(runtime)
-    history = read_history_summary(runtime)
+    try:
+        notepad = read_notepad(runtime)
+    except Exception as exc:
+        logger.debug("notepad read failed: %s", exc)
+        notepad = {"ok": False, "content": "", "exists": False}
+    try:
+        history = read_history_summary(runtime)
+    except Exception as exc:
+        logger.debug("history summary read failed: %s", exc)
+        history = {"ok": False, "content": "", "exists": False}
     sources = [
         {
             "title": source.get("title", ""),
@@ -182,10 +193,18 @@ def read_history_summary(state: RuntimeState) -> dict[str, Any]:
     Returns:
         包含历史摘要内容的字典
     """
-    path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
+    try:
+        path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
+    except ValueError as exc:
+        logger.debug("history summary path error: %s", exc)
+        return {"ok": False, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": False}
     if not path.exists():
         return {"ok": True, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": False}
-    content = read_text_lossy(path)
+    try:
+        content = read_text_lossy(path)
+    except OSError as exc:
+        logger.debug("history summary read error: %s", exc)
+        return {"ok": False, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": True}
     state.record_read(path, complete=True)
     return {"ok": True, "path": HISTORY_SUMMARY_FILE, "content": content, "exists": True}
 
@@ -200,12 +219,20 @@ def persist_history_summary(state: RuntimeState, summary: str) -> dict[str, Any]
     Returns:
         操作结果字典
     """
-    path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    content = f"# MokioClaw History Summary\n\n_Updated: {timestamp}_\n\n{summary.strip()}\n"
-    path.write_text(content, encoding="utf-8")
-    state.record_read(path, complete=True)
+    try:
+        path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
+    except ValueError as exc:
+        logger.debug("history summary path error: %s", exc)
+        return {"ok": False, "path": HISTORY_SUMMARY_FILE, "error": str(exc)}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        content = f"# MokioClaw History Summary\n\n_Updated: {timestamp}_\n\n{summary.strip()}\n"
+        path.write_text(content, encoding="utf-8")
+        state.record_read(path, complete=True)
+    except OSError as exc:
+        logger.debug("history summary write error: %s", exc)
+        return {"ok": False, "path": HISTORY_SUMMARY_FILE, "error": str(exc)}
     return {"ok": True, "path": HISTORY_SUMMARY_FILE, "lines": len(content.splitlines())}
 
 

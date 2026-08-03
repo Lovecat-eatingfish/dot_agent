@@ -34,7 +34,7 @@ from langchain_core.tools import StructuredTool
 
 from mokioclaw.core.log import get_logger
 from mokioclaw.core.state import RuntimeState
-from mokioclaw.core.utils import Writer, last_ai_content, tool_result_event as build_tool_result_event
+from mokioclaw.core.utils import Writer, last_ai_content, sanitize_user_input, tool_result_event as build_tool_result_event
 
 logger = get_logger(__name__)
 from mokioclaw.graph.memory import build_layered_memory, format_layered_memory_for_prompt, memory_event
@@ -74,7 +74,9 @@ def run_code_agent(
     memory = build_layered_memory({**state, "todos": todos}, node="codeAgent")
     writer(memory_event(memory, node="codeAgent"))
     model = create_model()
-    code_agent = model.bind_tools(build_tools(runtime) + [_build_todo_update_tool(todos)])
+    # 使用 mutable container 避免 lambda 捕获旧引用
+    _todos_ref = {"todos": todos}
+    code_agent = model.bind_tools(build_tools(runtime) + [_build_todo_update_tool(_todos_ref)])
 
     writer(
         {
@@ -110,6 +112,8 @@ def run_code_agent(
                 }
             )
             tool_result, todos = execute_code_agent_tool(runtime, todos, call)
+            # 同步更新 mutable container，让 TodoUpdateTool lambda 始终指向最新 todos
+            _todos_ref["todos"] = todos
             event = build_tool_result_event(tool_result, node="codeAgent")
             tool_events.append(event)
             writer(event)
@@ -174,17 +178,18 @@ def execute_code_agent_tool(runtime: RuntimeState, todos: list[dict[str, str]], 
     return ToolMessage(content=json.dumps(result, ensure_ascii=False), name=name, tool_call_id=tool_call_id), todos
 
 
-def _build_todo_update_tool(todos: list[dict[str, str]]) -> StructuredTool:
+def _build_todo_update_tool(todos_ref: dict[str, list[dict[str, str]]]) -> StructuredTool:
+    """构建 TodoUpdateTool，通过 mutable container 引用避免旧引用问题"""
     return StructuredTool.from_function(
         name="TodoUpdateTool",
-        func=lambda todo_id, status, note="": update_todo(todos, todo_id, status, note),
+        func=lambda todo_id, status, note="": update_todo(todos_ref["todos"], todo_id, status, note),
         description="Update one existing todo status. Args: todo_id, status, optional note.",
     )
 
 
 def _code_agent_input(state: MokioGraphState, instruction: str, memory: dict[str, Any]) -> str:
     parts = [
-        f"Task: {state['task']}",
+        f"Task: {sanitize_user_input(state['task'])}",
         f"Planner instruction:\n{instruction}",
     ]
     if state.get("session_context"):

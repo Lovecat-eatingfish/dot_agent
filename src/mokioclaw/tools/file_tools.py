@@ -20,6 +20,7 @@ from typing import Any
 
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.core.utils import FileEditResult, FileReadResult, FileWriteResult
+from mokioclaw.core.path_security import PathAccessDeniedError, PathSecurityError, PathTraversalError
 
 # 单次读取的最大行数，防止读取超大文件导致内存溢出
 MAX_READ_LINES = 2000
@@ -72,29 +73,31 @@ def read_text_lossy(path: Path) -> str:
     return path.read_text(encoding="utf-8")
 
 
-def resolve_workspace_path(state: RuntimeState, file_path: str) -> Path:
+def resolve_workspace_path(state: RuntimeState, file_path: str, operation: str = "read") -> Path:
     """将相对路径解析为工作区内的绝对路径
 
     处理流程：
     1. 移除 workspace/ 前缀
     2. 展开 ~ 用户目录
     3. 相对路径拼接 workspace
-    4. 安全检查（必须在 workspace 内）
+    4. 安全检查（必须在 workspace 内，不在黑名单）
 
     Args:
         state: 运行时状态
         file_path: 文件路径字符串
+        operation: 操作类型（"read" / "write" / "delete"）
 
     Returns:
         解析后的绝对路径
 
     Raises:
-        ValueError: 如果路径不在工作区内
+        PathTraversalError: 路径遍历攻击
+        PathAccessDeniedError: 访问被拒绝
     """
     raw = Path(_strip_workspace_prefix(file_path)).expanduser()
     if not raw.is_absolute():
         raw = state.workspace / raw
-    return state.assert_workspace_path(raw)
+    return state.assert_workspace_path(raw, operation=operation)
 
 
 def display_path(state: RuntimeState, path: Path) -> str:
@@ -115,6 +118,60 @@ def display_path(state: RuntimeState, path: Path) -> str:
         return str(path)
 
 
+def _validate_write_args(file_path: str, content: str) -> list[str]:
+    """验证 FileWriteTool 参数的合法性
+
+    Args:
+        file_path: 文件路径
+        content: 文件内容
+
+    Returns:
+        错误信息列表，空列表表示验证通过
+    """
+    errors = []
+
+    if not file_path or not file_path.strip():
+        errors.append("file_path must not be empty")
+    elif len(file_path) > 4096:
+        errors.append(f"file_path too long ({len(file_path)} chars), max 4096")
+
+    if content is None:
+        errors.append("content must not be None")
+    elif len(content) > 10_000_000:  # 10MB
+        errors.append(f"content too large ({len(content)} bytes), max 10MB")
+
+    return errors
+
+
+def _validate_edit_args(file_path: str, old_text: str, new_text: str) -> list[str]:
+    """验证 FileEditTool 参数的合法性
+
+    Args:
+        file_path: 文件路径
+        old_text: 要替换的原文
+        new_text: 替换后的新文本
+
+    Returns:
+        错误信息列表，空列表表示验证通过
+    """
+    errors = []
+
+    if not file_path or not file_path.strip():
+        errors.append("file_path must not be empty")
+    elif len(file_path) > 4096:
+        errors.append(f"file_path too long ({len(file_path)} chars), max 4096")
+
+    if not old_text or not old_text.strip():
+        errors.append("old_text must not be empty")
+
+    if new_text is None:
+        errors.append("new_text must not be None")
+    elif len(new_text) > 10_000_000:  # 10MB
+        errors.append(f"new_text too large ({len(new_text)} bytes), max 10MB")
+
+    return errors
+
+
 def read_file(
     state: RuntimeState,
     file_path: str,
@@ -125,6 +182,7 @@ def read_file(
 
     安全机制：
     - 路径必须在工作区内
+    - 路径不在黑名单
     - 自动尝试多种编码
     - 记录文件快照用于后续写入保护
 
@@ -143,8 +201,8 @@ def read_file(
         - complete: 是否完整读取
     """
     try:
-        path = resolve_workspace_path(state, file_path)
-    except ValueError as exc:
+        path = resolve_workspace_path(state, file_path, operation="read")
+    except (ValueError, PathSecurityError) as exc:
         return {"ok": False, "error": str(exc)}
     if not path.exists():
         return {"ok": False, "error": f"file does not exist: {display_path(state, path)}"}
@@ -199,9 +257,21 @@ def write_file(state: RuntimeState, file_path: str, content: str) -> FileWriteRe
         - lines: 写入后的行数
         - diff: unified diff 格式的变更
     """
+    # 1. 输入验证
+    validation_errors = _validate_write_args(file_path, content)
+    if validation_errors:
+        return {
+            "ok": False,
+            "error": "validation_failed",
+            "error_message": "; ".join(validation_errors),
+            "tool": "FileWriteTool",
+            "file_path": file_path,
+            "hint": "Check file_path and content size",
+        }
+
     try:
-        path = resolve_workspace_path(state, file_path)
-    except ValueError as exc:
+        path = resolve_workspace_path(state, file_path, operation="write")
+    except (ValueError, PathSecurityError) as exc:
         return {"ok": False, "error": str(exc)}
     existed = path.exists()
 
@@ -258,9 +328,21 @@ def edit_file(state: RuntimeState, file_path: str, old_text: str, new_text: str)
         - replacements: 替换次数（总是 1）
         - diff: unified diff 格式的变更
     """
+    # 1. 输入验证
+    validation_errors = _validate_edit_args(file_path, old_text, new_text)
+    if validation_errors:
+        return {
+            "ok": False,
+            "error": "validation_failed",
+            "error_message": "; ".join(validation_errors),
+            "tool": "FileEditTool",
+            "file_path": file_path,
+            "hint": "Check file_path, old_text, and new_text",
+        }
+
     try:
-        path = resolve_workspace_path(state, file_path)
-    except ValueError as exc:
+        path = resolve_workspace_path(state, file_path, operation="write")
+    except (ValueError, PathSecurityError) as exc:
         return {"ok": False, "error": str(exc)}
     if not path.exists():
         return {"ok": False, "error": f"file does not exist: {display_path(state, path)}"}

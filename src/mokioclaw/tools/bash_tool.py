@@ -66,39 +66,114 @@ DANGEROUS_PATTERNS = [
 ]
 
 
-def bash_tool_description() -> str:
-    """生成 BashTool 的使用说明，根据当前平台动态调整
+def _validate_bash_args(command: str, timeout_seconds: int | None = None) -> list[str]:
+    """验证 BashTool 参数的合法性
+
+    Args:
+        command: 要执行的命令
+        timeout_seconds: 超时时间（秒）
 
     Returns:
-        包含平台特定说明的工具描述字符串
+        错误信息列表，空列表表示验证通过
+    """
+    errors = []
+
+    # 检查命令是否为空
+    if not command or not command.strip():
+        errors.append("Command must not be empty")
+
+    # 检查命令长度（防止超长命令）
+    if len(command) > 10000:
+        errors.append(f"Command too long ({len(command)} chars), max 10000")
+
+    # 检查超时范围
+    if timeout_seconds is not None:
+        try:
+            timeout = int(timeout_seconds)
+            if timeout < 1:
+                errors.append(f"timeout_seconds must be >= 1, got {timeout}")
+            elif timeout > DEFAULT_MAX_TIMEOUT_SECONDS:
+                errors.append(f"timeout_seconds must be <= {DEFAULT_MAX_TIMEOUT_SECONDS}, got {timeout}")
+        except (TypeError, ValueError):
+            errors.append(f"Invalid timeout_seconds: {timeout_seconds}")
+
+    return errors
+
+
+def bash_tool_description() -> str:
+    """生成 BashTool 的详细使用说明，根据当前平台动态调整
+
+    Returns:
+        包含平台特定说明、语法示例、安全警告的详细工具描述字符串
     """
     system = platform.system().lower()
-    common = (
-        "Run a safe development shell command inside the workspace with timeout and output capture. "
-        "The command already runs with cwd set to the workspace, so use relative paths and do not run cd /workspace, "
-        "cd workspace, or long-lived interactive commands. Each call starts a fresh shell; exported variables do not persist "
-        "between calls, so write reusable environment values to the configured env file or pass them inline. "
-        "Long-running servers should use run_in_background=true. Prefer cross-platform Python one-liners for file checks."
-    )
+
+    # 通用说明
+    common = """Execute a shell command inside the workspace with automatic timeout and output capture.
+
+**Platform**: {platform}
+
+**Key behaviors**:
+- CWD is set to the workspace automatically. Use relative paths only.
+  ❌ Wrong: cd /workspace && python app.py
+  ✅ Right: python app.py
+- Fresh shell per call: exported env vars do NOT persist between calls.
+  Write reusable env to .mokioclaw.env or use inline export.
+- Long-running servers (uvicorn, flask run) must use run_in_background=true.
+- Output truncated to 6000 chars; full output saved to .mokioclaw/bash-outputs/ if needed.
+- Timeout: 120s default, 600s max. Set timeout_seconds for longer tasks.
+
+**Common use cases**:
+- Run tests: pytest -q, python -m pytest
+- Run scripts: python script.py, node app.js
+- Check files: ls, dir, type, cat
+- Search files: grep "pattern" *.py
+- Install deps: pip install package (requires approval)
+- Git operations: git status, git diff
+
+**Output format**:
+- ok: boolean (true if exit_code == 0)
+- command: normalized command string
+- exit_code: process exit code
+- stdout/stderr: captured output (truncated if needed)
+- stdout_path/stderr_path: path to full output file (if truncated)
+- timed_out: true if command exceeded timeout
+- duration_ms: execution time in milliseconds
+- requires_approval: true if command needed human approval
+
+**Security**:
+- Dangerous commands (rm -rf, format, shutdown) are BLOCKED.
+- High-risk commands (pip install, npm install, curl, uvicorn) require approval.
+- See approval mode: inline (prompt), auto (approve all), deny (block all).
+""".format(platform={
+    "windows": "Windows (cmd.exe)",
+    "darwin": "macOS (POSIX shell)",
+    "linux": "Linux/Unix (POSIX shell)"
+}.get(system, "Unknown"))
+
+    # Windows 特有说明
     if system == "windows":
-        return (
-            common
-            + " Current platform: Windows. Commands are executed by cmd.exe, not bash or PowerShell. "
-            "Use Windows cmd syntax: dir for listing, type file.txt for printing a file, copy/move/del for simple file operations, "
-            "&& for chaining, and set VAR=value for environment variables. Do not use POSIX-only tools like tail, grep, sed, awk, "
-            "cat, ls, export, or here-documents unless you implement the behavior with python -c."
-        )
-    if system == "darwin":
-        return (
-            common
-            + " Current platform: macOS. Commands are executed by a POSIX shell. "
-            "Use portable sh/bash-style commands such as ls, cat, grep, tail, export, and python/python3 as available."
-        )
-    return (
-        common
-        + " Current platform: Linux/Unix. Commands are executed by a POSIX shell. "
-        "Use portable sh/bash-style commands such as ls, cat, grep, tail, export, and python/python3 as available."
-    )
+        return common + """**Windows cmd.exe syntax**:
+- List files: dir
+- Print file: type file.txt
+- Chain commands: command1 && command2
+- Set env var: set VAR=value
+- Copy/move: copy src.txt dst.txt, move old.txt new.txt
+- Delete: del file.txt
+
+❌ Avoid POSIX-only: tail, grep, sed, awk, ls, export, here-documents
+✅ Use Python one-liners instead: python -c "import sys; print(open('file.txt').readlines()[-5:])"
+"""
+
+    # macOS / Linux 说明
+    return common + """**POSIX shell syntax** (macOS/Linux):
+- List files: ls, ls -la
+- Print file: cat file.txt, head -n 10 file.txt
+- Search: grep "pattern" *.py
+- Chain: command1 && command2, command1; command2
+- Set env var: export VAR=value
+- Read last N lines: tail -n 10 file.txt
+"""
 
 
 def _coerce_timeout(timeout_seconds: int | str | float) -> int:
@@ -267,12 +342,25 @@ def run_bash(
         - stderr: 标准错误
         - duration_ms: 执行耗时（毫秒）
     """
+    # 1. 输入验证
+    validation_errors = _validate_bash_args(command, timeout_seconds)
+    if validation_errors:
+        return {
+            "ok": False,
+            "error": "validation_failed",
+            "error_message": "; ".join(validation_errors),
+            "tool": "BashTool",
+            "command": command,
+            "hint": "Check command syntax and timeout value",
+        }
+
     if not command.strip():
         return {"ok": False, "error": "command must not be empty"}
     max_timeout = _state_int(state, "bash_max_timeout_seconds", DEFAULT_MAX_TIMEOUT_SECONDS)
-    timeout = _coerce_timeout(timeout_seconds)
     if timeout_seconds is None:
         timeout = _state_int(state, "bash_default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    else:
+        timeout = _coerce_timeout(timeout_seconds)
     if timeout <= 0 or timeout > max_timeout:
         return {"ok": False, "error": f"timeout_seconds must be between 1 and {max_timeout}"}
     normalized_command = _normalize_command(command)
@@ -386,9 +474,10 @@ def run_bash_read_only(
             "error": f"read-only mode: command '{cmd_base}' is not in the allowed list ({', '.join(sorted(READ_ONLY_ALLOWED))})",
         }
 
-    timeout = _coerce_timeout(timeout_seconds)
     if timeout_seconds is None:
         timeout = _state_int(state, "bash_default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+    else:
+        timeout = _coerce_timeout(timeout_seconds)
     max_timeout = _state_int(state, "bash_max_timeout_seconds", DEFAULT_MAX_TIMEOUT_SECONDS)
     if timeout <= 0 or timeout > max_timeout:
         timeout = min(timeout, max_timeout)

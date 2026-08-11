@@ -66,7 +66,8 @@ def test_write_file_returns_error_for_path_outside_workspace(tmp_path: Path) -> 
     result = write_file(state, "../outside.py", "print('nope')\n")
 
     assert result["ok"] is False
-    assert "inside workspace" in result["error"]
+    assert "Path traversal attempt" in result["error"]
+    assert "outside workspace" in result["error"]
     assert not (tmp_path.parent / "outside.py").exists()
 
 

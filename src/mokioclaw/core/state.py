@@ -18,6 +18,7 @@ from typing import Callable
 
 from mokioclaw.core.approval import ApprovalDecision, ApprovalRequest, normalize_approval_mode
 from mokioclaw.core.checkpoint import normalize_checkpoint_mode
+from mokioclaw.core.path_security import PathAccessDeniedError, PathTraversalError, validate_path_access
 from mokioclaw.core.trace import normalize_trace_mode
 
 
@@ -127,23 +128,21 @@ class RuntimeState:
         """
         return self.read_files.get(path.resolve())
 
-    def assert_workspace_path(self, path: Path) -> Path:
-        """安全检查：确保路径在工作区内部
+    def assert_workspace_path(self, path: Path, operation: str = "read") -> Path:
+        """安全检查：确保路径在工作区内部且符合安全策略
 
         防止路径遍历攻击（如 ../../etc/passwd），所有文件操作
         都必须通过此检查后才能执行。
 
         Args:
             path: 待检查的路径
+            operation: 操作类型（"read" / "write" / "delete"）
 
         Returns:
             解析后的绝对路径
 
         Raises:
-            ValueError: 如果路径不在工作区目录内
+            PathTraversalError: 路径遍历攻击
+            PathAccessDeniedError: 访问被拒绝（黑名单/写权限）
         """
-        resolved = path.resolve()
-        workspace = self.workspace.resolve()
-        if resolved != workspace and workspace not in resolved.parents:
-            raise ValueError(f"path must stay inside workspace: {workspace}")
-        return resolved
+        return validate_path_access(self, path, operation)

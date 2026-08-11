@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import Any
 
 from mokioclaw.core.log import get_logger
+from mokioclaw.core.path_security import PathSecurityError
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.core.utils import truncate, trim_handoffs
 from mokioclaw.tools.file_tools import read_text_lossy
@@ -195,7 +196,7 @@ def read_history_summary(state: RuntimeState) -> dict[str, Any]:
     """
     try:
         path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
-    except ValueError as exc:
+    except (ValueError, PathSecurityError) as exc:
         logger.debug("history summary path error: %s", exc)
         return {"ok": False, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": False}
     if not path.exists():
@@ -221,7 +222,7 @@ def persist_history_summary(state: RuntimeState, summary: str) -> dict[str, Any]
     """
     try:
         path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
-    except ValueError as exc:
+    except (ValueError, PathSecurityError) as exc:
         logger.debug("history summary path error: %s", exc)
         return {"ok": False, "path": HISTORY_SUMMARY_FILE, "error": str(exc)}
     try:

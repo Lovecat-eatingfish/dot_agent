@@ -8,9 +8,8 @@ from langgraph.graph import add_messages
 
 from mokioclaw.core.checkpoint import CheckpointManager, load_resume_inputs, normalize_checkpoint_mode
 from mokioclaw.core.log import get_logger
-
-logger = get_logger(__name__)
 from mokioclaw.core.paths import default_workspace
+from mokioclaw.core.workspace_detection import resolve_workspace
 from mokioclaw.tools.bash_tool import cleanup_background_processes, cleanup_old_outputs
 from mokioclaw.core.session import (
     append_assistant_turn,
@@ -35,8 +34,14 @@ def create_runtime(
     checkpoint_mode: str | None = None,
     resume_from: Path | None = None,
     trace_mode: str | None = None,
+    opened_file: Path | None = None,
 ) -> RuntimeState:
-    selected = workspace or resume_from or default_workspace()
+    # 智能工作区解析：支持打开的文件作为工作区
+    selected = resolve_workspace(
+        user_specified=workspace,
+        opened_file=opened_file,
+        fallback=resume_from,
+    )
     selected.mkdir(parents=True, exist_ok=True)
 
     # 启动时清理旧输出文件（非阻塞，失败不影响启动）
@@ -63,6 +68,7 @@ def stream_agent_events(
     task: str | None = None,
     *,
     workspace: Path | None = None,
+    opened_file: Path | None = None,
     max_attempts: int = 3,
     approval_mode: str = "inline",
     approval_handler=None,
@@ -85,9 +91,9 @@ def stream_agent_events(
         if route == "chat":
             return
 
-    selected_workspace = resume_path or workspace
     state = create_runtime(
-        selected_workspace,
+        workspace=resume_path or workspace,
+        opened_file=opened_file,
         approval_mode=approval_mode,
         approval_handler=approval_handler,
         checkpoint_mode=checkpoint_mode,

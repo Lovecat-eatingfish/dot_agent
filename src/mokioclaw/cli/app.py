@@ -1,5 +1,10 @@
 """
 CLI 入口模块
+typer：命令行框架，类似argparse，写命令行工具超级省事；
+    ctx = typer 上下文对象，用来在函数之间传递数据。ctx.obj是个字典，存自定义数据。
+
+rich：终端美化，彩色输出、面板、表格；
+textual：终端 GUI (TUI) 库，做终端窗口界面；
 
 基于 Typer 框架构建命令行接口，提供两种运行模式：
 
@@ -18,6 +23,24 @@ Typer 框架要点：
 - Annotated[type, typer.Option(...)] 声明命令行选项
 - typer.Argument(...) 声明位置参数
 - typer.Context 传递运行上下文（如子命令信息）
+
+
+
+
+整个程序数据流（非常重要，帮你理清项目）
+
+命令行输入 mokioclaw "写代码"
+    ↓
+MokioClawGroup.parse_args() 提取task_arg任务字符串
+    ↓
+main()回调函数
+    ↓
+stream_agent_events(任务,参数) 【core/agent.py，真正的Agent逻辑，生成器yield事件】
+    ↓
+循环拿到每一个event事件对象 → print_event()渲染到终端
+
+这个 cli 文件只负责：命令解析、终端输出、信号处理、用户确认弹窗。
+Agent 的 LLM 调用、工具调用、思考循环、plan‑actor‑verifier 逻辑全部在core/agent.py。
 """
 from __future__ import annotations
 
@@ -41,13 +64,19 @@ logger = get_logger(__name__)
 
 class MokioClawGroup(TyperGroup):
     """自定义参数解析组，让 ``mokioclaw "task"`` 和子命令共存。
+    原因： 原生 Typer 有个限制：原生：mokioclaw "写代码"会报错，因为"写代码"不是子命令。
+    我们想要效果：直接敲 mokioclaw "你的任务"，引号里面整串当做任务。
+
+    example：mokioclaw -w ./work "帮我写快速排序"
+        task_arg 就等于 "帮我写快速排序"，传给后面 main 函数。
+
 
     默认 Typer 行为：未匹配的参数会报错。
     此类重写 parse_args，将非命令、非选项的内容收集为 task_arg。
 
     解析逻辑：
-    1. 遇到已知子命令名或 --help → 剩余参数交给子命令处理
-    2. 遇到 -开头的选项 → 当作选项处理（支持 --key=value 和 --key value）
+    1. 遇到已知子命令名（tui）或 --help 交给typer 原生处理子命令 。 剩余参数交给子命令处理
+    2. 遇到 -开头的选项  → 当作命令行选项处理（支持 --key=value 和 --key value）
     3. 其余所有内容 → 拼接为 task_arg 存入 ctx.obj
     """
 
@@ -91,6 +120,9 @@ app = typer.Typer(
 
 def configure_console() -> None:
     """配置标准输出/错误流为 UTF-8 编码。
+    Windows 终端默认编码 GBK，rich/textual需要 UTF‑8。
+    修改 stdout/stderr 输出编码，防止中文乱码。
+
 
     Windows 终端默认编码可能是 GBK，Rich/Textual 需要 UTF-8。
     """
@@ -101,7 +133,14 @@ def configure_console() -> None:
 
 
 def _install_signal_handlers() -> None:
-    """安装信号处理器，确保 Ctrl+C 优雅退出"""
+    """
+    安装信号处理器，确保 Ctrl+C 优雅退出
+
+    处理Ctrl+C：
+        Linux/macOS 捕获SIGINT、SIGTERM信号，抛出KeyboardInterrupt；
+        Windows 的 signal 模块不支持自定义信号处理器，直接跳过，系统依然会抛出 KeyboardInterrupt。
+        作用：按Ctrl+C不会直接暴力杀掉进程，会优雅保存 checkpoint 检查点再退出
+    """
     if sys.platform == "win32":
         # Windows 不支持 SIGINT 的自定义 handler 通过 signal 模块，
         # 但 KeyboardInterrupt 仍然会被捕获
@@ -145,7 +184,14 @@ def main(
         typer.Option("--resume", help="Resume from an existing MokioClaw workspace."),
     ] = None,
 ) -> None:
-    """默认命令：执行 Agent 任务（Rich 终端输出）。
+    """
+    Rich 默认模式入口： @app.callback(invoke_without_command=True)：
+        执行 mokioclaw tui → ctx.invoked_subcommand不为 None，直接 return 跳过 main 逻辑。
+        执行 mokioclaw "任务" → 触发 main；
+
+
+    工作空间， 最大重试次数， 批准模式， 检查点模式， 链路追踪模式，恢复对话
+    默认命令：执行 Agent 任务（Rich 终端输出）。
 
     当用户运行 mokioclaw "task" 时触发。
     如果调用了子命令（如 mokioclaw tui），则跳过此函数。
@@ -168,6 +214,8 @@ def main(
     task = None
     if isinstance(ctx.obj, dict):
         task = ctx.obj.get("task_arg")
+
+    # 如果既没有任务，也没有--resume恢复旧会话，打印帮助信息退出。
     if not task and resume is None:
         safe_echo(ctx.get_help())
         raise typer.Exit()
@@ -187,11 +235,14 @@ def main(
             resume_workspace=resume,
             trace_mode=trace_mode,
         ):
+            # print_event(event)就是把事件美化打印到终端。
             print_event(event)
     except KeyboardInterrupt:
+        # KeyboardInterrupt：用户Ctrl+C中断，提示检查点已保存，退出码 130；
         safe_secho("\nInterrupted by user. Checkpoint saved.", fg=typer.colors.YELLOW)
         raise typer.Exit(130)
     except Exception as exc:
+        # 其他异常：打印致命错误，记录日志，退出码 1。
         logger.error("unexpected error: %s", exc, exc_info=True)
         safe_secho(f"\nFatal error: {exc}", fg=typer.colors.RED)
         raise typer.Exit(1)
@@ -225,7 +276,9 @@ def tui(
         typer.Option("--resume", help="Resume from an existing MokioClaw workspace."),
     ] = None,
 ) -> None:
-    """打开 Textual 终端 UI 界面。
+    """
+    运行命令：mokioclaw tui
+    打开 Textual 终端 UI 界面。
 
     运行方式：mokioclaw tui [task]
     延迟导入 MokioClawTuiApp 避免启动 Rich 模式时加载 Textual 依赖。
@@ -233,8 +286,8 @@ def tui(
     configure_console()
     _install_signal_handlers()
     try:
+        # 延迟导入 MokioClawTuiApp：只有跑 tui 子命令才导入 textual 相关代码；
         from mokioclaw.cli.tui import MokioClawTuiApp
-
         MokioClawTuiApp(
             initial_task=task,
             workspace=workspace,
@@ -255,6 +308,7 @@ def tui(
 
 def _inline_approval_handler(request: ApprovalRequest) -> ApprovalDecision:
     """Rich 模式的审批处理器。
+    当 Agent 要执行高危 bash 命令时会调用这个函数：
 
     当 BashTool 检测到危险命令时调用：
     1. 用 Rich Panel 显示命令内容和风险原因

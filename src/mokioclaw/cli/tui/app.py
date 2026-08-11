@@ -15,6 +15,27 @@ Textual 框架要点：
 - 主线程：Textual 事件循环，处理 UI 更新和用户输入
 - 工作线程：执行 stream_session_events()，产生 agent 事件
 - 通过 Message 在两个线程间通信
+
+Textual主线程（UI线程）：渲染界面、接收键盘输入、弹窗，不能跑耗时逻辑
+后台工作线程：执行Agent `stream_session_events()`，跑大模型、调用工具、循环思考
+
+⚠️ 严禁子线程直接操作 UI 组件，Textual 会直接崩溃。
+解决方案：自定义Message消息类，子线程调用post_message()投递消息，主线程回调on_xxx_message()更新界面
+
+
+
+消息类型： 3 种自定义消息，作为线程之间的信使：
+AgentEventMessage：后台产出一条 agent 事件，发给 UI 去渲染
+RunFinishedMessage：agent 任务跑完 / 中断，通知 UI 恢复输入框
+ApprovalRequestedMessage：遇到高危 bash 命令，通知 UI 弹出确认弹窗
+
+Message是 Textual 内置跨线程消息基类；
+子线程：self.call_from_thread(self.post_message, AgentEventMessage(event))
+主线程接收：def on_agent_event_message(self, message: AgentEventMessage):
+call_from_thread：专门给工作线程用，把消息安全投递到 UI 事件循环，千万不要直接子线程操作 DOM 组件。
+
+
+
 """
 from __future__ import annotations
 
@@ -79,6 +100,38 @@ class ApprovalRequestedMessage(Message):
 
 class MokioClawTuiApp(App[None]):
     """Textual TUI 主应用
+
+    事件流
+用户输入任务，按下回车
+    ↓
+on_input_submitted → start_task()
+    ↓
+run_worker 新开后台线程 → _run_stream()
+    ↓
+stream_session_events() 执行Agent逻辑，循环yield事件
+    ↓
+子线程 call_from_thread post_message(AgentEventMessage(event))
+    ↓
+主线程 on_agent_event_message()
+    ↓
+├─ _update_state_from_event 更新内存状态(todos、计数器、路径)
+└─ _write_summary → _mount_event_card() 渲染UI卡片
+
+遇到高危bash命令：
+    后台线程调用 _approval_handler
+    创建 ApprovalGate，投递 ApprovalRequestedMessage
+    主线程弹出 ApprovalModal弹窗
+    用户点击 Yes / No → gate.resolve(bool)
+    后台线程gate.wait()解除阻塞，继续执行agent
+
+Agent全部执行完毕
+    ↓
+子线程发送 RunFinishedMessage
+    ↓
+主线程 on_run_finished_message
+    running=False，输入框解禁，刷新侧边栏
+
+
 
     布局：
     ┌─────────────────────────────────────┐
@@ -257,18 +310,101 @@ class MokioClawTuiApp(App[None]):
     def __init__(
             self,
             *,
+            # ========== 第一类：核心任务参数 ==========
             initial_task: str | None = None,
-            workspace: Path | None = None,
-            max_attempts: int = 3,
-            approval_mode: Literal["inline", "auto", "deny"] = "inline",
-            checkpoint_mode: Literal["light", "strict", "off"] = "light",
-            trace_mode: Literal["on", "off"] = "on",
+            # TUI 启动后自动执行的初始任务
+            # 来自 CLI 层 tui 命令的位置参数：mokioclaw tui "帮我写个计算器"
+            # 在 on_mount() 里如果不为 None，会自动调用 start_task() 执行，用户不用手动输入
+            # 默认 None：只打开 TUI 不立即执行任务，等待用户手动输入
+
             resume: Path | None = None,
+            # 从已有的 checkpoint 恢复之前的会话
+            # 来自 CLI 层的 --resume 选项：mokioclaw tui --resume ./workspaces/xxx
+            # 传递给 resolve_workspace() 作为 fallback，同时传给 stream_session_events() 作为 resume_workspace
+            # 恢复时会读取之前的 checkpoint 快照、上下文、会话历史，断点续跑
+            # 默认 None：创建全新会话
+
+            # ========== 第二类：工作区控制参数 ==========
+            workspace: Path | None = None,
+            # 用户显式指定的工作区根目录
+            # 来自 CLI 层的 --workspace / -w 选项
+            # 在 resolve_workspace() 里优先级最高：只要用户传了这个，直接用它，不自动检测
+            # 所有工具（BashTool、ReadFileTool 等）的文件操作都会限制在这个目录下
+            # 默认 None：进入自动检测逻辑
+
+            opened_file: Path | None = None,
+            # 用户当前打开的文件路径，用来模拟 Claude Code 的行为
+            # 对应 workspace_detection.py 的 detect_workspace_from_file()
+            # 优先级仅次于 user_specified：如果传了这个，自动取它的父目录作为工作区
+            # 典型场景：用户在 VS Code 里打开了 ./src/main.py，IDE 把这个路径传给 TUI
+            # TUI 自动把 ./src 设为工作区，而不是项目根目录，对齐 Claude Code 的交互逻辑
+            # 默认 None：不基于文件路径检测工作区
+
+            # ========== 第三类：执行控制参数 ==========
+            max_attempts: int = 3,
+            # Planner→Actor→Verifier 循环的最大重试次数
+            # 来自 CLI 层的 --max-attempts 选项
+            # 传给 build_complex_workflow() 的配置，决定循环多少次后强制进入 Final 节点
+            # 在 _stream_complex_workflow() 的 inputs 里作为 max_attempts 传入 LangGraph 状态
+            # 默认 3：平衡尝试次数和成本，避免无限循环
+
+            approval_mode: Literal["inline", "auto", "deny"] = "inline",
+            # 高危 Bash 命令的审批模式
+            # 来自 CLI 层的 --approval-mode 选项
+            # inline（默认）：遇到高危命令弹窗让用户确认，安全优先
+            # auto：自动批准所有高危命令，适合完全信任的场景
+            # deny：直接拒绝所有高危命令，适合严格限制的场景
+            # 在 _run_stream() 里，如果模式是 inline，会把 self._approval_handler 传给 agent
+            # 这个 handler 会弹 ApprovalModal 对话框等待用户选择
+            # 为什么需要：防止 Agent 误执行删除文件、安装依赖等危险命令
+
+            checkpoint_mode: Literal["light", "strict", "off"] = "light",
+            # 检查点保存策略
+            # 来自 CLI 层的 --checkpoint-mode 选项
+            # 传给 CheckpointManager 和 normalize_checkpoint_mode()
+            # light（默认）：只保存状态摘要、事件列表，体积小
+            # strict：保存完整状态快照 + git diff，体积大但恢复更准确
+            # off：不保存检查点，不能恢复
+            # 默认 light：平衡恢复能力和存储开销
+
+            trace_mode: Literal["on", "off"] = "on",
+            # 链路追踪开关
+            # 来自 CLI 层的 --trace-mode 选项
+            # 传给 TraceRecorder 和 normalize_trace_mode()
+            # 开启时生成 trace/ 目录，记录每个节点的输入输出、耗时、事件时间线，用于调试和审计
+            # 关闭时不生成追踪文件，减少磁盘开销
+            # 默认 on：方便调试，生产环境可以关
+
+            # ========== 第四类：内部扩展参数 ==========
             stream_factory: StreamFactory = stream_session_events,
+            # Agent 事件流的工厂函数
+            # StreamFactory 类型：Callable[..., Iterable[dict[str, Any]]]
+            # 默认值是 stream_session_events，也就是生产环境用的真实 Agent 流
+            # 在 _run_stream() 里调用：for event in self.stream_factory(...)
+            # 为什么设计成可注入：依赖注入原则，方便测试（传假 factory 返回预设事件流）和扩展（云端流等）
     ) -> None:
+        """
+        TUI 会话的全局配置入口，所有影响 TUI 运行行为的参数都在这里注入。
+
+        参数分四类：
+        1. 核心任务参数：控制做什么、是否恢复
+        2. 工作区控制参数：控制在哪里做、基于哪个文件
+        3. 执行控制参数：控制重试几次、要不要审批、保存多少日志
+        4. 内部扩展参数：控制流来源（真实 Agent 还是测试用的假流）
+
+        每个参数都对应到下层的一个具体模块，最终影响 Agent 的执行行为或者 TUI 的交互逻辑。
+        """
         super().__init__()
         self.initial_task = initial_task
-        self.workspace = resume or workspace or default_workspace()
+        # 智能工作区解析：支持打开的文件作为工作区
+        from mokioclaw.core.workspace_detection import resolve_workspace
+
+        # 工作目录
+        self.workspace = resolve_workspace(
+            user_specified=workspace,
+            opened_file=opened_file,
+            fallback=resume,
+        )
         self.session_workspace = self.workspace
         self.max_attempts = max_attempts
         self.approval_mode = approval_mode
@@ -289,10 +425,23 @@ class MokioClawTuiApp(App[None]):
         self.last_route = ""
         self.sidebar_text = ""
         self.todos: list[dict[str, Any]] = []
+        # self._state_lock = Lock()：线程锁！后台线程和 UI 线程都会读写todos等状态，加锁防止并发读写错乱。
         self._state_lock = Lock()
 
-    # 构建 页面
+    # 2. compose() → 构建 UI 组件树
     def compose(self) -> ComposeResult:
+        """
+        Textual 的compose()等价于前端render()，用yield产出组件，布局结构看代码注释里的 ASCII 图。
+        组件划分：
+            Header：顶部标题栏，带时钟
+            top 区域：logo + 标题、运行状态文字
+            body 横向布局：
+                左边：VerticalScroll(id="events") 事件滚动列表，所有 agent 输出卡片放这里
+                右边：侧边栏，展示会话统计信息
+            input-row：底部输入框，用户在这里输入任务
+            Footer：底部快捷键提示
+                文件里一大段CSS = ，Textual 内置 CSS，和网页 CSS 语法几乎一样，控制颜色、边框、背景、布局。
+        """
         yield Header(show_clock=True)
         with Vertical(id="root"):
             with Horizontal(id="top"):
@@ -314,6 +463,13 @@ class MokioClawTuiApp(App[None]):
 
     # 页面挂在调用
     def on_mount(self) -> None:
+        """
+        组件挂载完成后的生命周期钩子，等价于前端on_mounted。
+            输出欢迎信息，刷新右侧侧边栏；
+            输入框自动聚焦；
+            如果启动 TUI 时传了initial_task初始任务，直接自动跑任务。
+        :return:
+        """
         self._write_welcome()
         self._refresh_sidebar()
         self.query_one("#task-input", Input).focus()
@@ -325,6 +481,14 @@ class MokioClawTuiApp(App[None]):
     # 如果是 /new → 创建新会话
     # 否则 → 启动新任务
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        """
+        4. 用户交互回调
+        用户输入完按回车触发：
+            /new指令：调用start_new_session()创建全新会话，换新工作目录；
+            普通文本任务：调用start_task(task, None)启动 agent。
+        :param event:
+        :return:
+        """
         if event.input.id != "task-input":
             return
         task = event.value.strip()
@@ -394,7 +558,9 @@ class MokioClawTuiApp(App[None]):
         self.query_one("#task-input", Input).disabled = True
         self.query_one("#status", Static).update("running")
         self._refresh_sidebar()
+        # UI 写入 “用户任务开始” 卡片；
         self._write_run_start(task, resume)
+        # run_worker(..., thread=True)：新开后台线程执行_run_stream。,✨run_worker是 Textual 内置 API，开启后台工作线程，不会阻塞 UI。
         self.run_worker(lambda: self._run_stream(task, resume), thread=True, exclusive=False,
                         name=f"mokioclaw-run-{self.run_count}")
 
@@ -404,9 +570,17 @@ class MokioClawTuiApp(App[None]):
     # 捕获异常（KeyboardInterrupt、普通异常）
     # 最后发送 RunFinishedMessage
     def _run_stream(self, task: str, resume: Path | None) -> None:
+        """
+        ⚠️这个函数跑在子线程，不能直接修改任何 UI 控件！
+
+        :param task:
+        :param resume:
+        :return:
+        """
         status = "finished"
         try:
             approval_handler = self._approval_handler if self.approval_mode == "inline" else None
+            # 调用stream_session_events()拿到 agent 事件生成器；
             for event in self.stream_factory(
                     task,
                     session_workspace=self.session_workspace,
@@ -417,6 +591,7 @@ class MokioClawTuiApp(App[None]):
                     resume_workspace=resume,
                     trace_mode=self.trace_mode,
             ):
+                # 每拿到一个 event，通过消息投递给主线程；
                 self.call_from_thread(self.post_message, AgentEventMessage(event))
         except KeyboardInterrupt:
             status = "interrupted"
@@ -428,14 +603,20 @@ class MokioClawTuiApp(App[None]):
         finally:
             self.call_from_thread(self.post_message, RunFinishedMessage(status))
 
-    # 审批处理器（被 Agent 调用）：
-    # 创建 ApprovalGate（审批门，用于同步等待）
-    # 发送 ApprovalRequestedMessage 到主线程
-    # 阻塞等待用户做出决定（gate.wait()）
-    # 返回 ApprovalDecision
+
     def _approval_handler(self, request: ApprovalRequest) -> ApprovalDecision:
+        """
+        当 agent 要执行高危 shell 命令，会调用这个 handler（运行在后台线程）：
+
+        ApprovalGate是一个同步阻塞工具：子线程在这里卡住等待用户点击弹窗；
+        往主线程发送弹窗请求消息；
+        .wait()阻塞子线程，直到 UI 用户点击批准 / 拒绝，调用gate.resolve(result)解除阻塞，返回决定给 agent
+        :param request:
+        :return:
+        """
         gate = ApprovalGate(request)
         self.call_from_thread(self.post_message, ApprovalRequestedMessage(gate))
+        # 关键点：后台线程卡住等待，UI 线程依然可以操作界面。
         return gate.wait()
 
     # 审批回调（用户点击后执行）：
@@ -454,12 +635,14 @@ class MokioClawTuiApp(App[None]):
     # 如果该事件应该隐藏 → 只刷新侧边栏，不显示
     # 否则 → 生成摘要并写入事件流
     def _handle_event(self, event: dict[str, Any]) -> None:
+        # _update_state_from_event(event)：更新内存状态（带锁保护），从 event 里面提取todos、工具计数、checkpoint 路径、session_id 等；
         self._update_state_from_event(event)
         if self._should_hide_event(event):
             self._refresh_sidebar()
             return
         summary = summarize_event(event)
         self._write_summary(summary)
+        # _refresh_sidebar()：把内存里的会话状态，组装成表格，刷新右侧面板。
         self._refresh_sidebar()
 
     # 从事件中提取信息更新状态：
@@ -553,6 +736,10 @@ class MokioClawTuiApp(App[None]):
     # 用 Table 表格显示
     # 更新到 #side-state 组件
     def _refresh_sidebar(self) -> None:
+        """
+
+        :return:
+        """
         status = "running" if self.running else "ready"
         workspace = shorten(self.latest_workspace or str(self.session_workspace), 80)
         checkpoint = shorten(self.latest_checkpoint or "(waiting)", 80)

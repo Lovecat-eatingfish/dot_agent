@@ -594,6 +594,7 @@ def context_compressor_node(state: MokioGraphState) -> dict[str, Any]:
     writer = _get_writer()
     before_tokens = state.get("context_token_count") or estimate_context_tokens(state)
     before_messages = list(state.get("messages", []))
+
     memory = build_layered_memory(state, node="context_compressor")
     writer(memory_event(memory, node="context_compressor"))
 

@@ -7,6 +7,7 @@ LLM Provider 模块
 from __future__ import annotations
 
 import os
+import dotenv
 
 from langchain_openai import ChatOpenAI
 
@@ -25,6 +26,7 @@ def _validate_env() -> dict[str, str]:
     if _validated_env is not None:
         return _validated_env
 
+    dotenv.load_dotenv()
     api_key = os.getenv("API_KEY")
     model = os.getenv("MODEL")
     base_url = os.getenv("BASE_URL")

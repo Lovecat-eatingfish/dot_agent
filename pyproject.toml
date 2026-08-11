@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mokioclaw = "mokioclaw.cli.app:app"
+dotagent  = "mokioclaw.cli.app:app"
 
 [dependency-groups]
 dev = [

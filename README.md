@@ -16,37 +16,46 @@ MokioClaw 是一个教学优先的 Mini CodeAgent 项目。它按 Agent 系统�
 
 ## 当前阶段
 
-当前处于第 6 阶段的第一步：在 MultiAgent、Context Engineering、Harness Engineering 基础上，新增 Textual TUI 本地交互层。飞书 API 交互仍属于下一步。
+当前架构在 MultiAgent、Context Engineering 和 Harness Engineering 基础上，提供两种交互方式：
 
-第 3 阶段的图不再是固定的 `planner -> searchAgent -> codeAgent -> verifier` 顺序链路。现在外层 LangGraph 只有 supervisor 与验收循环：
+- **Rich CLI**：单次任务的终端输出，展示事件时间线。
+- **Textual TUI**：多轮对话的全屏终端界面，复用同一个 workspace。
+
+外层 LangGraph 采用意图路由 + 验收循环：
 
 ```text
-User Task
+User Input
    |
    v
-planner / supervisor
-   |  toolcall: CallSearchAgentTool
-   |-----------------------------> searchAgent
-   |<----------------------------- research notes + sources
+intent_router
+   |-- chat (寒暄/问答) --> chat_responder --> END
    |
-   |  toolcall: CallCodeAgentTool
-   |-----------------------------> codeAgent
-   |<----------------------------- files + command results
-   |
-   v
-context_monitor
-   | token >= limit
-   v
-context_compressor
-   |
-   v
-verifier / model reviewer
-   | pass
-   v
-final
-   ^
-   | fail and attempts < max_attempts
-   +--------- planner
+   |-- workflow (任务)
+            |
+            v
+         planner
+            |  toolcall: CallSearchAgentTool
+            |-----------------------------> searchAgent
+            |<----------------------------- research notes + sources
+            |
+            |  toolcall: CallCodeAgentTool
+            |-----------------------------> codeAgent
+            |<----------------------------- files + command results
+            |
+            v
+         context_monitor
+            | token >= limit
+            v
+         context_compressor
+            |
+            v
+         verifier
+            | pass
+            v
+         final
+            ^
+            | fail and attempts < max_attempts
+            +--------- planner
 ```
 
 标志性演示任务：
@@ -55,7 +64,7 @@ final
 uv run mokioclaw "帮我查阅明日方舟阿米娅，并编写一个 HTML 介绍人物"
 ```
 
-这个任务适合展示 MultiAgent，因为它需要先查资料，再把资料转成可交付的 HTML 页面，最后由模型版 verifier 读取文件、执行检查、判断是否完成。第 4 阶段会在 planner/verifier 之间自动监控上下文 token，达到阈值后插入压缩节点，并把规则、工作记忆、历史摘要拆成独立层次展示。
+这个任务适合展示 MultiAgent：需要先查资料，再把资料转成可交付的 HTML 页面，最后由模型版 verifier 读取文件、执行检查、判断是否完成。上下文 token 达到阈值后，`context_compressor` 会自动压缩消息窗口，并把规则、工作记忆、历史摘要拆成独立层次管理。
 
 ## Context Engineering
 
@@ -95,7 +104,7 @@ MOKIO_CONTEXT_TOKEN_LIMIT=2000 uv run mokioclaw "帮我查阅明日方舟阿米�
 | --- | --- | --- |
 | `planner` | `TodoWriteTool` / `CallSearchAgentTool` / `CallCodeAgentTool` | 制定计划，并通过 toolcall 分派专家 Agent |
 | `searchAgent` | `WebSearchTool` | 调用 Tavily 搜索资料，返回研究摘要和 sources |
-| `codeAgent` | `FileReadTool` / `FileWriteTool` / `FileEditTool` / `GrepTool` / `BashTool` / `TodoUpdateTool` | 写文件、运行检查、更新 todo 进度 |
+| `codeAgent` | `FileReadTool` / `FileWriteTool` / `FileEditTool` / `GlobTool` / `GrepTool` / `BashTool` / `TodoUpdateTool` | 写文件、运行检查、更新 todo 进度 |
 | `context_monitor` | 无 | 估算当前上下文 token，决定是否触发压缩 |
 | `context_compressor` | 模型压缩 prompt / 分层记忆 | 删除旧 messages，生成可恢复的压缩上下文，并写入 `HISTORY_SUMMARY.md` |
 | `verifier` | `FileReadTool` / `GrepTool` / `BashTool` / `WebSearchTool` | 模型验收节点，只读检查，不修改文件 |
@@ -105,6 +114,7 @@ MOKIO_CONTEXT_TOKEN_LIMIT=2000 uv run mokioclaw "帮我查阅明日方舟阿米�
 
 | Tool | 职责 | 设计重点 |
 | --- | --- | --- |
+| `GlobTool` | 按文件名通配符搜索文件或目录 | 支持 `path_type=”dir”` 查找目录 |
 | `TodoWriteTool` | 写入 todo、验收标准、验证命令 | 让 planner 的计划外显；兼容列表、JSON 列表和以 todo id 为 key 的 description 字典 |
 | `TodoUpdateTool` | 更新 todo 状态 | 同步更新 state 和 workspace 内的 `TODO.md` |
 | `CallSearchAgentTool` | 调用 searchAgent | 把子 Agent 包装成 planner 的 toolcall |
@@ -112,7 +122,7 @@ MOKIO_CONTEXT_TOKEN_LIMIT=2000 uv run mokioclaw "帮我查阅明日方舟阿米�
 | `NotepadReadTool` | 读取长期笔记 | 从 workspace 的 `NOTEPAD.md` 恢复上下文 |
 | `NotepadAppendTool` | 追加长期笔记 | 记录发现、决策、重要文件、风险和下一步 |
 | `WebSearchTool` | Tavily 网络搜索 | 返回 answer 和结构化 sources |
-| `FileReadTool` | 读取 workspace 内文本文件 | 支持 `offset` / `limit`，记录“已读状态” |
+| `FileReadTool` | 读取 workspace 内文本文件 | 支持 `offset` / `limit`，记录”已读状态” |
 | `FileWriteTool` | 创建文件或整文件写入 | 覆盖已有文件前要求先读 |
 | `FileEditTool` | 对已有文件做局部替换 | 基于 `old_text` / `new_text`，要求唯一匹配 |
 | `GrepTool` | 搜索 workspace 内文本内容 | 用结构化方式定位内容 |
@@ -220,50 +230,65 @@ uv run mokioclaw "帮我查阅明日方舟阿米娅，并编写一个 HTML 介�
 ## 文件目录
 
 ```text
-MokioAgent/
-├─ assets/
-│  └─ logo-no-words.png
-├─ logo.png
+dot_agent/
+├─ pyproject.toml          # 项目元数据、依赖、CLI 入口点
+├─ uv.lock                 # 依赖锁文件
+├─ .env                    # 运行时密钥（不进 git）
+├─ .env_example            # .env 模板
 ├─ README.md
-├─ pyproject.toml
-├─ uv.lock
 ├─ src/
 │  └─ mokioclaw/
+│     ├─ __init__.py
+│     ├─ main.py            # 薄入口：import cli.app 然后调 app()
 │     ├─ agents/
-│     │  ├─ search_agent.py     # searchAgent：Tavily 研究专家
-│     │  └─ code_agent.py       # codeAgent：文件和命令执行专家
+│     │  ├─ search_agent.py   # searchAgent：Tavily 研究专家
+│     │  └─ code_agent.py     # codeAgent：文件和命令执行专家
 │     ├─ cli/
-│     │  ├─ app.py              # Typer CLI 入口与 tui 子命令
-│     │  ├─ formatter.py        # Rich 事件时间线展示
-│     │  ├─ event_summary.py    # Rich CLI / Textual TUI 共用事件摘要
-│     │  └─ tui/                # Textual 本地交互层
+│     │  ├─ app.py            # Typer CLI 入口与 tui 子命令
+│     │  ├─ formatter.py      # Rich 事件时间线展示
+│     │  ├─ event_summary.py  # Rich CLI / Textual TUI 共用事件摘要
+│     │  └─ tui/              # Textual 本地交互层
 │     ├─ core/
-│     │  ├─ agent.py            # LangGraph workflow 运行入口
-│     │  ├─ checkpoint.py       # light / strict checkpoint 与 resume
-│     │  ├─ paths.py            # 项目根目录与 workspace 路径
-│     │  └─ state.py            # RuntimeState 与文件快照
+│     │  ├─ agent.py          # LangGraph workflow 运行入口
+│     │  ├─ approval.py       # 审批请求/决策 + 风险命令匹配
+│     │  ├─ checkpoint.py     # light / strict checkpoint 与 resume
+│     │  ├─ log.py            # MOKIO_LOG_LEVEL / MOKIO_LOG_FILE 日志配置
+│     │  ├─ parallel.py       # 并行工具调用（自动检测依赖）
+│     │  ├─ path_security.py  # 路径白名单/黑名单/敏感文件检查
+│     │  ├─ paths.py          # 项目根目录与 workspace 路径
+│     │  ├─ retry.py          # 工具调用指数退避重试
+│     │  ├─ state.py          # RuntimeState 与文件快照
+│     │  ├─ utils.py          # 共享工具函数
+│     │  └─ workspace_detection.py  # 项目根目录自动检测
 │     ├─ graph/
-│     │  ├─ state.py            # Graph state
-│     │  ├─ memory.py           # rules / working memory / history summary-store
-│     │  ├─ nodes.py            # planner / context monitor / compressor / verifier / final
-│     │  └─ workflow.py         # StateGraph 组装与路由
+│     │  ├─ state.py              # Graph state
+│     │  ├─ memory.py             # rules / working memory / history summary-store
+│     │  ├─ memory_retrieval.py   # 记忆检索
+│     │  ├─ nodes.py              # planner / context monitor / compressor / verifier / final
+│     │  ├─ workflow.py           # StateGraph 组装与路由
+│     │  ├─ tiered_compression.py # 四级分级压缩策略
+│     │  ├─ dual_threshold_compression.py
+│     │  └─ tool_disclosure.py    # 工具披露控制
 │     ├─ providers/
 │     │  └─ openai_provider.py  # 从 .env 创建 ChatOpenAI
 │     ├─ prompts/
-│     │  ├─ stage3.py           # 第 3 阶段节点与子 Agent prompt
-│     │  └─ stage4.py           # Context compression prompt
+│     │  ├─ agent_prompt.py           # 节点与子 Agent prompt
+│     │  └─ context_manager_prompt.py # 上下文压缩 prompt
 │     └─ tools/
 │        ├─ registry.py         # 工具注册
 │        ├─ todo_tool.py        # TodoWrite / TodoUpdate / TODO.md 持久化
 │        ├─ notepad_tool.py     # NOTEPAD.md 长期工作笔记
 │        ├─ web_search_tool.py  # Tavily WebSearchTool
 │        ├─ file_tools.py       # Read / Write / Edit
+│        ├─ glob_tool.py        # 文件名通配符搜索
 │        ├─ grep_tool.py        # 内容搜索
 │        └─ bash_tool.py        # 命令执行
 └─ tests/
    ├─ test_tools.py
    ├─ test_graph.py
    ├─ test_formatter.py
+   ├─ test_runtime.py
+   ├─ test_tui.py
    └─ test_cli_smoke.py
 ```
 
@@ -347,6 +372,10 @@ MOKIO_BASH_MAX_OUTPUT_CHARS=6000
 MOKIO_BASH_ENV_FILE=
 MOKIO_CHECKPOINT_MODE=light
 MOKIO_TRACE_MODE=on
+MOKIO_LOG_LEVEL=WARNING
+MOKIO_LOG_FILE=
+MOKIO_REQUEST_TIMEOUT=120
+MOKIO_MAX_RETRIES=3
 ```
 
 同步依赖：

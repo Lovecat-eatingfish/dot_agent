@@ -5,6 +5,7 @@ from langchain_core.tools import StructuredTool
 from mokioclaw.core.state import RuntimeState
 from mokioclaw.tools.bash_tool import bash_tool_description, run_bash, run_bash_read_only
 from mokioclaw.tools.file_tools import edit_file, read_file, write_file
+from mokioclaw.tools.glob_tool import glob_search
 from mokioclaw.tools.grep_tool import grep
 from mokioclaw.tools.notepad_tool import append_notepad, read_notepad
 from mokioclaw.tools.web_search_tool import build_web_search_tool
@@ -28,11 +29,29 @@ def build_tools(state: RuntimeState) -> list[StructuredTool]:
             description="Edit an existing workspace file by replacing one unique old_text snippet.",
         ),
         StructuredTool.from_function(
-            name="GrepTool",
-            func=lambda pattern, path=".", glob=None, head_limit=50, ignore_case=False: grep(
-                state, pattern, path, glob, head_limit, ignore_case
+            name="GlobTool",
+            func=lambda pattern, path=".", path_type="file", head_limit=200: glob_search(
+                state, pattern, path, path_type, head_limit
             ),
-            description="Search workspace text files by regex pattern and return matching lines.",
+            description=(
+                "Find files or directories inside the workspace by glob pattern. "
+                "Args: pattern (e.g. '**/*.py', '*.md'), optional path, optional path_type "
+                "('file' or 'dir'), optional head_limit. Returns sorted relative paths."
+            ),
+        ),
+        StructuredTool.from_function(
+            name="GrepTool",
+            func=lambda pattern, path=".", glob=None, head_limit=50, ignore_case=False,
+            context_before=0, context_after=0, output_mode="content": grep(
+                state, pattern, path, glob, head_limit, ignore_case,
+                context_before, context_after, output_mode,
+            ),
+            description=(
+                "Search workspace text files by regex pattern. Uses ripgrep when available, "
+                "falls back to a pure-Python scanner. Args: pattern, optional path, optional glob "
+                "filter, head_limit, ignore_case, context_before, context_after, output_mode "
+                "('content' | 'files_with_matches' | 'count')."
+            ),
         ),
         StructuredTool.from_function(
             name="BashTool",
@@ -62,11 +81,29 @@ def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
             description="Read a UTF-8 text file inside the workspace. Supports offset and limit.",
         ),
         StructuredTool.from_function(
-            name="GrepTool",
-            func=lambda pattern, path=".", glob=None, head_limit=50, ignore_case=False: grep(
-                state, pattern, path, glob, head_limit, ignore_case
+            name="GlobTool",
+            func=lambda pattern, path=".", path_type="file", head_limit=200: glob_search(
+                state, pattern, path, path_type, head_limit
             ),
-            description="Search workspace text files by regex pattern and return matching lines.",
+            description=(
+                "Find files or directories inside the workspace by glob pattern. "
+                "Args: pattern (e.g. '**/*.py', '*.md'), optional path, optional path_type "
+                "('file' or 'dir'), optional head_limit. Returns sorted relative paths."
+            ),
+        ),
+        StructuredTool.from_function(
+            name="GrepTool",
+            func=lambda pattern, path=".", glob=None, head_limit=50, ignore_case=False,
+            context_before=0, context_after=0, output_mode="content": grep(
+                state, pattern, path, glob, head_limit, ignore_case,
+                context_before, context_after, output_mode,
+            ),
+            description=(
+                "Search workspace text files by regex pattern. Uses ripgrep when available, "
+                "falls back to a pure-Python scanner. Args: pattern, optional path, optional glob "
+                "filter, head_limit, ignore_case, context_before, context_after, output_mode "
+                "('content' | 'files_with_matches' | 'count')."
+            ),
         ),
         StructuredTool.from_function(
             name="BashTool",

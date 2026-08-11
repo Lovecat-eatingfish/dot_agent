@@ -25,6 +25,7 @@ from mokioclaw.core.state import RuntimeState
 from mokioclaw.core.trace import TraceRecorder, normalize_trace_mode
 from mokioclaw.graph.workflow import build_complex_workflow, build_entry_workflow
 
+logger = get_logger(__name__)
 
 def create_runtime(
     workspace: Path | None = None,
@@ -80,6 +81,7 @@ def stream_agent_events(
     if resume_path is None:
         route = "workflow"
         entry_state: dict[str, Any] = {"task": task or "", "messages": []}
+        # 判断简约的意图： 聊天 / plan， 如果是聊天 调用llm 返回数据 ——》end， 如果是plan直接end（后米构建更复杂的图： build_complex_workflow）
         for mode, event in build_entry_workflow().stream(entry_state, stream_mode=["updates", "custom"]):
             if mode == "custom":
                 yield {"type": "custom_event", "event": event}

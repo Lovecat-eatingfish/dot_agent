@@ -6,12 +6,12 @@ from pathlib import Path
 from rich.text import Text
 from typer.testing import CliRunner
 
-from mokioclaw.cli.app import app
-from mokioclaw.cli.event_summary import summarize_event
-from mokioclaw.cli.tui import MokioClawTuiApp
-from mokioclaw.cli.tui.approval import ApprovalGate
-from mokioclaw.cli.tui.logo import render_logo
-from mokioclaw.core.approval import ApprovalRequest
+from mokioclaw.interaction.app import app
+from mokioclaw.interaction.event_summary import summarize_event
+from mokioclaw.interaction.tui import MokioClawTuiApp
+from mokioclaw.interaction.tui.approval import ApprovalGate
+from mokioclaw.interaction.tui.logo import render_logo
+from mokioclaw.security.approval import ApprovalRequest
 
 
 def test_tui_help_is_available() -> None:
@@ -20,7 +20,7 @@ def test_tui_help_is_available() -> None:
     result = runner.invoke(app, ["tui", "--help"])
 
     assert result.exit_code == 0
-    assert "Textual terminal interface" in result.output
+    assert "Textual TUI" in result.output
 
 
 def test_tui_options_are_accepted(monkeypatch) -> None:
@@ -34,7 +34,7 @@ def test_tui_options_are_accepted(monkeypatch) -> None:
         def run(self):
             return None
 
-    monkeypatch.setattr("mokioclaw.cli.tui.MokioClawTuiApp", FakeApp)
+    monkeypatch.setattr("mokioclaw.interaction.tui.MokioClawTuiApp", FakeApp)
 
     result = runner.invoke(
         app,
@@ -56,7 +56,7 @@ def test_natural_task_entry_still_works(monkeypatch, tmp_path) -> None:
         calls.append((args, kwargs))
         yield {"type": "workspace", "path": str(tmp_path)}
 
-    monkeypatch.setattr("mokioclaw.cli.app.stream_agent_events", fake_stream)
+    monkeypatch.setattr("mokioclaw.interaction.app.stream_agent_events", fake_stream)
 
     result = runner.invoke(app, ["demo task"])
 
@@ -114,8 +114,8 @@ def test_tui_renders_fake_stream_events(tmp_path) -> None:
         app = MokioClawTuiApp(initial_task="demo task", stream_factory=fake_stream)
         async with app.run_test(size=(120, 36)) as pilot:
             await pilot.pause(0.3)
-            assert "workspace-a" in app.sidebar_text
-            assert "trace-demo" in app.sidebar_text
+            assert "workspace-a" in app.latest_workspace
+            assert "trace-demo" in app.latest_trace
             assert "session-demo" in app.sidebar_text
             assert app.run_count == 1
             assert not app.running

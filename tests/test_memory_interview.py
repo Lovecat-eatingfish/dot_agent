@@ -20,14 +20,14 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from mokioclaw.core.state import RuntimeState
-from mokioclaw.graph.dual_threshold_compression import (
+from mokioclaw.state.runtime import RuntimeState
+from mokioclaw.memory.dual_threshold_compression import (
     CompressionThresholds,
     DualThresholdCompressor,
     SummaryChain,
 )
-from mokioclaw.graph.memory_retrieval import IntentBasedRetrievalTrigger, SimpleMemoryRetriever
-from mokioclaw.graph.tool_disclosure import ProgressiveToolDisclosure, ToolRegistry, ToolSchema, ToolMetadata
+from mokioclaw.memory.retrieval import IntentBasedRetrievalTrigger, SimpleMemoryRetriever
+from mokioclaw.memory.tool_disclosure import ProgressiveToolDisclosure, ToolRegistry, ToolSchema, ToolMetadata
 
 
 class TestDualThresholdCompression:

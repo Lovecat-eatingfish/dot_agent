@@ -81,8 +81,13 @@ def detect_workspace_from_project(start: Path | None = None) -> Path:
     if _has_project_marker(current):
         return current
 
-    # 向上查找
+    # 向上查找，但不超过用户主目录（避免跨越项目边界找到无关的 .git）
+    home = Path.home()
     for candidate in current.parents:
+        # 停止条件：不超过用户主目录
+        if candidate == home or home not in candidate.parents:
+            break
+
         # 排除一些不应该作为项目根的目录
         if candidate.name in {"node_modules", ".venv", "venv", "env", ".git"}:
             continue

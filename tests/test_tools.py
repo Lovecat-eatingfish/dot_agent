@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import sys
 
-from mokioclaw.core.approval import ApprovalDecision, classify_command_risk
-from mokioclaw.core.state import RuntimeState
+from mokioclaw.security.approval import ApprovalDecision, classify_command_risk
+from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.tools.bash_tool import bash_tool_description, run_bash
 from mokioclaw.tools.file_tools import edit_file, read_file, write_file
 from mokioclaw.tools.grep_tool import grep

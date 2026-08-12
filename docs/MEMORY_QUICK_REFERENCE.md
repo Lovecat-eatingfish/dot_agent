@@ -40,7 +40,7 @@ Steps: 6+ tool calls     → 强制总结
 ### 使用示例
 
 ```python
-from mokioclaw.graph.dual_threshold_compression import (
+from mokioclaw.memory.dual_threshold_compression import (
     CompressionThresholds,
     DualThresholdCompressor,
 )
@@ -107,7 +107,7 @@ _persist_raw_history(state["runtime"], messages)
 ### 触发条件
 
 ```python
-from mokioclaw.graph.memory_retrieval import (
+from mokioclaw.memory.retrieval import (
     IntentBasedRetrievalTrigger,
     SimpleMemoryRetriever,
 )
@@ -148,7 +148,7 @@ result2 = trigger.retrieve_if_needed("继续任务")  # None (冷却期)
 ### 使用示例
 
 ```python
-from mokioclaw.graph.tool_disclosure import (
+from mokioclaw.memory.tool_disclosure import (
     ToolRegistry,
     ProgressiveToolDisclosure,
     ToolMetadata,
@@ -193,7 +193,7 @@ disclosure.get_full_schemas_for_intent("web_search", "search")
 ## 分级压缩策略
 
 ```python
-from mokioclaw.graph.tiered_compression import classify_message_for_compression
+from mokioclaw.memory.tiered_compression import classify_message_for_compression
 
 # 优先级分数
 KEEP_ALWAYS = 100        # 永远保留

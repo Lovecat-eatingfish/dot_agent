@@ -91,7 +91,7 @@ return {
 
 #### 2.1 实现分级压缩策略
 
-**新增模块**：`src/mokioclaw/graph/tiered_compression.py`
+**新增模块**：`src/mokioclaw/memory/tiered_compression.py`
 
 **四级压缩策略**：
 
@@ -128,7 +128,7 @@ def compress_messages_by_tier(messages: list[Any], context_summary: str = "") ->
 
 #### 3.1 路径白名单/黑名单机制
 
-**新增模块**：`src/mokioclaw/core/path_security.py`
+**新增模块**：`src/mokioclaw/security/path_security.py`
 
 **默认黑名单**：
 ```python
@@ -182,7 +182,7 @@ SENSITIVE_FILE_PATTERNS = [
 
 #### 4.1 工具调用重试机制
 
-**新增模块**：`src/mokioclaw/core/retry.py`
+**新增模块**：`src/mokioclaw/reliability/retry.py`
 
 **重试装饰器**：
 ```python
@@ -227,7 +227,7 @@ RETRYABLE_ERRORS = [
 
 #### 5.1 并行工具调用
 
-**新增模块**：`src/mokioclaw/core/parallel.py`
+**新增模块**：`src/mokioclaw/reliability/parallel.py`
 
 **并行检测逻辑**：
 ```python
@@ -289,10 +289,10 @@ async def execute_tools_in_parallel_async(
 
 | 文件 | 用途 |
 |------|------|
-| `src/mokioclaw/graph/tiered_compression.py` | 分级压缩策略实现 |
-| `src/mokioclaw/core/path_security.py` | 路径安全控制（白名单/黑名单） |
-| `src/mokioclaw/core/retry.py` | 工具调用重试机制 |
-| `src/mokioclaw/core/parallel.py` | 并行工具调用支持 |
+| `src/mokioclaw/memory/tiered_compression.py` | 分级压缩策略实现 |
+| `src/mokioclaw/security/path_security.py` | 路径安全控制（白名单/黑名单） |
+| `src/mokioclaw/reliability/retry.py` | 工具调用重试机制 |
+| `src/mokioclaw/reliability/parallel.py` | 并行工具调用支持 |
 | `docs/claude-code-comparison-analysis.md` | Claude Code 对比分析报告 |
 
 ---
@@ -303,8 +303,8 @@ async def execute_tools_in_parallel_async(
 |------|----------|
 | `src/mokioclaw/tools/bash_tool.py` | 重写 description，添加 `_validate_bash_args()` |
 | `src/mokioclaw/tools/file_tools.py` | 添加 `_validate_write_args()` / `_validate_edit_args()` |
-| `src/mokioclaw/graph/nodes.py` | 集成分级压缩到 `context_compressor_node()` |
-| `src/mokioclaw/core/state.py` | `assert_workspace_path()` 使用新安全模块 |
+| `src/mokioclaw/orchestration/nodes.py` | 集成分级压缩到 `context_compressor_node()` |
+| `src/mokioclaw/state/runtime.py` | `assert_workspace_path()` 使用新安全模块 |
 | `src/mokioclaw/core/utils.py` | 添加缺失的 `import re` |
 
 ---
@@ -334,42 +334,42 @@ async def execute_tools_in_parallel_async(
 
 ### 修复 #1：path_security.py - 敏感文件正则匹配失效（HIGH）
 
-**文件**：`src/mokioclaw/core/path_security.py:142`  
+**文件**：`src/mokioclaw/security/path_security.py:142`  
 **问题**：使用 `re.match()` 只匹配字符串开头，无法检测子目录中的敏感文件（如 `subdir/.env`）  
 **修复**：改为 `re.search()` 匹配任意位置  
 **验证**：✅ 子目录中的 `.pem`、`id_rsa` 等文件现在能被正确检测
 
 ### 修复 #2：nodes.py - JSON 提取正则失败（HIGH）
 
-**文件**：`src/mokioclaw/graph/nodes.py:285`  
+**文件**：`src/mokioclaw/orchestration/nodes.py:285`  
 **问题**：非贪婪 regex `"error".*?({.*?})` 在嵌套 JSON 时只捕获第一部分  
 **修复**：改为贪婪匹配 `"error".*?({.*})` 捕获完整 JSON 对象  
 **影响**：修复了 LLM 返回复杂错误对象时的解析失败
 
 ### 修复 #3：memory.py - 异常处理不匹配（CRITICAL）
 
-**文件**：`src/mokioclaw/graph/memory.py:198, 225`  
+**文件**：`src/mokioclaw/memory/memory.py:198, 225`  
 **问题**：代码捕获 `ValueError` 但 `path_security.py` 抛出 `PathSecurityError`（子类）  
 **修复**：改为捕获 `(ValueError, PathSecurityError)`  
 **影响**：防止路径安全检查失败时程序崩溃
 
 ### 修复 #4：parallel.py - 并行执行数据竞争（HIGH）
 
-**文件**：`src/mokioclaw/core/parallel.py:54`  
+**文件**：`src/mokioclaw/reliability/parallel.py:54`  
 **问题**：`set(write_paths)` 去重后无法检测重复路径，导致并行写同一文件  
 **修复**：检查 `len(write_paths) != len(set(write_paths))` 识别重复  
 **影响**：防止文件写入冲突和数据损坏
 
 ### 修复 #5：tiered_compression.py - 双重压缩（HIGH）
 
-**文件**：`src/mokioclaw/graph/tiered_compression.py:271`  
+**文件**：`src/mokioclaw/memory/tiered_compression.py:271`  
 **问题**：`estimate_tokens_for_tiered_compression()` 内部调用 `compress_messages_by_tier()` 导致重复压缩  
 **修复**：添加 `compressed_messages` 参数复用已压缩结果  
 **影响**：提升性能，避免不必要的重复计算
 
 ### 修复 #6：tiered_compression.py - Token 估算不准确（MEDIUM）
 
-**文件****：`src/mokioclaw/graph/tiered_compression.py:265`  
+**文件****：`src/mokioclaw/memory/tiered_compression.py:265`  
 **问题**：`max(1, len(text) // 4)` 强制最小 1 token，且整数除法低估  
 **修复**：改为 `max(0, (len(text) + 3) // 4)` 正确四舍五入，允许 0 token  
 **影响**：更准确的 token 统计，特别是短文本
@@ -383,7 +383,7 @@ async def execute_tools_in_parallel_async(
 
 ### 修复 #8：retry.py - 线性退避 + 不可达代码（MEDIUM）
 
-**文件**：`src/mokioclaw/core/retry.py:118, 128`  
+**文件**：`src/mokioclaw/reliability/retry.py:118, 128`  
 **问题**：
 - 使用线性退避 `attempt * 1.0` 而非指数退避
 - `raise` 后 fallback return 不可达
@@ -407,7 +407,7 @@ async def execute_tools_in_parallel_async(
 - 工作记忆层（Working Memory）：当前任务关键信息
 - 历史摘要层（History Summary）：过往对话压缩总结
 
-**文件**：`src/mokioclaw/graph/memory.py`
+**文件**：`src/mokioclaw/memory/memory.py`
 
 ### Q2: 双阈值压缩
 
@@ -418,7 +418,7 @@ async def execute_tools_in_parallel_async(
 - 硬阈值（90%）：同步强制压缩
 - 步数触发（>5步）：强制总结
 
-**文件**：`src/mokioclaw/graph/dual_threshold_compression.py`
+**文件**：`src/mokioclaw/memory/dual_threshold_compression.py`
 
 ### Q3: 增量式摘要更新
 
@@ -429,7 +429,7 @@ async def execute_tools_in_parallel_async(
 - 复杂度 O(n) vs 全量 O(n²)
 - 速度提升 10x
 
-**文件**：`src/mokioclaw/graph/dual_threshold_compression.py`
+**文件**：`src/mokioclaw/memory/dual_threshold_compression.py`
 
 ### Q4: 完整历史持久化
 
@@ -440,7 +440,7 @@ async def execute_tools_in_parallel_async(
 - 不发送给模型，仅用于审计
 - 用途：审计溯源、摘要重建、记忆检索
 
-**文件**：`src/mokioclaw/graph/nodes.py`
+**文件**：`src/mokioclaw/orchestration/nodes.py`
 
 ### Q5: 按需长期记忆检索
 
@@ -452,7 +452,7 @@ async def execute_tools_in_parallel_async(
 - 低依赖意图（新任务、问候）→ 不检索
 - 冷却机制：60 秒
 
-**文件**：`src/mokioclaw/graph/memory_retrieval.py`
+**文件**：`src/mokioclaw/memory/memory_retrieval.py`
 
 ### Q6: 工具渐进式披露
 
@@ -463,7 +463,7 @@ async def execute_tools_in_parallel_async(
 - 按需加载：3 × 400 = 1200 tokens
 - 总计 2200 vs 20000，节省 89%
 
-**文件**：`src/mokioclaw/graph/tool_disclosure.py`
+**文件**：`src/mokioclaw/memory/tool_disclosure.py`
 
 ---
 

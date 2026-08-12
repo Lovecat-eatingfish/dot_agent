@@ -6,9 +6,9 @@ from pathlib import Path
 from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
 
-from mokioclaw.core.state import RuntimeState
-from mokioclaw.graph.memory import build_layered_memory, persist_history_summary, read_history_summary
-from mokioclaw.graph.nodes import (
+from mokioclaw.state.runtime import RuntimeState
+from mokioclaw.memory.memory import build_layered_memory, persist_history_summary, read_history_summary
+from mokioclaw.orchestration.nodes import (
     _call_code_agent_tool,
     _call_search_agent_tool,
     chat_responder_node,
@@ -25,7 +25,7 @@ from mokioclaw.graph.nodes import (
     verifier_node,
     verifier_route,
 )
-from mokioclaw.graph.workflow import build_workflow
+from mokioclaw.orchestration.workflow import build_workflow
 
 
 def test_model_verifier_passes_from_json(monkeypatch, tmp_path: Path) -> None:
@@ -46,7 +46,7 @@ def test_model_verifier_passes_from_json(monkeypatch, tmp_path: Path) -> None:
         def bind_tools(self, tools):
             return FakeBoundModel()
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
     state = {
         "runtime": RuntimeState(workspace=tmp_path),
         "task": "demo",
@@ -73,7 +73,7 @@ def test_model_verifier_invalid_json_fails_and_routes_back(monkeypatch, tmp_path
         def bind_tools(self, tools):
             return FakeBoundModel()
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
     state = {
         "runtime": RuntimeState(workspace=tmp_path),
         "task": "demo",
@@ -85,7 +85,7 @@ def test_model_verifier_invalid_json_fails_and_routes_back(monkeypatch, tmp_path
 
     assert result["passed"] is False
     assert "valid JSON" in result["last_error"]
-    assert verifier_route({**state, **result}) == "planner"
+    assert verifier_route({**state, **result}) == "repair"
 
 
 def test_verifier_routes_to_final_at_max_attempts() -> None:
@@ -121,7 +121,7 @@ def test_intent_router_routes_chat_with_model_json(monkeypatch) -> None:
         def invoke(self, messages):
             return AIMessage(content='{"route":"chat","reason":"greeting","confidence":0.92}')
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
 
     result = intent_router_node({"task": "你好"})
 
@@ -136,7 +136,7 @@ def test_intent_router_routes_workflow_with_model_json(monkeypatch) -> None:
         def invoke(self, messages):
             return AIMessage(content='{"route":"workflow","reason":"needs files","confidence":0.88}')
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
 
     result = intent_router_node({"task": "帮我创建一个 HTML 页面"})
 
@@ -149,7 +149,7 @@ def test_intent_router_invalid_json_defaults_to_workflow(monkeypatch) -> None:
         def invoke(self, messages):
             return AIMessage(content="not json")
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
 
     result = intent_router_node({"task": "你好"})
 
@@ -162,7 +162,7 @@ def test_chat_responder_node_returns_chat_response(monkeypatch) -> None:
         def invoke(self, messages):
             return AIMessage(content="你好，我在。")
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
 
     result = chat_responder_node({"task": "你好", "intent_reason": "greeting"})
 
@@ -183,7 +183,7 @@ def test_estimate_context_tokens_uses_model_counter(monkeypatch, tmp_path: Path)
         def get_num_tokens_from_messages(self, messages):
             return 42 + len(messages)
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
     result = estimate_context_tokens(
         {
             "runtime": RuntimeState(workspace=tmp_path),
@@ -197,7 +197,7 @@ def test_estimate_context_tokens_uses_model_counter(monkeypatch, tmp_path: Path)
 
 def test_context_monitor_does_not_compress_below_limit(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MOKIO_CONTEXT_TOKEN_LIMIT", "100")
-    monkeypatch.setattr("mokioclaw.graph.nodes.estimate_context_tokens", lambda state: 10)
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.estimate_context_tokens", lambda state: 10)
     result = context_monitor_node(
         {
             "runtime": RuntimeState(workspace=tmp_path),
@@ -213,7 +213,7 @@ def test_context_monitor_does_not_compress_below_limit(monkeypatch, tmp_path: Pa
 
 def test_context_monitor_compresses_at_limit(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("MOKIO_CONTEXT_TOKEN_LIMIT", "100")
-    monkeypatch.setattr("mokioclaw.graph.nodes.estimate_context_tokens", lambda state: 100)
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.estimate_context_tokens", lambda state: 100)
     result = context_monitor_node(
         {
             "runtime": RuntimeState(workspace=tmp_path),
@@ -233,9 +233,9 @@ def test_context_compressor_removes_old_messages_and_preserves_state(monkeypatch
         calls["count"] += 1
         return 1000 if calls["count"] == 1 else 50
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.estimate_context_tokens", fake_estimate)
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.estimate_context_tokens", fake_estimate)
     monkeypatch.setattr(
-        "mokioclaw.graph.nodes._compress_context_with_model",
+        "mokioclaw.orchestration.nodes._compress_context_with_model",
         lambda state: {
             "summary": "compressed summary",
             "active_goal": "finish demo",
@@ -286,7 +286,7 @@ def test_planner_generates_default_plan(monkeypatch, tmp_path: Path) -> None:
         def bind_tools(self, tools):
             return FakeBoundModel()
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.create_model", lambda: FakeModel())
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
     result = planner_node(
         {
             "task": "Create a simple HTML page",
@@ -309,7 +309,7 @@ def test_call_search_agent_tool_updates_state(monkeypatch, tmp_path: Path) -> No
             "queries": ["Amiya Arknights"],
         }
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.run_search_agent", fake_search_agent)
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.run_search_agent", fake_search_agent)
     state = {"task": "阿米娅", "runtime": RuntimeState(workspace=tmp_path)}
 
     result = _call_search_agent_tool(state, lambda event: None, "research Amiya")
@@ -327,7 +327,7 @@ def test_call_code_agent_tool_updates_state(monkeypatch, tmp_path: Path) -> None
             "todos": [{"id": "todo-1", "content": "write", "status": "completed", "note": ""}],
         }
 
-    monkeypatch.setattr("mokioclaw.graph.nodes.run_code_agent", fake_code_agent)
+    monkeypatch.setattr("mokioclaw.orchestration.nodes.run_code_agent", fake_code_agent)
     state = {
         "task": "阿米娅",
         "runtime": RuntimeState(workspace=tmp_path),

@@ -25,9 +25,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from mokioclaw.core.approval import ApprovalDecision, classify_command_risk, make_approval_request
+from mokioclaw.security.approval import ApprovalDecision, classify_command_risk, make_approval_request
 from mokioclaw.core.log import get_logger
-from mokioclaw.core.state import RuntimeState
+from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.core.utils import BashResult, coerce_bool
 
 logger = get_logger(__name__)
@@ -568,13 +568,14 @@ def _build_env(state: RuntimeState) -> tuple[dict[str, str], str | None]:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
-    _prepend_harness_paths(state, env)
     env_file = state.bash_env_file or state.workspace / ".mokioclaw.env"
     if env_file.exists():
         try:
             env.update(_parse_env_file(env_file, env))
         except OSError as exc:
             return env, f"failed to read bash env file {env_file}: {exc}"
+    # env file may have overwritten PATH; re-prepend harness paths so they stay first
+    _prepend_harness_paths(state, env)
     return env, None
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from mokioclaw.core.agent import create_runtime
+from mokioclaw.orchestration.agent import create_runtime
 from mokioclaw.core.paths import new_task_workspace
 
 
@@ -91,7 +91,7 @@ def test_create_runtime_reads_trace_env(monkeypatch, tmp_path: Path) -> None:
 
 
 def test_stream_agent_events_routes_model_chat_without_workspace(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
+    from mokioclaw.orchestration.agent import stream_agent_events
 
     class FakeEntryWorkflow:
         def stream(self, inputs, stream_mode):
@@ -107,8 +107,8 @@ def test_stream_agent_events_routes_model_chat_without_workspace(monkeypatch, tm
     def fail_complex_workflow():
         raise AssertionError("complex workflow should not be built for chat route")
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", fail_complex_workflow)
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", fail_complex_workflow)
 
     events = list(stream_agent_events("你好", workspace=tmp_path, approval_mode="deny"))
 
@@ -117,7 +117,7 @@ def test_stream_agent_events_routes_model_chat_without_workspace(monkeypatch, tm
 
 
 def test_stream_agent_events_routes_model_workflow_to_complex_graph(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
+    from mokioclaw.orchestration.agent import stream_agent_events
 
     class FakeEntryWorkflow:
         def stream(self, inputs, stream_mode):
@@ -130,8 +130,8 @@ def test_stream_agent_events_routes_model_workflow_to_complex_graph(monkeypatch,
         def stream(self, inputs, stream_mode):
             yield ("updates", {"final": {"final_answer": "PASSED"}})
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     events = list(stream_agent_events("帮我创建一个 HTML 页面", workspace=tmp_path, checkpoint_mode="off", trace_mode="off", approval_mode="deny"))
 
@@ -140,15 +140,15 @@ def test_stream_agent_events_routes_model_workflow_to_complex_graph(monkeypatch,
 
 
 def test_stream_agent_events_saves_checkpoint_on_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
+    from mokioclaw.orchestration.agent import stream_agent_events
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
             yield ("updates", {"planner": {"plan_summary": "plan", "messages": []}})
             raise KeyboardInterrupt
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: _WorkflowEntry())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: _WorkflowEntry())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     events = list(
         stream_agent_events(
@@ -165,7 +165,7 @@ def test_stream_agent_events_saves_checkpoint_on_keyboard_interrupt(monkeypatch,
 
 
 def test_stream_agent_events_writes_trace_summary_on_finish(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
+    from mokioclaw.orchestration.agent import stream_agent_events
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
@@ -173,8 +173,8 @@ def test_stream_agent_events_writes_trace_summary_on_finish(monkeypatch, tmp_pat
             yield ("custom", {"type": "tool_result", "node": "codeAgent", "name": "BashTool", "result": {"ok": True}})
             yield ("updates", {"final": {"final_answer": "LangGraph MultiAgent workflow finished: PASSED"}})
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: _WorkflowEntry())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: _WorkflowEntry())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     events = list(
         stream_agent_events(
@@ -194,7 +194,7 @@ def test_stream_agent_events_writes_trace_summary_on_finish(monkeypatch, tmp_pat
 
 
 def test_stream_agent_events_checkpoints_only_at_safety_points(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
+    from mokioclaw.orchestration.agent import stream_agent_events
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
@@ -212,8 +212,8 @@ def test_stream_agent_events_checkpoints_only_at_safety_points(monkeypatch, tmp_
             )
             yield ("updates", {"final": {"final_answer": "LangGraph MultiAgent workflow finished: PASSED"}})
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: _WorkflowEntry())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: _WorkflowEntry())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     events = list(
         stream_agent_events(
@@ -232,15 +232,15 @@ def test_stream_agent_events_checkpoints_only_at_safety_points(monkeypatch, tmp_
 
 
 def test_stream_agent_events_writes_trace_summary_on_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
+    from mokioclaw.orchestration.agent import stream_agent_events
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
             yield ("updates", {"planner": {"plan_summary": "plan", "messages": []}})
             raise KeyboardInterrupt
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: _WorkflowEntry())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: _WorkflowEntry())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     events = list(
         stream_agent_events(
@@ -259,14 +259,14 @@ def test_stream_agent_events_writes_trace_summary_on_keyboard_interrupt(monkeypa
 
 
 def test_stream_agent_events_trace_off_creates_no_trace_dir(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
+    from mokioclaw.orchestration.agent import stream_agent_events
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
             yield ("updates", {"final": {"final_answer": "PASSED"}})
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: _WorkflowEntry())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: _WorkflowEntry())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     events = list(
         stream_agent_events(
@@ -283,9 +283,9 @@ def test_stream_agent_events_trace_off_creates_no_trace_dir(monkeypatch, tmp_pat
 
 
 def test_stream_agent_events_trace_records_resume(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
-    from mokioclaw.core.checkpoint import CheckpointManager
-    from mokioclaw.core.state import RuntimeState
+    from mokioclaw.orchestration.agent import stream_agent_events
+    from mokioclaw.reliability.checkpoint import CheckpointManager
+    from mokioclaw.state.runtime import RuntimeState
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
@@ -297,7 +297,7 @@ def test_stream_agent_events_trace_records_resume(monkeypatch, tmp_path: Path) -
         status="interrupted",
         latest_node="planner",
     )
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     list(
         stream_agent_events(
@@ -316,9 +316,9 @@ def test_stream_agent_events_trace_records_resume(monkeypatch, tmp_path: Path) -
 
 
 def test_stream_agent_events_resume_skips_entry_router(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_agent_events
-    from mokioclaw.core.checkpoint import CheckpointManager
-    from mokioclaw.core.state import RuntimeState
+    from mokioclaw.orchestration.agent import stream_agent_events
+    from mokioclaw.reliability.checkpoint import CheckpointManager
+    from mokioclaw.state.runtime import RuntimeState
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
@@ -334,8 +334,8 @@ def test_stream_agent_events_resume_skips_entry_router(monkeypatch, tmp_path: Pa
     def fail_entry_workflow():
         raise AssertionError("resume should skip entry router")
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", fail_entry_workflow)
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", fail_entry_workflow)
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     events = list(stream_agent_events(workspace=tmp_path, resume_workspace=tmp_path, checkpoint_mode="off", trace_mode="off", approval_mode="deny"))
 
@@ -343,7 +343,7 @@ def test_stream_agent_events_resume_skips_entry_router(monkeypatch, tmp_path: Pa
 
 
 def test_stream_session_events_chat_writes_session_without_harness(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_session_events
+    from mokioclaw.orchestration.agent import stream_session_events
 
     class FakeEntryWorkflow:
         def stream(self, inputs, stream_mode):
@@ -357,8 +357,8 @@ def test_stream_session_events_chat_writes_session_without_harness(monkeypatch, 
     def fail_complex_workflow():
         raise AssertionError("complex workflow should not run for chat route")
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", fail_complex_workflow)
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", fail_complex_workflow)
 
     events = list(stream_session_events("你好", session_workspace=tmp_path, checkpoint_mode="light", trace_mode="on", approval_mode="deny"))
 
@@ -372,7 +372,7 @@ def test_stream_session_events_chat_writes_session_without_harness(monkeypatch, 
 
 
 def test_stream_session_events_workflow_reuses_workspace_and_session_context(monkeypatch, tmp_path: Path) -> None:
-    from mokioclaw.core.agent import stream_session_events
+    from mokioclaw.orchestration.agent import stream_session_events
 
     captured = {}
 
@@ -390,8 +390,8 @@ def test_stream_session_events_workflow_reuses_workspace_and_session_context(mon
             captured["session_turn"] = inputs.get("session_turn")
             yield ("updates", {"final": {"final_answer": "PASSED: done"}})
 
-    monkeypatch.setattr("mokioclaw.core.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
-    monkeypatch.setattr("mokioclaw.core.agent.build_complex_workflow", lambda: FakeWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
     events = list(
         stream_session_events(

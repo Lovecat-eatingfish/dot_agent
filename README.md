@@ -239,50 +239,63 @@ dot_agent/
 ├─ src/
 │  └─ mokioclaw/
 │     ├─ __init__.py
-│     ├─ main.py            # 薄入口：import cli.app 然后调 app()
+│     ├─ main.py            # 薄入口：import interaction.app 然后调 app()
 │     ├─ agents/
 │     │  ├─ search_agent.py   # searchAgent：Tavily 研究专家
 │     │  └─ code_agent.py     # codeAgent：文件和命令执行专家
-│     ├─ cli/
-│     │  ├─ app.py            # Typer CLI 入口与 tui 子命令
-│     │  ├─ formatter.py      # Rich 事件时间线展示
-│     │  ├─ event_summary.py  # Rich CLI / Textual TUI 共用事件摘要
-│     │  └─ tui/              # Textual 本地交互层
-│     ├─ core/
-│     │  ├─ agent.py          # LangGraph workflow 运行入口
-│     │  ├─ approval.py       # 审批请求/决策 + 风险命令匹配
-│     │  ├─ checkpoint.py     # light / strict checkpoint 与 resume
-│     │  ├─ log.py            # MOKIO_LOG_LEVEL / MOKIO_LOG_FILE 日志配置
-│     │  ├─ parallel.py       # 并行工具调用（自动检测依赖）
-│     │  ├─ path_security.py  # 路径白名单/黑名单/敏感文件检查
-│     │  ├─ paths.py          # 项目根目录与 workspace 路径
-│     │  ├─ retry.py          # 工具调用指数退避重试
-│     │  ├─ state.py          # RuntimeState 与文件快照
-│     │  ├─ utils.py          # 共享工具函数
-│     │  └─ workspace_detection.py  # 项目根目录自动检测
-│     ├─ graph/
-│     │  ├─ state.py              # Graph state
-│     │  ├─ memory.py             # rules / working memory / history summary-store
-│     │  ├─ memory_retrieval.py   # 记忆检索
-│     │  ├─ nodes.py              # planner / context monitor / compressor / verifier / final
-│     │  ├─ workflow.py           # StateGraph 组装与路由
+│     ├─ interaction/           # 交互层：Rich CLI + Textual TUI
+│     │  ├─ app.py              # Typer CLI 入口与 tui 子命令
+│     │  ├─ formatter.py        # Rich 事件时间线展示
+│     │  ├─ event_summary.py    # Rich CLI / Textual TUI 共用事件摘要
+│     │  └─ tui/                # Textual 本地交互层
+│     │     ├─ app.py           # MokioClawTuiApp 主界面
+│     │     ├─ approval.py      # TUI 审批门
+│     │     └─ logo.py          # Logo 渲染
+│     ├─ orchestration/         # 编排层：LangGraph workflow 入口
+│     │  ├─ agent.py            # create_runtime / stream_agent_events / stream_session_events
+│     │  ├─ workflow.py         # StateGraph 组装与路由
+│     │  ├─ nodes.py            # planner / context monitor / compressor / verifier / final
+│     │  └─ agent_loop.py       # agent loop 执行
+│     ├─ agents/                # Agent 层
+│     │  ├─ code_agent.py       # codeAgent：文件和命令执行专家
+│     │  └─ search_agent.py     # searchAgent：Tavily 研究专家
+│     ├─ tools/                 # 工具层
+│     │  ├─ registry.py         # 工具注册
+│     │  ├─ todo_tool.py        # TodoWrite / TodoUpdate / TODO.md 持久化
+│     │  ├─ notepad_tool.py     # NOTEPAD.md 长期工作笔记
+│     │  ├─ web_search_tool.py  # Tavily WebSearchTool
+│     │  ├─ file_tools.py       # Read / Write / Edit
+│     │  ├─ glob_tool.py        # 文件名通配符搜索
+│     │  ├─ grep_tool.py        # 内容搜索
+│     │  └─ bash_tool.py        # 命令执行
+│     ├─ memory/                # 记忆层
+│     │  ├─ memory.py           # rules / working memory / history summary-store
+│     │  ├─ retrieval.py        # 记忆检索
 │     │  ├─ tiered_compression.py # 四级分级压缩策略
-│     │  ├─ dual_threshold_compression.py
-│     │  └─ tool_disclosure.py    # 工具披露控制
-│     ├─ providers/
+│     │  ├─ dual_threshold_compression.py # 双阈值增量压缩
+│     │  └─ tool_disclosure.py  # 工具渐进式披露
+│     ├─ state/                 # 状态层
+│     │  ├─ runtime.py          # RuntimeState 与文件快照
+│     │  └─ graph.py            # Graph state schema
+│     ├─ reliability/           # 保障层
+│     │  ├─ checkpoint.py       # light / strict checkpoint 与 resume
+│     │  ├─ trace.py            # 执行链路追踪
+│     │  ├─ session.py          # 多轮对话 session 管理
+│     │  ├─ retry.py            # 工具调用指数退避重试
+│     │  └─ parallel.py         # 并行工具调用
+│     ├─ security/              # 安全层
+│     │  ├─ approval.py         # 审批请求/决策 + 风险命令匹配
+│     │  └─ path_security.py    # 路径白名单/黑名单/敏感文件检查
+│     ├─ providers/             # 提供者层
 │     │  └─ openai_provider.py  # 从 .env 创建 ChatOpenAI
-│     ├─ prompts/
-│     │  ├─ agent_prompt.py           # 节点与子 Agent prompt
+│     ├─ prompts/               # Prompt 模板层
+│     │  ├─ agent_prompt.py     # 节点与子 Agent prompt
 │     │  └─ context_manager_prompt.py # 上下文压缩 prompt
-│     └─ tools/
-│        ├─ registry.py         # 工具注册
-│        ├─ todo_tool.py        # TodoWrite / TodoUpdate / TODO.md 持久化
-│        ├─ notepad_tool.py     # NOTEPAD.md 长期工作笔记
-│        ├─ web_search_tool.py  # Tavily WebSearchTool
-│        ├─ file_tools.py       # Read / Write / Edit
-│        ├─ glob_tool.py        # 文件名通配符搜索
-│        ├─ grep_tool.py        # 内容搜索
-│        └─ bash_tool.py        # 命令执行
+│     └─ core/                  # 基础设施
+│        ├─ log.py              # MOKIO_LOG_LEVEL / MOKIO_LOG_FILE 日志配置
+│        ├─ paths.py            # 项目根目录与 workspace 路径
+│        ├─ utils.py            # 共享工具函数
+│        └─ workspace_detection.py # 项目根目录自动检测
 └─ tests/
    ├─ test_tools.py
    ├─ test_graph.py
@@ -383,6 +396,36 @@ MOKIO_MAX_RETRIES=3
 ```bash
 uv sync
 ```
+
+### 用户自定义配置
+
+MokioClaw 支持两级用户配置，采用 **YAML frontmatter + markdown body** 格式（参考 Claude Code 的 memory 文件模式）：
+
+**全局配置** `~/.mokioclaw/CLAUDE.md` — 所有项目共享
+
+**项目配置** `.mokioclaw/config.md` — 当前项目专属（从 workspace 向上查找）
+
+配置示例：
+
+```markdown
+---
+approval_mode: inline
+max_attempts: 5
+bash_timeout: 300
+---
+
+# Custom Instructions
+
+以下指令会注入到所有 agent 的 system prompt 中：
+
+- Always add type hints to Python code
+- Use async/await for I/O operations
+- Write tests for every new function
+```
+
+合并规则：项目配置覆盖全局配置的相同字段，markdown body 追加到 agent prompt 末尾。
+
+详细说明见 [`.mokioclaw/config.md.example`](.mokioclaw/config.md.example)。
 
 运行测试：
 

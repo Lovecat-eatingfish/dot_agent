@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from mokioclaw.cli.formatter import (
+from mokioclaw.interaction.formatter import (
     render_checkpoint_resumed,
     render_checkpoint_saved,
     render_context_compression,
@@ -125,7 +125,7 @@ def test_render_session_event(capsys) -> None:
 
 
 def test_print_custom_event_handles_session_saved(capsys) -> None:
-    from mokioclaw.cli.formatter import print_custom_event
+    from mokioclaw.interaction.formatter import print_custom_event
 
     print_custom_event(
         {
@@ -162,7 +162,7 @@ def test_render_context_compression(capsys) -> None:
 
 
 def test_tool_result_formats_notepad_content(capsys) -> None:
-    from mokioclaw.cli.formatter import print_custom_event
+    from mokioclaw.interaction.formatter import print_custom_event
 
     print_custom_event(
         {
@@ -203,7 +203,7 @@ def test_render_memory_snapshot(capsys) -> None:
 
 
 def test_print_custom_event_handles_memory_snapshot(capsys) -> None:
-    from mokioclaw.cli.formatter import print_custom_event
+    from mokioclaw.interaction.formatter import print_custom_event
 
     print_custom_event(
         {
@@ -263,7 +263,7 @@ def test_render_checkpoint_resumed(capsys) -> None:
 
 
 def test_print_custom_event_handles_checkpoint_saved(capsys) -> None:
-    from mokioclaw.cli.formatter import print_custom_event
+    from mokioclaw.interaction.formatter import print_custom_event
 
     print_custom_event(
         {
@@ -302,7 +302,7 @@ def test_render_trace_summary(capsys) -> None:
 
 
 def test_print_custom_event_handles_trace_summary(capsys) -> None:
-    from mokioclaw.cli.formatter import print_custom_event
+    from mokioclaw.interaction.formatter import print_custom_event
 
     print_custom_event(
         {

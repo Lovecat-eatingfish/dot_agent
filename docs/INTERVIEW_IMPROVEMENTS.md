@@ -9,7 +9,7 @@
 **面试官问题**：短期记忆在工程上就是上下文窗口里当前正在用的那坨东西。具体实现？
 
 **我们的实现**：
-- ✅ **三层记忆架构**（`src/mokioclaw/graph/memory.py`）
+- ✅ **三层记忆架构**（`src/mokioclaw/memory/memory.py`）
   - 规则层（Rules）：持久化工作规则
   - 工作记忆层（Working Memory）：当前任务关键信息
   - 历史摘要层（History Summary）：过往对话压缩总结
@@ -33,7 +33,7 @@ MAX_TEXT_CHARS = {
 **面试官问题**：对话的叠加逻辑是什么？
 
 **我们的实现**：
-- ✅ **Token 监控**（`src/mokioclaw/graph/nodes.py:context_monitor_node`）
+- ✅ **Token 监控**（`src/mokioclaw/orchestration/nodes.py:context_monitor_node`）
   - 估算当前消息列表的 token 数量
   - 支持 CJK 字符的特殊估算（CJK ~1.5 tokens/字符，ASCII ~0.25 tokens/字符）
 
@@ -59,7 +59,7 @@ def estimate_context_tokens(state) -> int:
 **我们的实现**：
 - ✅ **三层记忆架构**（同上 Q1）
 
-- ✅ **分级压缩策略**（`src/mokioclaw/graph/tiered_compression.py`）
+- ✅ **分级压缩策略**（`src/mokioclaw/memory/tiered_compression.py`）
   ```python
   KEEP_ALWAYS = 100      # 永远保留
   COMPRESS_LIGHTLY = 50  # 轻度压缩
@@ -72,7 +72,7 @@ def estimate_context_tokens(state) -> int:
 **面试官问题**：触发条件的具体数值策略？
 
 **我们的实现**：
-- ✅ **双阈值策略**（`src/mokioclaw/graph/dual_threshold_compression.py`）
+- ✅ **双阈值策略**（`src/mokioclaw/memory/dual_threshold_compression.py`）
   - **软阈值（70%）**：异步预生成摘要，不阻塞
   - **硬阈值（90%）**：同步强制压缩
   - **步数触发（>5步）**：工具调用过多强制总结
@@ -102,7 +102,7 @@ def check_compression_needed(current_tokens, step_count):
 **面试官问题**：是增量还是全量？
 
 **我们的实现**：
-- ✅ **增量式摘要更新**（`src/mokioclaw/graph/dual_threshold_compression.py`）
+- ✅ **增量式摘要更新**（`src/mokioclaw/memory/dual_threshold_compression.py`）
   - **增量叠加**：第10轮有 S_1-10，第11轮直接拼 S_1-10 + D_11
   - **复杂度 O(n)** vs 全量重算 O(n²)
   - **节省时间**：10 倍以上
@@ -125,7 +125,7 @@ def _incremental_compress(self, messages, context_summary):
 **面试官问题**：原始数据存不存？
 
 **我们的实现**：
-- ✅ **完整历史持久化**（`src/mokioclaw/graph/nodes.py`）
+- ✅ **完整历史持久化**（`src/mokioclaw/orchestration/nodes.py`）
   - 持久化到 `RAW_HISTORY.md`，不发送给模型
   - **用途**：
     - 审计溯源：回放模型当时的上下文
@@ -151,7 +151,7 @@ def _persist_raw_history(runtime, messages):
 **面试官问题**：具体在什么情况下需要检索？
 
 **我们的实现**：
-- ✅ **基于意图的检索触发器**（`src/mokioclaw/graph/memory_retrieval.py`）
+- ✅ **基于意图的检索触发器**（`src/mokioclaw/memory/memory_retrieval.py`）
   - **高依赖意图**：追问、继续、引用、对比、调试 → 检索
   - **低依赖意图**：新任务、简单查询、问候 → 不检索
   - **冷却机制**：60 秒内不重复检索
@@ -178,7 +178,7 @@ class IntentBasedRetrievalTrigger:
 **面试官问题**：关键数据：50 工具 × 400 = 20000 token，如何优化？
 
 **我们的实现**：
-- ✅ **渐进式披露机制**（`src/mokioclaw/graph/tool_disclosure.py`）
+- ✅ **渐进式披露机制**（`src/mokioclaw/memory/tool_disclosure.py`）
   - **第一轮**：精简列表（~20 token/工具）
   - **第二轮**：根据意图加载 3-5 个完整 Schema
 
@@ -203,17 +203,17 @@ class ProgressiveToolDisclosure:
 
 ## 🎯 新增文件
 
-1. **`src/mokioclaw/graph/dual_threshold_compression.py`**
+1. **`src/mokioclaw/memory/dual_threshold_compression.py`**
    - 双阈值压缩策略
    - 增量摘要更新
    - 步数触发机制
 
-2. **`src/mokioclaw/graph/memory_retrieval.py`**
+2. **`src/mokioclaw/memory/memory_retrieval.py`**
    - 长期记忆检索
    - 基于意图的检索触发器
    - 冷却机制
 
-3. **`src/mokioclaw/graph/tool_disclosure.py`**
+3. **`src/mokioclaw/memory/tool_disclosure.py`**
    - 工具渐进式披露
    - 意图匹配算法
    - Token 估算
@@ -249,22 +249,22 @@ class ProgressiveToolDisclosure:
 
 ### 核心文件
 
-1. **`src/mokioclaw/graph/nodes.py`**
+1. **`src/mokioclaw/orchestration/nodes.py`**
    - 集成双阈值压缩器
    - 添加 `context_compression_strategy` 状态字段
    - 添加 `_persist_raw_history()` 函数
    - 添加 `_count_tool_calls()` 步数统计
 
-2. **`src/mokioclaw/graph/dual_threshold_compression.py`** ✨ 新增
+2. **`src/mokioclaw/memory/dual_threshold_compression.py`** ✨ 新增
    - `CompressionThresholds`：阈值配置
    - `SummaryChain`：摘要链维护
    - `DualThresholdCompressor`：双阈值压缩器
 
-3. **`src/mokioclaw/graph/memory_retrieval.py`** ✨ 新增
+3. **`src/mokioclaw/memory/memory_retrieval.py`** ✨ 新增
    - `SimpleMemoryRetriever`：简化版记忆检索
    - `IntentBasedRetrievalTrigger`：意图触发器
 
-4. **`src/mokioclaw/graph/tool_disclosure.py`** ✨ 新增
+4. **`src/mokioclaw/memory/tool_disclosure.py`** ✨ 新增
    - `ToolRegistry`：工具注册表
    - `ProgressiveToolDisclosure`：渐进式披露器
 

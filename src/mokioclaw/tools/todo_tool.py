@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from mokioclaw.core.state import RuntimeState
+from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.core.utils import TodoPersistResult, TodoUpdateResult, TodoWriteResult
 
 VALID_TODO_STATUSES = {"pending", "in_progress", "completed", "blocked"}

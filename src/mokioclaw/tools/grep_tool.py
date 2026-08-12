@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-from mokioclaw.core.state import RuntimeState
+from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.tools.file_tools import display_path, read_text_lossy, resolve_workspace_path
 
 SKIP_DIRS = {".git", ".mokioclaw", ".venv", "__pycache__", ".pytest_cache", "node_modules", ".idea", ".workbuddy"}

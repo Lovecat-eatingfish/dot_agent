@@ -33,13 +33,14 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.tools import StructuredTool
 
 from mokioclaw.core.log import get_logger
-from mokioclaw.core.state import RuntimeState
-from mokioclaw.core.utils import Writer, last_ai_content, sanitize_user_input, tool_result_event as build_tool_result_event
+from mokioclaw.state.runtime import RuntimeState
+from mokioclaw.core.utils import Writer, execute_tool_calls, last_ai_content, sanitize_user_input, tool_result_event as build_tool_result_event
 
 logger = get_logger(__name__)
-from mokioclaw.graph.memory import build_layered_memory, format_layered_memory_for_prompt, memory_event
-from mokioclaw.graph.state import MokioGraphState
+from mokioclaw.memory.memory import build_layered_memory, format_layered_memory_for_prompt, memory_event
+from mokioclaw.state.graph import MokioGraphState
 from mokioclaw.prompts.agent_prompt import CODE_AGENT_PROMPT
+from mokioclaw.prompts.builder import get_prompt_builder
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools import build_tools
 from mokioclaw.tools.todo_tool import persist_todos, update_todo
@@ -70,6 +71,7 @@ def run_code_agent(
     # 转字典列表
     todos = [dict(todo) for todo in state.get("todos", [])]
     writer = writer or (lambda _: None)
+    builder = get_prompt_builder(workspace=runtime.workspace)
     # 构建三层记忆： 规则层  工作记忆 历史摘要
     memory = build_layered_memory({**state, "todos": todos}, node="codeAgent")
     writer(memory_event(memory, node="codeAgent"))
@@ -89,11 +91,14 @@ def run_code_agent(
     )
 
     messages = [
-        SystemMessage(content=CODE_AGENT_PROMPT),
+        SystemMessage(content=builder.build("code_agent")),
         HumanMessage(content=_code_agent_input(state, instruction, memory)),
     ]
     produced_messages: list[Any] = []
     tool_events: list[dict[str, Any]] = []
+
+    def _exec(call: dict[str, Any]) -> tuple[ToolMessage, list[dict[str, str]]]:
+        return execute_code_agent_tool(runtime, _todos_ref["todos"], call)
 
     for _ in range(max_loops):
         response = code_agent.invoke(messages)
@@ -102,17 +107,16 @@ def run_code_agent(
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
             break
-        for call in tool_calls:
-            writer(
-                {
-                    "type": "tool_call",
-                    "node": "codeAgent",
-                    "name": call.get("name"),
-                    "args": call.get("args", {}),
-                }
-            )
-            tool_result, todos = execute_code_agent_tool(runtime, todos, call)
-            # 同步更新 mutable container，让 TodoUpdateTool lambda 始终指向最新 todos
+
+        # TodoUpdateTool 会原地修改 todos 列表，必须串行执行以避免竞态
+        has_todo_update = any(c.get("name") == "TodoUpdateTool" for c in tool_calls)
+        if has_todo_update or len(tool_calls) == 1:
+            results = [_exec(call) for call in tool_calls]
+        else:
+            results = execute_tool_calls(tool_calls, _exec, max_workers=4, writer=writer, node="codeAgent")
+
+        for call, (tool_result, new_todos) in zip(tool_calls, results):
+            todos = new_todos
             _todos_ref["todos"] = todos
             event = build_tool_result_event(tool_result, node="codeAgent")
             tool_events.append(event)

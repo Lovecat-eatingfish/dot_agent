@@ -28,8 +28,9 @@ from mokioclaw.core.log import get_logger
 from mokioclaw.core.utils import Writer, dedupe_sources, last_ai_content, parse_json_content, tool_result_event
 
 logger = get_logger(__name__)
-from mokioclaw.graph.state import MokioGraphState
+from mokioclaw.state.graph import MokioGraphState
 from mokioclaw.prompts.agent_prompt import SEARCH_AGENT_PROMPT
+from mokioclaw.prompts.builder import get_prompt_builder
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.tools.web_search_tool import build_web_search_tool
 
@@ -57,11 +58,14 @@ def run_search_agent(
         - queries: 执行的搜索查询
     """
     writer = writer or (lambda _: None)
+    runtime = state.get("runtime")
+    workspace = getattr(runtime, "workspace", None) if runtime else None
+    builder = get_prompt_builder(workspace=workspace)
     model = create_model()
     search_tool = build_web_search_tool()
     search_agent = model.bind_tools([search_tool])
     messages = [
-        SystemMessage(content=SEARCH_AGENT_PROMPT),
+        SystemMessage(content=builder.build("search_agent")),
         HumanMessage(
             content=(
                 f"Task: {state['task']}\n\n"

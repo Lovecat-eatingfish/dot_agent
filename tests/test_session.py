@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from mokioclaw.core.session import (
+from mokioclaw.reliability.session import (
     SESSION_SUMMARY_FILE,
     append_assistant_turn,
     append_user_turn,

@@ -15,6 +15,7 @@
 - coerce_bool: 字符串/布尔值转换
 - tool_result_event: 构建工具结果事件
 - execute_tool_by_name: 按名称执行工具
+- execute_tool_calls: 批量执行工具调用（独立调用并行，依赖调用串行）
 """
 from __future__ import annotations
 
@@ -423,6 +424,64 @@ def execute_tool_by_name(
         name=name,
         tool_call_id=call.get("id") or f"{name}-call",
     )
+
+
+def execute_tool_calls(
+    tool_calls: list[dict[str, Any]],
+    executor: Callable[[dict[str, Any]], Any],
+    *,
+    max_workers: int = 4,
+    writer: Writer | None = None,
+    node: str = "",
+) -> list[Any]:
+    """批量执行工具调用，独立调用并行，依赖调用串行
+
+    使用策略：
+    1. 单条调用 → 直接串行
+    2. 多条调用且互相独立 → 并行执行（ThreadPoolExecutor）
+    3. 多条调用但有依赖 → 串行执行
+
+    独立性判断依据（由 are_tools_independent 实现）：
+    - 写操作（FileWriteTool, FileEditTool）之间目标文件不冲突
+    - 读操作（FileReadTool）之间目标文件不冲突
+    - 写操作和读操作目标文件不重叠
+    - 注意：TodoUpdateTool 等状态修改类调用被视为有副作用的，
+      如需并行，调用方应在 executor 中自行保证线程安全
+
+    Args:
+        tool_calls: 工具调用列表
+        executor: 执行单个工具调用的函数，接收 call dict，返回任意结果
+        max_workers: 并行执行时的最大线程数
+        writer: 事件写入器（并行模式下仅写入开始/结束事件）
+        node: 节点名称（用于事件标记）
+
+    Returns:
+        结果列表（顺序与输入一致）
+    """
+    if not tool_calls:
+        return []
+
+    if len(tool_calls) == 1:
+        return [executor(tool_calls[0])]
+
+    # 尝试并行执行
+    from mokioclaw.reliability.parallel import are_tools_independent, execute_tools_in_parallel
+
+    if are_tools_independent(tool_calls):
+        if writer and node:
+            writer({"type": "tool_batch_start", "node": node, "count": len(tool_calls), "mode": "parallel"})
+        results = execute_tools_in_parallel(tool_calls, executor, max_workers=max_workers)
+        if writer and node:
+            writer({"type": "tool_batch_end", "node": node, "count": len(tool_calls), "mode": "parallel"})
+        return results
+
+    # 串行执行
+    if writer and node:
+        writer({"type": "tool_batch_start", "node": node, "count": len(tool_calls), "mode": "sequential"})
+    results = [executor(call) for call in tool_calls]
+    if writer and node:
+        writer({"type": "tool_batch_end", "node": node, "count": len(tool_calls), "mode": "sequential"})
+    return results
 
 
 def tool_result_event(tool_message: ToolMessage, *, node: str) -> dict[str, Any]:

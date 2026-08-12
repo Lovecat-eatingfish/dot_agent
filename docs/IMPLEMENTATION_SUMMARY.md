@@ -54,7 +54,7 @@
 
 #### ✅ 分级压缩策略（已完成）
 
-**新增文件**：`src/mokioclaw/graph/tiered_compression.py`
+**新增文件**：`src/mokioclaw/memory/tiered_compression.py`
 
 **四级策略**：
 | 级别 | 优先级 | 处理方式 | 示例 |
@@ -77,7 +77,7 @@
 
 #### ✅ 路径白名单/黑名单（已完成）
 
-**新增文件**：`src/mokioclaw/core/path_security.py`
+**新增文件**：`src/mokioclaw/security/path_security.py`
 
 **默认配置**：
 ```python
@@ -106,7 +106,7 @@ SENSITIVE_PATTERNS = [r".*\.env$", r".*\.pem$", r".*\.key$", r"id_rsa.*", ...]
 
 #### ✅ 工具调用重试机制（已完成）
 
-**新增文件**：`src/mokioclaw/core/retry.py`
+**新增文件**：`src/mokioclaw/reliability/retry.py`
 
 **特性**：
 - 指数退避重试（1s → 2s → 4s → 8s → 10s max）
@@ -131,7 +131,7 @@ result = invoke_tool_with_retry(tool_func, tool_input, max_attempts=3)
 
 #### ✅ 并行工具调用（已完成）
 
-**新增文件**：`src/mokioclaw/core/parallel.py`
+**新增文件**：`src/mokioclaw/reliability/parallel.py`
 
 **特性**：
 - 自动检测工具依赖关系
@@ -180,10 +180,10 @@ results = execute_tools_in_parallel(
 
 ### 核心实现
 
-1. **`src/mokioclaw/graph/tiered_compression.py`** - 分级压缩策略
-2. **`src/mokioclaw/core/path_security.py`** - 路径安全控制
-3. **`src/mokioclaw/core/retry.py`** - 工具调用重试
-4. **`src/mokioclaw/core/parallel.py`** - 并行工具调用
+1. **`src/mokioclaw/memory/tiered_compression.py`** - 分级压缩策略
+2. **`src/mokioclaw/security/path_security.py`** - 路径安全控制
+3. **`src/mokioclaw/reliability/retry.py`** - 工具调用重试
+4. **`src/mokioclaw/reliability/parallel.py`** - 并行工具调用
 
 ### 文档
 
@@ -200,8 +200,8 @@ results = execute_tools_in_parallel(
 |------|----------|----------|
 | `src/mokioclaw/tools/bash_tool.py` | 重写 description，添加 `_validate_bash_args()` | 低（向后兼容） |
 | `src/mokioclaw/tools/file_tools.py` | 添加 `_validate_write_args()` / `_validate_edit_args()` | 低（向后兼容） |
-| `src/mokioclaw/graph/nodes.py` | 集成分级压缩到 `context_compressor_node()` | 中（增强功能） |
-| `src/mokioclaw/core/state.py` | `assert_workspace_path()` 使用新安全模块 | 低（增强检查） |
+| `src/mokioclaw/orchestration/nodes.py` | 集成分级压缩到 `context_compressor_node()` | 中（增强功能） |
+| `src/mokioclaw/state/runtime.py` | `assert_workspace_path()` 使用新安全模块 | 低（增强检查） |
 | `src/mokioclaw/core/utils.py` | 添加缺失的 `import re` | 无（bug fix） |
 
 ---

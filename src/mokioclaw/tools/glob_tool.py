@@ -16,7 +16,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from mokioclaw.core.state import RuntimeState
+from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.tools.file_tools import display_path, resolve_workspace_path
 
 # 递归搜索时跳过的目录（与 GrepTool 保持一致）

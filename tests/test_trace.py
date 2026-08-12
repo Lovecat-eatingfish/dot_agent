@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from mokioclaw.core.state import RuntimeState
-from mokioclaw.core.trace import TraceRecorder
+from mokioclaw.state.runtime import RuntimeState
+from mokioclaw.reliability.trace import TraceRecorder
 
 
 def test_trace_recorder_writes_events_summary_and_timeline(tmp_path: Path) -> None:

@@ -80,7 +80,7 @@ def _validate_bash_args(command: str, timeout_seconds: int | None = None) -> lis
 
 #### 分级压缩策略
 
-**位置**：`src/mokioclaw/graph/tiered_compression.py`
+**位置**：`src/mokioclaw/memory/tiered_compression.py`
 
 **四级策略**：
 ```python
@@ -93,7 +93,7 @@ DROP_PRIORITY = 0              # 直接删除
 
 **使用示例**：
 ```python
-from mokioclaw.graph.tiered_compression import compress_messages_by_tier
+from mokioclaw.memory.tiered_compression import compress_messages_by_tier
 
 compressed = compress_messages_by_tier(
     messages,
@@ -110,7 +110,7 @@ compressed = compress_messages_by_tier(
 
 **预估压缩效果**：
 ```python
-from mokioclaw.graph.tiered_compression import estimate_tokens_for_tiered_compression
+from mokioclaw.memory.tiered_compression import estimate_tokens_for_tiered_compression
 
 stats = estimate_tokens_for_tiered_compression(messages)
 # {
@@ -127,7 +127,7 @@ stats = estimate_tokens_for_tiered_compression(messages)
 
 #### 路径白名单/黑名单
 
-**位置**：`src/mokioclaw/core/path_security.py`
+**位置**：`src/mokioclaw/security/path_security.py`
 
 **默认配置**：
 ```python
@@ -143,7 +143,7 @@ SENSITIVE_PATTERNS = [r".*\.env$", r".*\.pem$", r".*\.key$", r"id_rsa.*", ...]
 
 **使用示例**：
 ```python
-from mokioclaw.core.path_security import validate_path_access, PathAccessDeniedError
+from mokioclaw.security.path_security import validate_path_access, PathAccessDeniedError
 
 try:
     safe_path = validate_path_access(state, path, operation="write")
@@ -161,11 +161,11 @@ except PathAccessDeniedError as exc:
 
 #### 工具调用重试
 
-**位置**：`src/mokioclaw/core/retry.py`
+**位置**：`src/mokioclaw/reliability/retry.py`
 
 **装饰器用法**：
 ```python
-from mokioclaw.core.retry import retry_on_failure, RetryableError
+from mokioclaw.reliability.retry import retry_on_failure, RetryableError
 
 @retry_on_failure(
     max_attempts=3,
@@ -189,7 +189,7 @@ RETRYABLE_ERRORS = [
 
 **函数式重试**：
 ```python
-from mokioclaw.core.retry import invoke_tool_with_retry
+from mokioclaw.reliability.retry import invoke_tool_with_retry
 
 result = invoke_tool_with_retry(
     tool_func=my_tool,
@@ -210,11 +210,11 @@ result = invoke_tool_with_retry(
 
 #### 并行工具调用
 
-**位置**：`src/mokioclaw/core/parallel.py`
+**位置**：`src/mokioclaw/reliability/parallel.py`
 
 **自动检测**：
 ```python
-from mokioclaw.core.parallel import are_tools_independent
+from mokioclaw.reliability.parallel import are_tools_independent
 
 # 可以并行的情况：
 # - 多个 FileReadTool（读不同文件）
@@ -229,7 +229,7 @@ from mokioclaw.core.parallel import are_tools_independent
 
 **使用示例**：
 ```python
-from mokioclaw.core.parallel import execute_tools_in_parallel
+from mokioclaw.reliability.parallel import execute_tools_in_parallel
 
 results = execute_tools_in_parallel(
     tool_calls=[
@@ -244,7 +244,7 @@ results = execute_tools_in_parallel(
 
 **异步版本**：
 ```python
-from mokioclaw.core.parallel import execute_tools_in_parallel_async
+from mokioclaw.reliability.parallel import execute_tools_in_parallel_async
 
 results = await execute_tools_in_parallel_async(
     tool_calls,
@@ -259,10 +259,10 @@ results = await execute_tools_in_parallel_async(
 
 | 模块 | 路径 | 用途 |
 |------|------|------|
-| `tiered_compression` | `src/mokioclaw/graph/tiered_compression.py` | 分级压缩策略 |
-| `path_security` | `src/mokioclaw/core/path_security.py` | 路径安全控制 |
-| `retry` | `src/mokioclaw/core/retry.py` | 工具调用重试 |
-| `parallel` | `src/mokioclaw/core/parallel.py` | 并行工具调用 |
+| `tiered_compression` | `src/mokioclaw/memory/tiered_compression.py` | 分级压缩策略 |
+| `path_security` | `src/mokioclaw/security/path_security.py` | 路径安全控制 |
+| `retry` | `src/mokioclaw/reliability/retry.py` | 工具调用重试 |
+| `parallel` | `src/mokioclaw/reliability/parallel.py` | 并行工具调用 |
 
 ---
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from mokioclaw.core.state import RuntimeState
+from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.core.utils import NotepadAppendResult, NotepadReadResult
 from mokioclaw.tools.file_tools import read_text_lossy
 

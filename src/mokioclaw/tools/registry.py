@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from langchain_core.tools import StructuredTool
 
-from mokioclaw.core.state import RuntimeState
+from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.tools.bash_tool import bash_tool_description, run_bash, run_bash_read_only
 from mokioclaw.tools.file_tools import edit_file, read_file, write_file
 from mokioclaw.tools.glob_tool import glob_search

@@ -44,7 +44,7 @@ CLI 入口在 `pyproject.toml` 里注册：
 
 ```toml
 [project.scripts]
-mokioclaw = "mokioclaw.cli.app:app"
+mokioclaw = "mokioclaw.interaction.app:app"
 ```
 
 安装后可以直接 `mokioclaw "你的任务"` 跑起来。

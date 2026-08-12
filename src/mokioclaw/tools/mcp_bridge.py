@@ -1,79 +1,22 @@
 """
-MCP 适配层（接口预留）
+MCP (Model Context Protocol) 桥接层（已实现）
 
-MCP (Model Context Protocol) 是 Anthropic 提出的标准协议，
-用于 AI 模型与外部工具/数据源之间的通信。
+已实现功能：
+- stdio 传输：通过 subprocess 与外部 MCP Server 进程通信
+- JSON-RPC 2.0：完整的请求/响应/通知消息格式
+- 工具发现：tools/list 自动获取 Server 可用工具
+- 工具调用：tools/call 经沙箱验证后执行
+- 沙箱安全：文件路径白名单/黑名单、命令白名单、网络控制、超时限制
+- LangChain 集成：MCP 工具自动转换为 StructuredTool
 
-当前状态：接口预留，未实现具体连接。
-未来可以通过此模块接入支持 MCP 的外部服务。
+使用方式：
+    from mokioclaw.mcp.bridge import get_mcp_bridge
+    bridge = get_mcp_bridge()
+    bridge.register_server("fs", command="node", args=["./server/index.js"])
+    tools = bridge.to_langchain_tools()
 """
 from __future__ import annotations
 
-from pathlib import Path
-from typing import Any
+from mokioclaw.mcp.bridge import MCPBridge, get_mcp_bridge, reset_mcp_bridge
 
-from langchain_core.tools import StructuredTool
-
-
-class MCPBridge:
-    """MCP 服务桥接器（接口预留）
-
-    未来实现：
-    - stdio 传输：连接本地 MCP server 进程
-    - SSE 传输：连接远程 MCP server
-    - 自动工具发现：list_tools() → StructuredTool 转换
-    """
-
-    def __init__(self) -> None:
-        self._servers: dict[str, dict[str, Any]] = {}
-        self._tools: dict[str, StructuredTool] = {}
-
-    def connect(self, name: str, config: dict[str, Any]) -> None:
-        """连接到 MCP server（预留接口）
-
-        Args:
-            name: server 唯一名称
-            config: 连接配置，如 {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-*"]}
-        """
-        self._servers[name] = config
-
-    def disconnect(self, name: str) -> None:
-        """断开 MCP server 连接"""
-        self._servers.pop(name, None)
-        for tool_name in list(self._tools.keys()):
-            if tool_name.startswith(f"{name}:"):
-                del self._tools[tool_name]
-
-    def list_tools(self, server: str | None = None) -> list[StructuredTool]:
-        """列出已加载的 MCP 工具（预留接口）
-
-        Args:
-            server: server 名称，None 表示所有
-
-        Returns:
-            StructuredTool 列表
-        """
-        if server is not None:
-            prefix = f"{server}:"
-            return [tool for name, tool in self._tools.items() if name.startswith(prefix)]
-        return list(self._tools.values())
-
-    def call_tool(self, tool_name: str, args: dict[str, Any]) -> Any:
-        """调用 MCP 工具（预留接口）"""
-        raise NotImplementedError("MCP tool calling not yet implemented")
-
-    def to_langchain_tools(self, server: str | None = None) -> list[StructuredTool]:
-        """将 MCP 工具转换为 LangChain StructuredTool（预留接口）"""
-        return self.list_tools(server)
-
-
-# 模块级单例
-_default_bridge: MCPBridge | None = None
-
-
-def get_mcp_bridge() -> MCPBridge:
-    """获取默认 MCP 桥接器单例"""
-    global _default_bridge
-    if _default_bridge is None:
-        _default_bridge = MCPBridge()
-    return _default_bridge
+__all__ = ["MCPBridge", "get_mcp_bridge", "reset_mcp_bridge"]

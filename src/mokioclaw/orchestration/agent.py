@@ -24,6 +24,7 @@ from mokioclaw.reliability.session import (
 from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.reliability.trace import TraceRecorder, normalize_trace_mode
 from mokioclaw.orchestration.workflow import build_complex_workflow, build_entry_workflow
+from mokioclaw.prompts.builder import reset_prompt_builder
 
 logger = get_logger(__name__)
 
@@ -106,6 +107,8 @@ def stream_agent_events(
         resume_from=resume_path,
         trace_mode=trace_mode,
     )
+    # 每个新任务重置 PromptBuilder，确保使用当前 workspace 的配置
+    reset_prompt_builder()
     # 先跑入口流程图 build_entry_workflow 做意图识别；
     # 实时推送 graph_event /custom_event；
     # 若意图判定为 chat 直接终止，不执行复杂工作流；
@@ -290,6 +293,8 @@ def _stream_complex_workflow(
         resume_from=resume_path,
         trace_mode=trace_mode,
     )
+    # 每个新任务重置 PromptBuilder，确保使用当前 workspace 的配置
+    reset_prompt_builder()
     workflow = build_complex_workflow()
 
     resumed = False

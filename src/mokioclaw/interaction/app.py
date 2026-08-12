@@ -44,10 +44,11 @@ Agent 的 LLM 调用、工具调用、思考循环、plan‑actor‑verifier 逻
 """
 from __future__ import annotations
 
+import json
 import signal
 import sys
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 import typer
 from rich import box
@@ -58,6 +59,8 @@ from mokioclaw.interaction.formatter import print_event, safe_echo, safe_secho
 from mokioclaw.security.approval import ApprovalDecision, ApprovalRequest
 from mokioclaw.orchestration.agent import stream_agent_events
 from mokioclaw.core.log import get_logger, setup_logging
+from mokioclaw.daemon.manager import DaemonManager
+from mokioclaw.daemon.scheduler import get_scheduler, ScheduledTask, CronScheduler
 
 logger = get_logger(__name__)
 
@@ -335,3 +338,186 @@ def _inline_approval_handler(request: ApprovalRequest) -> ApprovalDecision:
     console.print()
     approved = answer in {"y", "yes"}
     return ApprovalDecision(approved=approved, reason="" if approved else "Rejected by human operator.")
+
+
+# ============================================================
+# Daemon 子命令
+# ============================================================
+
+@app.command("daemon")
+def daemon_status(
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Workspace directory."),
+    ] = None,
+) -> None:
+    """查看后台 daemon 状态"""
+    mgr = DaemonManager(workspace=workspace or Path.cwd())
+    info = mgr.get_info()
+    typer.echo(f"Status: {info.status}")
+    if info.pid:
+        typer.echo(f"PID: {info.pid}")
+    if info.started_at:
+        typer.echo(f"Started: {info.started_at}")
+    if info.uptime_seconds > 0:
+        typer.echo(f"Uptime: {_format_uptime(info.uptime_seconds)}")
+    if info.status == "stopped":
+        typer.echo("Daemon is not running.")
+
+
+@app.command("daemon-start")
+def daemon_start(
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Workspace directory."),
+    ] = None,
+) -> None:
+    """启动后台 daemon"""
+    ws = workspace or Path.cwd()
+    mgr = DaemonManager(workspace=ws)
+    if mgr.is_running():
+        typer.echo(f"Daemon already running (pid {mgr._read_pid()})")
+        raise typer.Exit(0)
+    command = [sys.executable, "-m", "mokioclaw", "serve", "--workspace", str(ws)]
+    try:
+        info = mgr.start(command)
+        typer.echo(f"Daemon started: pid {info.pid}")
+    except RuntimeError as exc:
+        typer.echo(f"Failed: {exc}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command("daemon-stop")
+def daemon_stop(
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Workspace directory."),
+    ] = None,
+) -> None:
+    """停止后台 daemon"""
+    mgr = DaemonManager(workspace=workspace or Path.cwd())
+    if mgr.stop():
+        typer.echo("Daemon stopped.")
+    else:
+        typer.echo("Daemon was not running.")
+
+
+# ============================================================
+# Schedule 子命令
+# ============================================================
+
+@app.command("schedule")
+def schedule_list(
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Workspace directory."),
+    ] = None,
+) -> None:
+    """列出所有定时任务"""
+    ws = workspace or Path.cwd()
+    scheduler = CronScheduler(tasks_dir=ws / ".mokioclaw" / "tasks")
+    tasks = scheduler.tasks
+    if not tasks:
+        typer.echo("No scheduled tasks.")
+        return
+    for task in tasks:
+        typer.echo(f"[{task.id}] {task.name}")
+        typer.echo(f"  Cron: {task.cron}")
+        typer.echo(f"  Cmd:  {task.command} {' '.join(task.args)}")
+        typer.echo(f"  Status: {task.status} | Runs: {task.run_count}")
+
+
+@app.command("schedule-add")
+def schedule_add(
+    name: str,
+    cron: str,
+    command: str,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Workspace directory."),
+    ] = None,
+) -> None:
+    """添加定时任务
+
+    Example: mokioclaw schedule-add "daily-report" "0 9 * * *" "echo hello"
+    """
+    ws = workspace or Path.cwd()
+    scheduler = CronScheduler(tasks_dir=ws / ".mokioclaw" / "tasks")
+    task = ScheduledTask(name=name, cron=cron, command=command)
+    task_id = scheduler.add_task(task)
+    typer.echo(f"Task added: {task_id}")
+
+
+@app.command("schedule-remove")
+def schedule_remove(
+    task_id: str,
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Workspace directory."),
+    ] = None,
+) -> None:
+    """移除定时任务"""
+    ws = workspace or Path.cwd()
+    scheduler = CronScheduler(tasks_dir=ws / ".mokioclaw" / "tasks")
+    if scheduler.remove_task(task_id):
+        typer.echo(f"Task removed: {task_id}")
+    else:
+        typer.echo(f"Task not found: {task_id}")
+
+
+# ============================================================
+# MCP 子命令
+# ============================================================
+
+@app.command("mcp")
+def mcp_list_servers() -> None:
+    """列出已连接的 MCP Server"""
+    from mokioclaw.mcp.bridge import get_mcp_bridge
+    bridge = get_mcp_bridge()
+    servers = bridge.list_servers()
+    if not servers:
+        typer.echo("No MCP servers connected.")
+        return
+    for name in servers:
+        tools = bridge.list_tools(name)
+        typer.echo(f"[{name}] {len(tools)} tools")
+        for tool in tools[:10]:
+            typer.echo(f"  - {tool.name}: {tool.description[:60]}")
+
+
+@app.command("mcp-call")
+def mcp_call_tool(
+    tool_name: str = typer.Argument(help="Tool name in format 'server:tool'"),
+    arg: Annotated[
+        list[str] | None,
+        typer.Option("--arg", "-a", help="Tool argument as key=value"),
+    ] = None,
+) -> None:
+    """调用 MCP 工具
+
+    Example: mokioclaw mcp-call fs:read_file -a path=/tmp/test.txt
+    """
+    from mokioclaw.mcp.bridge import get_mcp_bridge
+    bridge = get_mcp_bridge()
+    arguments: dict[str, Any] = {}
+    if arg:
+        for item in arg:
+            if "=" in item:
+                k, _, v = item.partition("=")
+                arguments[k.strip()] = v.strip()
+    result = bridge.call_tool(tool_name, arguments)
+    typer.echo(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+
+
+# ============================================================
+# 辅助函数
+# ============================================================
+
+def _format_uptime(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m {int(seconds % 60)}s"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"

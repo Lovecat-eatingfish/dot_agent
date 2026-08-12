@@ -200,6 +200,9 @@ def _apply_frontmatter(config: UserConfig, frontmatter: dict[str, Any]) -> None:
     for key, value in frontmatter.items():
         if key in field_map:
             attr = field_map[key]
+            # YAML bool 需要先转为字符串，再按目标类型转换
+            if isinstance(value, bool):
+                value = str(value).lower()
             current = getattr(config, attr)
             if isinstance(current, bool):
                 setattr(config, attr, bool(value))
@@ -233,8 +236,8 @@ def _find_project_config(workspace: Path) -> Path | None:
         candidate = current / _PROJECT_CONFIG_DIR / _PROJECT_CONFIG_NAME
         if candidate.exists():
             return candidate
-        # 遇到 .git 根目录停止
-        if (current / ".git").is_dir():
+        # 遇到 .git 根目录停止（兼容 worktree：.git 可能是文件）
+        if (current / ".git").exists():
             break
         parent = current.parent
         if parent == current:

@@ -398,32 +398,119 @@ def coerce_bool(value: Any, default: bool = False) -> bool:
 def execute_tool_by_name(
     tools: list[Any],
     call: dict[str, Any],
+    hook_runner: Any | None = None,
+    budget: Any | None = None,
+    workspace: Any | None = None,
+    runtime: Any | None = None,
 ) -> ToolMessage:
     """按名称查找并执行工具，返回 ToolMessage
 
     Args:
         tools: 工具列表（需有 .name 属性）
         call: 工具调用字典，包含 name, args, id
+        hook_runner: 可选的 HookRunner，用于在工具执行前后触发 Hook
+        budget: 可选的 ToolResultBudget，用于大输出落盘
+        workspace: 工作区路径（budget 需要）
+        runtime: 可选 RuntimeState（agent_mode 门禁 + file_state_map）
 
     Returns:
         包含执行结果的 ToolMessage
     """
+    from mokioclaw.core.hooks import HookEvent, HookPayload, HookRunner
+    from mokioclaw.core.tool_gate import gate_tool_call
+    from mokioclaw.core.tool_result_budget import ToolResultBudget
+    from mokioclaw.memory.microcompact import update_file_state_map
+
     name = call.get("name", "")
     args = call.get("args") or {}
+    runtime_obj = runtime or call.get("_runtime")
+    tool_call_id = call.get("id") or f"{name}-call"
+    mid = (
+        runtime_obj.next_message_id()
+        if runtime_obj is not None and hasattr(runtime_obj, "next_message_id")
+        else None
+    )
+
+    def _tm(payload: dict[str, Any]) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False, default=str),
+            name=name,
+            tool_call_id=tool_call_id,
+            id=mid,
+        )
+
+    # agent_mode 门禁（在 Hook 之前）
+    blocked = gate_tool_call(runtime_obj, name, args if isinstance(args, dict) else {})
+    if blocked is not None:
+        return _tm(blocked)
+
+    # PreToolUse Hook
+    if hook_runner and isinstance(hook_runner, HookRunner):
+        pre_payload = HookPayload(
+            event=HookEvent.PreToolUse,
+            tool_name=name,
+            tool_args=dict(args),
+        )
+        pre_result = hook_runner.run(HookEvent.PreToolUse, pre_payload)
+        if pre_result.blocked:
+            return _tm({"ok": False, "error": pre_result.feedback or "blocked by hook"})
+        if pre_result.updated_args is not None:
+            args = pre_result.updated_args
+
     tools_map = {tool.name: tool for tool in tools}
     tool = tools_map.get(name)
+    # 同批刚 LoadMcpTool：tools 列表可能尚未刷新，回退到 runtime.loaded_mcp_tools
+    if tool is None and runtime_obj is not None:
+        loaded = getattr(runtime_obj, "loaded_mcp_tools", None) or {}
+        tool = loaded.get(name)
+    error: Exception | None = None
     if tool is None:
         result = {"ok": False, "error": f"unknown tool: {name}"}
     else:
         try:
             result = tool.invoke(args)
         except Exception as exc:
-            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return ToolMessage(
-        content=json.dumps(result, ensure_ascii=False),
-        name=name,
-        tool_call_id=call.get("id") or f"{name}-call",
-    )
+            error = exc
+            result = {"ok": False, "is_error": True, "error": f"{type(exc).__name__}: {exc}"}
+
+    # PostToolUse / PostToolUseFailure Hook
+    if hook_runner and isinstance(hook_runner, HookRunner):
+        post_event = HookEvent.PostToolUseFailure if error else HookEvent.PostToolUse
+        post_payload = HookPayload(
+            event=post_event,
+            tool_name=name,
+            tool_args=args,
+            tool_result=result,
+            error=error,
+        )
+        hook_runner.run(post_event, post_payload)
+
+    # L1 Tool-Result Budget：大输出落盘
+    if budget and isinstance(budget, ToolResultBudget) and workspace and not error:
+        result = budget.apply(result, name, workspace)
+
+    # contextModifier：工具可更新后续 cwd / env
+    if runtime_obj is not None and isinstance(result, dict) and not error:
+        try:
+            from mokioclaw.core.context_modifier import apply_context_modifier
+
+            apply_context_modifier(runtime_obj, result)
+        except Exception:
+            pass
+
+    # 更新 file_state_map：与 ToolMessage.id 使用同一 message_id
+    if runtime_obj is not None and isinstance(result, dict) and not error and mid:
+        try:
+            update_file_state_map(
+                getattr(runtime_obj, "file_state_map", {}),
+                tool_name=name,
+                tool_result=result,
+                message_id=mid,
+            )
+        except Exception:
+            pass
+
+    return _tm(result if isinstance(result, dict) else {"ok": True, "result": result})
 
 
 def execute_tool_calls(

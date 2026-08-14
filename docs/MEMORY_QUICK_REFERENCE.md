@@ -104,6 +104,11 @@ _persist_raw_history(state["runtime"], messages)
 
 ## 长期记忆检索
 
+> ⚠️ 本节示例使用的 `SimpleMemoryRetriever` / `IntentBasedRetrievalTrigger` 是早期面试题设计稿，
+> **已 @deprecated**，运行时无功能路径。实际长期记忆由 `memory/topic_store.py:TopicStore`
+> 管理：`MEMORY.md` 索引常驻 system 动态块（见 `prompts/builder.py:_load_memory_index`），
+> 主题 `*.md` 按需 `FileRead` 读取，无需独立检索器。下面示例仅保留供面试考察点回溯。
+
 ### 触发条件
 
 ```python
@@ -136,6 +141,11 @@ result2 = trigger.retrieve_if_needed("继续任务")  # None (冷却期)
 ```
 
 ## 工具渐进式披露
+
+> ⚠️ 本节 `ProgressiveToolDisclosure` 是早期面试题设计稿，**已 @deprecated**。运行时实际
+> 生效的延迟加载有两处：`tools/tool_search.py`（`apply_tool_search_filter` +
+> `ToolSearchTool` 按需加载 schema）和 `mcp/disclosure.py`（`select_mcp_tools_for_bind` +
+> `LoadMcpTool` 对 MCP 工具延迟加载）。下面示例仅保留供面试考察点回溯。
 
 ### Token 节省对比
 
@@ -221,8 +231,8 @@ DROP = 0                 # 直接删除
 | Q7 | 第11轮 | 增量叠加 | dual_threshold_compression.py |
 | Q8 | 原始上下文 | RAW_HISTORY.md | nodes.py |
 | Q9 | 增量 vs 全量 | O(n) vs O(n²) | dual_threshold_compression.py |
-| Q10 | 检索时机 | 意图触发 | memory_retrieval.py |
-| Q11 | Token 优化 | 渐进式披露 | tool_disclosure.py |
+| Q10 | 检索时机 | 意图触发 | memory/retrieval.py (@deprecated → topic_store.py) |
+| Q11 | Token 优化 | 渐进式披露 | memory/tool_disclosure.py (@deprecated → tools/tool_search.py + mcp/disclosure.py) |
 
 ## 测试覆盖
 

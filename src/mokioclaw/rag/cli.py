@@ -28,7 +28,7 @@ _RAG_LOGFILE = "rag.log"
 
 @rag_app.command("serve")
 def serve(
-    host: Annotated[str, typer.Option("--host", help="监听地址")] = "127.0.0.1",
+    host: Annotated[str, typer.Option("--host", help="监听地址（默认仅本机；公网请配合 RAG_API_TOKEN）")] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", "-p", help="监听端口")] = 8000,
     workspace: Annotated[
         Path | None,
@@ -39,6 +39,16 @@ def serve(
     """启动 RAG FastAPI 服务"""
     setup_logging()
     ws = workspace or Path.cwd()
+
+    # 非 loopback 绑定且无 token 时告警（不强制阻断，避免破坏本地多网卡调试）
+    import os
+    token = os.getenv("RAG_API_TOKEN", "").strip()
+    if host not in {"127.0.0.1", "localhost", "::1"} and not token:
+        typer.echo(
+            "WARNING: binding non-loopback without RAG_API_TOKEN — "
+            "set RAG_API_TOKEN or use --host 127.0.0.1",
+            err=True,
+        )
 
     if foreground:
         _run_server(host, port, ws)

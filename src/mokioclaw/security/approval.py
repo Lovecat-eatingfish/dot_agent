@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import Any
 from uuid import uuid4
 
 
@@ -14,6 +15,8 @@ class ApprovalRequest:
     command: str
     risk_reason: str
     tool_name: str = "BashTool"
+    # 通用工具审批（approve 模式）可携带序列化参数摘要
+    tool_args_preview: str = ""
 
 
 @dataclass(frozen=True)
@@ -54,5 +57,37 @@ def classify_command_risk(command: str) -> str | None:
     return None
 
 
-def make_approval_request(command: str, risk_reason: str) -> ApprovalRequest:
-    return ApprovalRequest(id=f"approval-{uuid4().hex[:8]}", command=command, risk_reason=risk_reason)
+def make_approval_request(
+    command: str,
+    risk_reason: str,
+    *,
+    tool_name: str = "BashTool",
+    tool_args_preview: str = "",
+) -> ApprovalRequest:
+    return ApprovalRequest(
+        id=f"approval-{uuid4().hex[:8]}",
+        command=command,
+        risk_reason=risk_reason,
+        tool_name=tool_name,
+        tool_args_preview=tool_args_preview,
+    )
+
+
+def resolve_approval(
+    handler: Any,
+    request: ApprovalRequest,
+    *,
+    approval_mode: str = "inline",
+) -> ApprovalDecision:
+    """统一解析审批结果"""
+    mode = normalize_approval_mode(approval_mode)
+    if mode == "auto":
+        return ApprovalDecision(approved=True, reason="approval_mode=auto")
+    if mode == "deny":
+        return ApprovalDecision(approved=False, reason="approval_mode=deny")
+    if handler is None:
+        return ApprovalDecision(approved=False, reason="no approval handler")
+    decision = handler(request)
+    if isinstance(decision, ApprovalDecision):
+        return decision
+    return ApprovalDecision(approved=bool(decision), reason="handler")

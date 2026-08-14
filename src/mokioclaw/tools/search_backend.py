@@ -241,7 +241,7 @@ class RagSearchBackend:
         if self._init_error is not None:
             return False
         try:
-            from mokioclaw.rag.embedding import FakeEmbedder, create_embedder
+            from mokioclaw.rag.embedding import create_embedder
             from mokioclaw.rag.backends.local_file import LocalFileBackend
             from mokioclaw.rag.retrieval import HybridRetriever
             from mokioclaw.core.paths import default_rag_dir
@@ -253,8 +253,10 @@ class RagSearchBackend:
                 return False
             try:
                 embedder = create_embedder()
-            except Exception:
-                embedder = FakeEmbedder()
+            except Exception as exc:  # noqa: BLE001
+                # 禁止用 FakeEmbedder 查真实索引（向量空间不一致 → 静默错结果）
+                self._init_error = f"embedder unavailable: {exc}"
+                return False
             backend = LocalFileBackend(embedder=embedder, persist_dir=persist)
             self._retriever = HybridRetriever(backend=backend, embedder=embedder, top_k=5)
             return True

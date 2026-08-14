@@ -12,9 +12,9 @@ from langchain_core.tools import StructuredTool
 
 from mokioclaw.core.log import get_logger
 from mokioclaw.mcp.client import MCPClient, _CALL_TIMEOUT, MCPTool
-from mokioclaw.mcp.protocol import extract_content_parts
+from mokioclaw.mcp.protocol import MCPResource, extract_content_parts
 from mokioclaw.mcp.sandbox import SandboxPolicy, workspace_policy
-from mokioclaw.mcp.transport import MCPTransport
+from mokioclaw.mcp.transport import HttpSSETransport, MCPTransport
 
 logger = get_logger(__name__)
 
@@ -40,20 +40,32 @@ class MCPBridge:
         self,
         name: str,
         *,
-        command: str,
+        command: str | None = None,
         args: list[str] | None = None,
         env: dict[str, str] | None = None,
         cwd: str | None = None,
+        url: str | None = None,
+        headers: dict[str, str] | None = None,
+        transport_type: str | None = None,
         sandbox: SandboxPolicy | None = None,
     ) -> bool:
         """注册并连接 MCP Server
 
+        传输类型（对齐 Claude Code 多传输）：
+        - stdio（默认）: 需提供 command + args，启动子进程
+        - http/SSE: 需提供 url，POST JSON-RPC + SSE 流读响应
+
+        transport_type 显式指定时可覆盖自动推断（"stdio" | "http"）。
+
         Args:
             name: server 唯一名称
-            command: 可执行文件路径
-            args: 命令行参数
-            env: 环境变量
-            cwd: 工作目录
+            command: 可执行文件路径（stdio）
+            args: 命令行参数（stdio）
+            env: 环境变量（stdio）
+            cwd: 工作目录（stdio）
+            url: MCP Server HTTP 端点（http/SSE）
+            headers: HTTP 请求头（http/SSE）
+            transport_type: 显式指定传输类型
             sandbox: 沙箱策略，None 时使用 workspace 默认策略
 
         Returns:
@@ -63,15 +75,33 @@ class MCPBridge:
             if name in self._clients:
                 self.disconnect(name)
 
+            # 推断传输类型：显式 > url 有则 http > 否则 stdio
+            if transport_type is None:
+                transport_type = "http" if url else "stdio"
+            transport_type = transport_type.lower()
+
+            if transport_type in ("http", "sse", "streamable-http"):
+                if not url:
+                    logger.error("MCP server '%s' http transport requires url", name)
+                    return False
+                transport = HttpSSETransport(url=url, headers=headers)
+            elif transport_type == "stdio":
+                if not command:
+                    logger.error("MCP server '%s' stdio transport requires command", name)
+                    return False
+                transport = MCPTransport(command=command, args=args or [], env=env, cwd=cwd)
+            else:
+                logger.error("MCP server '%s' unknown transport_type: %s", name, transport_type)
+                return False
+
             workspace_path = _get_workspace_path(self._workspace)
-            policy = sandbox or workspace_policy(workspace_path) if workspace_path else None
-            transport = MCPTransport(command=command, args=args or [], env=env, cwd=cwd)
+            policy = sandbox or (workspace_policy(workspace_path) if workspace_path else None)
             client = MCPClient(name=name, transport=transport, sandbox_policy=policy)
 
             if client.connect():
                 self._clients[name] = client
                 self._rebuild_tools()
-                logger.info("MCP server '%s' registered and connected", name)
+                logger.info("MCP server '%s' registered and connected (%s)", name, transport_type)
                 return True
             else:
                 logger.error("MCP server '%s' connection failed", name)
@@ -99,25 +129,62 @@ class MCPBridge:
             return list(self._clients.keys())
 
     def list_tools(self, server: str | None = None) -> list[MCPTool]:
-        """列出 MCP 工具"""
+        """列出 MCP 工具
+
+        锁内仅取 client 快照，阻塞 JSON-RPC 在锁外执行（tools/list 超时 60s），
+        避免持锁阻塞其他 bridge 调用。
+        """
         with self._lock:
             if server is not None:
                 client = self._clients.get(server)
-                return client.list_tools() if client else []
-            tools: list[MCPTool] = []
-            for client in self._clients.values():
-                tools.extend(client.list_tools())
-            return tools
+                clients = [client] if client else []
+            else:
+                clients = list(self._clients.values())
+        tools: list[MCPTool] = []
+        for client in clients:
+            tools.extend(client.list_tools())
+        return tools
+
+    def list_resources(self, server: str | None = None) -> list[MCPResource]:
+        """列出 MCP 资源（对齐 Claude Code resources 注入）
+
+        同 list_tools：锁内取快照，锁外做阻塞 I/O。
+        """
+        with self._lock:
+            if server is not None:
+                client = self._clients.get(server)
+                clients = [client] if client else []
+            else:
+                clients = list(self._clients.values())
+        resources: list[MCPResource] = []
+        for client in clients:
+            resources.extend(client.list_resources())
+        return resources
+
+    def read_resource(self, server: str, uri: str) -> dict[str, Any]:
+        """读取单个 MCP 资源"""
+        with self._lock:
+            client = self._clients.get(server)
+        if client is None:
+            return {"ok": False, "error": f"MCP server '{server}' not connected"}
+        return client.read_resource(uri)
 
     def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """调用 MCP 工具
 
-        工具名格式：`server_name:tool_name`
+        工具名格式（对齐 Claude Code）：`mcp__{server}__{tool}`
+        兼容旧格式：`server:tool`
         """
-        if ":" not in tool_name:
-            return {"ok": False, "error": f"Invalid MCP tool name: '{tool_name}'. Expected 'server:tool'."}
+        server_name, actual_name = _parse_mcp_tool_name(tool_name)
+        if not server_name or not actual_name:
+            return {
+                "ok": False,
+                "error": (
+                    f"Invalid MCP tool name: '{tool_name}'. "
+                    "Expected 'mcp__server__tool' (or legacy 'server:tool')."
+                ),
+            }
 
-        server_name, _, actual_name = tool_name.partition(":")
         with self._lock:
             client = self._clients.get(server_name)
 
@@ -138,19 +205,32 @@ class MCPBridge:
         """将 MCP 工具转换为 LangChain StructuredTool"""
         with self._lock:
             if server is not None:
-                return [t for name, t in self._tools.items() if name.split(":")[0] == server]
+                prefix = f"mcp__{server}__"
+                legacy_prefix = f"{server}:"
+                return [
+                    t for name, t in self._tools.items()
+                    if name.startswith(prefix) or name.startswith(legacy_prefix)
+                ]
             return list(self._tools.values())
 
     def to_dict(self) -> dict[str, Any]:
-        """导出配置（用于持久化）"""
+        """导出配置（用于持久化）
+
+        按传输类型导出：stdio 导出 command/args，http 导出 url/headers。
+        """
         with self._lock:
-            return {
-                name: {
-                    "command": client._transport._command,
-                    "args": client._transport._args,
-                }
-                for name, client in self._clients.items()
-            }
+            out: dict[str, Any] = {}
+            for name, client in self._clients.items():
+                transport = client._transport
+                if isinstance(transport, HttpSSETransport):
+                    out[name] = {"type": "http", "url": transport._url}
+                else:
+                    out[name] = {
+                        "type": "stdio",
+                        "command": getattr(transport, "_command", ""),
+                        "args": getattr(transport, "_args", []),
+                    }
+            return out
 
     def _rebuild_tools(self) -> None:
         """根据当前连接的 Server 重建工具映射
@@ -165,7 +245,7 @@ class MCPBridge:
         new_tools: dict[str, StructuredTool] = {}
         for client in clients:
             for mcp_tool in client.list_tools():
-                qualified_name = f"{mcp_tool.server_name}:{mcp_tool.name}"
+                qualified_name = f"mcp__{mcp_tool.server_name}__{mcp_tool.name}"
                 new_tools[qualified_name] = _mcp_tool_to_langchain(mcp_tool, self)
 
         # 更新工具映射（在锁内）
@@ -173,15 +253,48 @@ class MCPBridge:
             self._tools = new_tools
 
 
+def _parse_mcp_tool_name(tool_name: str) -> tuple[str, str]:
+    """解析 mcp__server__tool 或 legacy server:tool"""
+    if tool_name.startswith("mcp__"):
+        rest = tool_name[len("mcp__"):]
+        server_name, sep, actual_name = rest.partition("__")
+        if sep and server_name and actual_name:
+            return server_name, actual_name
+        return "", ""
+    if ":" in tool_name:
+        server_name, _, actual_name = tool_name.partition(":")
+        return server_name, actual_name
+    return "", ""
+
+
 def _mcp_tool_to_langchain(mcp_tool: MCPTool, bridge: "MCPBridge") -> StructuredTool:
     """将 MCPTool 转换为 LangChain StructuredTool"""
-    qualified_name = f"{mcp_tool.server_name}:{mcp_tool.name}"
+    qualified_name = f"mcp__{mcp_tool.server_name}__{mcp_tool.name}"
 
-    def _invoke(**kwargs: Any) -> str:
-        result = bridge.call_tool(qualified_name, kwargs)
-        if result.get("ok"):
-            return str(result.get("content", ""))
-        return f"[MCP Error] {result.get('error', 'unknown')}"
+    def _invoke(**kwargs: Any) -> dict[str, Any]:
+        # catch-and-return：业务异常不抛出，避免崩掉 agent loop
+        try:
+            result = bridge.call_tool(qualified_name, kwargs)
+            if result.get("ok"):
+                return {
+                    "ok": True,
+                    "content": str(result.get("content", "")),
+                    "server": result.get("server"),
+                    "tool": result.get("tool"),
+                }
+            return {
+                "ok": False,
+                "is_error": True,
+                "error": result.get("error", "unknown"),
+                "content": f"[MCP Error] {result.get('error', 'unknown')}",
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "is_error": True,
+                "error": f"{type(exc).__name__}: {exc}",
+                "content": f"[MCP Error] {type(exc).__name__}: {exc}",
+            }
 
     return StructuredTool.from_function(
         name=qualified_name,

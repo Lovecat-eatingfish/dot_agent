@@ -13,8 +13,9 @@ from pathlib import Path
 from typing import Any
 
 from mokioclaw.core.paths import default_rag_dir
-from mokioclaw.rag.backends.local_file import LocalFileBackend
+from mokioclaw.rag.backends.local_file import LocalFileBackend, make_child_id, make_parent_id
 from mokioclaw.rag.embedding import Embedder
+from mokioclaw.rag.security import sanitize_doc_id
 from mokioclaw.rag.splitter import Chunk
 from mokioclaw.rag.types import ChildChunk, ParentChunk
 
@@ -49,13 +50,14 @@ class ChromaStore:
         """
         if not chunks:
             return 0
-        doc_id = chunks[0].doc_id
+        doc_id = sanitize_doc_id(chunks[0].doc_id)
         parents: list[ParentChunk] = []
         children: list[ChildChunk] = []
         for i, c in enumerate(chunks):
-            pid = f"{doc_id}:p{i}"
-            cid = f"{doc_id}:c{i}"
+            pid = make_parent_id(doc_id, i)
+            cid = make_child_id(doc_id, i)
             meta = dict(c.metadata)
+            meta["doc_id"] = doc_id
             parents.append(ParentChunk(
                 parent_id=pid, doc_id=doc_id, content=c.content, metadata=dict(meta),
             ))

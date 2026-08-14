@@ -48,9 +48,11 @@ from rich.pretty import Pretty
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.widgets import Collapsible, Footer, Header, Input, Static
+from textual.widgets import Collapsible, Footer, Header, Input, OptionList, Static
+from textual.widgets.option_list import Option
 
 from mokioclaw.interaction.event_summary import EventSummary, shorten, summarize_event
 from mokioclaw.interaction.tui.approval import ApprovalGate, ApprovalModal
@@ -228,6 +230,27 @@ Agent全部执行完毕
         color: #d7d1c9;
     }
 
+    #input-area {
+        height: auto;
+        max-height: 16;
+        background: #151719;
+    }
+
+    #slash-suggest {
+        display: none;
+        height: auto;
+        max-height: 10;
+        border: round #4a8f86;
+        background: #1a1d1f;
+        color: #d7d1c9;
+        padding: 0 1;
+        margin: 0 0 0 0;
+    }
+
+    #slash-suggest.-open {
+        display: block;
+    }
+
     #input-row {
         height: 3;
         border: round #4a8f86;
@@ -302,9 +325,13 @@ Agent全部执行完毕
     """
 
     BINDINGS = [
-        ("ctrl+c", "cancel_or_quit", "Cancel/Quit"),
-        ("ctrl+l", "clear_events", "Clear"),
-        ("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+c", "cancel_or_quit", "Cancel/Quit"),
+        Binding("ctrl+l", "clear_events", "Clear"),
+        Binding("ctrl+q", "quit", "Quit"),
+        Binding("up", "suggest_up", "Suggest up", show=False),
+        Binding("down", "suggest_down", "Suggest down", show=False),
+        Binding("tab", "accept_suggest", "Complete", show=False),
+        Binding("escape", "dismiss_suggest", "Dismiss", show=False),
     ]
 
     def __init__(
@@ -427,6 +454,8 @@ Agent全部执行完毕
         self.todos: list[dict[str, Any]] = []
         # self._state_lock = Lock()：线程锁！后台线程和 UI 线程都会读写todos等状态，加锁防止并发读写错乱。
         self._state_lock = Lock()
+        self._suggest_open = False
+        self._suggestions: list[str] = []
 
     # 2. compose() → 构建 UI 组件树
     def compose(self) -> ComposeResult:
@@ -455,10 +484,12 @@ Agent全部执行完毕
                 with Vertical(id="sidebar"):
                     yield Static("Session", id="side-title")
                     yield Static("", id="side-state")
-            with Horizontal(id="input-row"):
-                yield Static("❯", id="prompt")
-                yield Input(placeholder="Chat or ask for coding work, then press Enter", id="task-input")
-                yield Static("Enter send · /new session · Ctrl+L clear", id="hint")
+            with Vertical(id="input-area"):
+                yield OptionList(id="slash-suggest")
+                with Horizontal(id="input-row"):
+                    yield Static("❯", id="prompt")
+                    yield Input(placeholder="Chat or ask for coding work, then press Enter", id="task-input")
+                    yield Static("Enter send · / for commands · Ctrl+L clear", id="hint")
         yield Footer()
 
     # 页面挂在调用
@@ -476,6 +507,94 @@ Agent全部执行完毕
         if self.initial_task:
             self.call_after_refresh(self.start_task, self.initial_task, self.resume)
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in {"suggest_up", "suggest_down", "accept_suggest", "dismiss_suggest"}:
+            return self._suggest_open
+        return True
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "task-input":
+            return
+        if self.running:
+            # 任务运行中：关掉残留的候选面板，避免显示过期内容
+            self._close_slash_suggestions()
+            return
+        self._refresh_slash_suggestions(event.value)
+
+    def action_suggest_up(self) -> None:
+        if not self._suggest_open:
+            return
+        panel = self.query_one("#slash-suggest", OptionList)
+        if panel.option_count:
+            panel.action_cursor_up()
+
+    def action_suggest_down(self) -> None:
+        if not self._suggest_open:
+            return
+        panel = self.query_one("#slash-suggest", OptionList)
+        if panel.option_count:
+            panel.action_cursor_down()
+
+    def action_accept_suggest(self) -> None:
+        self._apply_slash_suggestion()
+
+    def action_dismiss_suggest(self) -> None:
+        self._close_slash_suggestions()
+
+    def _refresh_slash_suggestions(self, text: str) -> None:
+        from mokioclaw.interaction.commands import filter_command_suggestions
+
+        stripped = text.lstrip()
+        if not stripped.startswith("/"):
+            self._close_slash_suggestions()
+            return
+        # 已经包含空格（参数区）则不再弹候选，但保留已有面板让用户继续编辑参数
+        body = stripped[1:]
+        if " " in body.strip():
+            self._close_slash_suggestions()
+            return
+        ws = Path(self.latest_workspace) if self.latest_workspace else self.workspace
+        prefix = body
+        suggestions = filter_command_suggestions(prefix, ws, limit=12)
+        if not suggestions:
+            self._close_slash_suggestions()
+            return
+        # 输入完全命中唯一命令时无需再弹候选
+        if len(suggestions) == 1 and suggestions[0].lower() == prefix.lower():
+            self._close_slash_suggestions()
+            return
+        self._suggestions = suggestions
+        panel = self.query_one("#slash-suggest", OptionList)
+        panel.clear_options()
+        panel.add_options([Option(f"/{name}", id=name) for name in suggestions])
+        panel.highlighted = 0
+        panel.add_class("-open")
+        self._suggest_open = True
+
+    def _close_slash_suggestions(self) -> None:
+        self._suggest_open = False
+        self._suggestions = []
+        try:
+            panel = self.query_one("#slash-suggest", OptionList)
+            panel.clear_options()
+            panel.remove_class("-open")
+        except Exception:
+            pass
+
+    def _apply_slash_suggestion(self) -> bool:
+        if not self._suggest_open or not self._suggestions:
+            return False
+        panel = self.query_one("#slash-suggest", OptionList)
+        idx = panel.highlighted
+        if idx is None or idx < 0 or idx >= len(self._suggestions):
+            idx = 0
+        name = self._suggestions[idx]
+        inp = self.query_one("#task-input", Input)
+        inp.value = f"/{name} "
+        inp.cursor_position = len(inp.value)
+        self._close_slash_suggestions()
+        return True
+
     # 用户按 Enter 时触发：
     # 获取输入内容
     # 如果是 /new → 创建新会话
@@ -485,20 +604,66 @@ Agent全部执行完毕
         4. 用户交互回调
         用户输入完按回车触发：
             /new指令：调用start_new_session()创建全新会话，换新工作目录；
+            斜杠命令：系统命令直接处理；skill/自定义命令注入后送入 agent；
             普通文本任务：调用start_task(task, None)启动 agent。
         :param event:
         :return:
         """
         if event.input.id != "task-input":
             return
+        # 补全面板打开时 Enter 只回填，不提交
+        if self._suggest_open and self._apply_slash_suggestion():
+            return
         task = event.value.strip()
         if not task or self.running:
             return
         event.input.value = ""
+        self._close_slash_suggestions()
         if task == "/new":
             self.start_new_session()
             return
+
+        from mokioclaw.interaction.commands import CommandKind, dispatch_slash_command, is_slash_command
+
+        if is_slash_command(task):
+            ws = Path(self.latest_workspace) if self.latest_workspace else self.workspace
+            result = dispatch_slash_command(task, workspace=ws)
+            if result.ui_message:
+                self._append_system_note(result.ui_message)
+            if result.action == "exit":
+                self.exit()
+                return
+            if result.action == "new":
+                self.start_new_session()
+                return
+            if result.action == "clear":
+                self.action_clear_events()
+                return
+            if result.kind == CommandKind.SYSTEM and result.action in {"none", "compact"}:
+                if result.action == "compact":
+                    # force_compact.flag 已由 dispatch 写入；发一个轻量 turn 触发 monitor
+                    self.start_task(
+                        "Compact the current conversation context, then briefly confirm what was preserved.",
+                        None,
+                    )
+                return
+            if result.inject_message and result.handled:
+                self.start_task(result.inject_message, None)
+                return
+            # FALLTHROUGH：当作普通消息
+            task = result.inject_message or task
+
         self.start_task(task, None)
+
+    def _append_system_note(self, text: str) -> None:
+        """在事件流中写入系统提示（斜杠命令反馈）"""
+        try:
+            from textual.widgets import Static
+            scroll = self.query_one("#events", VerticalScroll)
+            scroll.mount(Static(f"[dim]{text}[/dim]", classes="system-note"))
+            scroll.scroll_end(animate=False)
+        except Exception:
+            self.notify(text[:200])
 
     # 收到 Agent 事件时触发：
     # 调用 _handle_event() 处理事件
@@ -961,11 +1126,25 @@ Agent全部执行完毕
                 return stripped
         return ""
 
+    def _end_session_hooks(self) -> None:
+        """触发持久会话的 SessionEnd（/new 或退出 TUI）"""
+        try:
+            from mokioclaw.orchestration.agent import end_persistent_session_hooks
+
+            ws = Path(self.latest_workspace) if self.latest_workspace else self.session_workspace
+            end_persistent_session_hooks(ws)
+        except Exception:
+            pass
+
+    def on_unmount(self) -> None:
+        self._end_session_hooks()
+
     # 开始新会话
     def start_new_session(self) -> None:
         if self.running:
             self.notify("MokioClaw is already running a task.", severity="warning")
             return
+        self._end_session_hooks()
         self.workspace = default_workspace()
         self.session_workspace = self.workspace
         self.resume = None

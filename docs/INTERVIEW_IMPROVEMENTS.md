@@ -178,9 +178,12 @@ class IntentBasedRetrievalTrigger:
 **面试官问题**：关键数据：50 工具 × 400 = 20000 token，如何优化？
 
 **我们的实现**：
-- ✅ **渐进式披露机制**（`src/mokioclaw/memory/tool_disclosure.py`）
+
+- ✅ **渐进式披露机制**（`src/mokioclaw/memory/tool_disclosure.py`，⚠️ @deprecated 设计稿）
   - **第一轮**：精简列表（~20 token/工具）
   - **第二轮**：根据意图加载 3-5 个完整 Schema
+- ✅ **运行时实际生效**：`src/mokioclaw/tools/tool_search.py`（`apply_tool_search_filter` +
+  `ToolSearchTool` 按需加载 schema）+ `src/mokioclaw/mcp/disclosure.py`（MCP 工具延迟加载）
 
 **关键数据**：
 ```python

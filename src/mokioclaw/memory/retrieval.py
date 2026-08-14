@@ -1,7 +1,11 @@
 """
-长期记忆检索模块
+长期记忆检索模块（早期面试题设计稿，已弃用）
 
-实现基于向量相似度的按需检索，支持 RAG 和长期记忆召回。
+@deprecated 运行时无功能路径。长期记忆由 ``memory/topic_store.py`` 的
+``TopicStore`` 实现：MEMORY.md 作为轻量索引注入 system 动态块，主题 *.md 按需
+FileRead 读取，由 ``prompts/builder.py:_load_memory_index`` 装配。本模块仅保留
+供 ``tests/test_memory_interview.py`` 中的面试考察点回归测试使用，新增代码请
+勿引用。
 
 面试官考察点：
 - "长期记忆可以按需检索召回，具体在什么情况下需要检索？"
@@ -48,6 +52,10 @@ class RetrievalResult:
 
 class SimpleMemoryRetriever:
     """简化版记忆检索器
+
+    @deprecated 已被 ``memory/topic_store.py:TopicStore`` 取代。TopicStore 以
+    MEMORY.md 索引 + 主题文件分离模式管理长期记忆，索引注入 system 动态块，
+    正文按需读取，无需独立检索器。本类仅保留供面试考察点测试。
 
     不使用向量数据库，而是基于关键词匹配 + TF-IDF 简化实现
     生产环境可替换为 Milvus / Pinecone / Weaviate
@@ -194,6 +202,10 @@ class SimpleMemoryRetriever:
 
 class IntentBasedRetrievalTrigger:
     """基于意图的检索触发器
+
+    @deprecated 运行时不再使用。意图路由由 ``orchestration/intent.py`` +
+    ``orchestration/nodes.py:intent_router_node`` 实现，长期记忆索引常驻
+    system 动态块，无需独立触发器。本类仅保留供面试考察点测试。
 
     解决面试官问题："长期记忆检索的触发时机取决于当前问题对历史信息的依赖程度"
 

@@ -311,7 +311,8 @@ class TestPromptBuilder:
         builder = PromptBuilder()
         custom = "Custom base prompt"
         result = builder.build("planner", base_prompt=custom)
-        assert result == custom
+        assert result.startswith(custom)
+        assert "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__" in result
 
     def test_singleton_caching(self, monkeypatch: pytest.MonkeyPatch):
         reset_prompt_builder()

@@ -42,8 +42,18 @@ from mokioclaw.state.graph import MokioGraphState
 from mokioclaw.prompts.agent_prompt import CODE_AGENT_PROMPT
 from mokioclaw.prompts.builder import get_prompt_builder
 from mokioclaw.providers.openai_provider import create_model
+from mokioclaw.reliability.token_budget import (
+    BudgetTracker,
+    OutputTokenRecovery,
+    PromptTooLongRecovery,
+    filter_unresolved_tool_uses,
+    is_truncated,
+    model_with_max_tokens,
+    NUDGE_MESSAGE,
+)
 from mokioclaw.tools import build_tools
 from mokioclaw.tools.todo_tool import persist_todos, update_todo
+from mokioclaw.orchestration.agent_loop import _invoke_with_recovery
 
 
 def run_code_agent(
@@ -71,14 +81,18 @@ def run_code_agent(
     # 转字典列表
     todos = [dict(todo) for todo in state.get("todos", [])]
     writer = writer or (lambda _: None)
-    builder = get_prompt_builder(workspace=runtime.workspace)
+    builder = get_prompt_builder(workspace=runtime.workspace, runtime=runtime)
     # 构建三层记忆： 规则层  工作记忆 历史摘要
     memory = build_layered_memory({**state, "todos": todos}, node="codeAgent")
     writer(memory_event(memory, node="codeAgent"))
     model = create_model()
     # 使用 mutable container 避免 lambda 捕获旧引用
     _todos_ref = {"todos": todos}
-    code_agent = model.bind_tools(build_tools(runtime) + [_build_todo_update_tool(_todos_ref)])
+
+    def _bind():
+        return model.bind_tools(build_tools(runtime) + [_build_todo_update_tool(_todos_ref)])
+
+    code_agent = _bind()
 
     writer(
         {
@@ -100,21 +114,95 @@ def run_code_agent(
     def _exec(call: dict[str, Any]) -> tuple[ToolMessage, list[dict[str, str]]]:
         return execute_code_agent_tool(runtime, _todos_ref["todos"], call)
 
-    for _ in range(max_loops):
-        response = code_agent.invoke(messages)
+    stop_continues = 0
+    # ===== 引擎层恢复状态机（对齐 Claude Code） =====
+    budget = BudgetTracker(budget=getattr(runtime, "token_budget", None))
+    output_recovery = OutputTokenRecovery()
+    prompt_recovery = PromptTooLongRecovery()
+    current_agent = code_agent
+    loops_done = 0
+    while loops_done < max_loops:
+        loops_done += 1
+        response = _invoke_with_recovery(current_agent, messages, prompt_recovery)
+        if response is None:
+            break
         produced_messages.append(response)
         messages.append(response)
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
+        accounted_tokens = budget.account(response)
+
+        # ===== max_output_tokens 截断检测与恢复 =====
+        if is_truncated(response):
+            recovery = output_recovery.on_truncated()
+            if recovery is None:
+                break
+            if recovery["action"] == "escalate":
+                current_agent = model_with_max_tokens(code_agent, output_recovery.max_output_tokens_override)
+                messages.pop()
+                produced_messages.pop()
+                # 回滚本轮已计入的 token，避免污染预算基线
+                budget.total_output_tokens -= accounted_tokens
+                loops_done -= 1
+                continue
+            if recovery["action"] == "resume":
+                # 被截断的 AIMessage 可能带 partial tool_calls（finish_reason=length
+                # 时 provider 仍可能返回带 id 的不完整 tool_calls），需清洗悬空 tool_use，
+                # 否则下一轮 messages 末尾 [AIMessage(tool_calls), HumanMessage] 缺 ToolMessage → API 400（#2）
+                produced_messages = filter_unresolved_tool_uses(produced_messages)
+                # messages 与 produced_messages 同步：清洗可能已补占位 ToolMessage，对齐两者
+                _sync_messages_from_produced(messages, produced_messages)
+                resume_msg = HumanMessage(content=recovery["message"])
+                messages.append(resume_msg)
+                produced_messages.append(resume_msg)
+                continue
+
+        # ===== 预算检查：达阈值或收益递减 → 停止 =====
+        should_stop, reason = budget.check()
+        if should_stop:
+            logger.info("codeAgent stopping: %s (budget=%s, used=%d)",
+                        reason, budget.budget, budget.total_output_tokens)
+            produced_messages.append(HumanMessage(content=NUDGE_MESSAGE))
             break
 
-        # TodoUpdateTool 会原地修改 todos 列表，必须串行执行以避免竞态
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            # Stop hook：可 preventContinuation 强制继续（对齐 Claude Code）
+            from mokioclaw.core.hooks import fire_stop_hook
+
+            stop_result = fire_stop_hook(
+                runtime.hook_runner,
+                workspace=str(runtime.workspace),
+            )
+            if stop_result.prevent_continuation and stop_continues < 2:
+                stop_continues += 1
+                continue_msg = HumanMessage(
+                    content=(
+                        stop_result.feedback
+                        or stop_result.context_injection
+                        or "Stop was blocked by a hook. Continue working on the task."
+                    )
+                )
+                messages.append(continue_msg)
+                produced_messages.append(continue_msg)
+                writer({"type": "stop_blocked", "node": "codeAgent", "reason": continue_msg.content})
+                continue
+            break
+
+        # 正常进入工具执行前重置截断恢复计数
+        output_recovery.reset_for_new_turn()
+
+        # TodoUpdateTool / LoadMcpTool / ToolSearch：串行；Load/Search 优先
         has_todo_update = any(c.get("name") == "TodoUpdateTool" for c in tool_calls)
-        if has_todo_update or len(tool_calls) == 1:
-            results = [_exec(call) for call in tool_calls]
+        has_load = any(c.get("name") in {"LoadMcpTool", "ToolSearchTool"} for c in tool_calls)
+        if has_todo_update or has_load or len(tool_calls) == 1:
+            ordered = _order_tool_calls_for_execution(tool_calls)
+            results_by_key: dict[Any, tuple[ToolMessage, list[dict[str, str]]]] = {}
+            for call in ordered:
+                results_by_key[_tool_call_key(call)] = _exec(call)
+            results = [results_by_key[_tool_call_key(c)] for c in tool_calls]
         else:
             results = execute_tool_calls(tool_calls, _exec, max_workers=4, writer=writer, node="codeAgent")
 
+        need_rebind = False
         for call, (tool_result, new_todos) in zip(tool_calls, results):
             todos = new_todos
             _todos_ref["todos"] = todos
@@ -138,12 +226,28 @@ def run_code_agent(
                         "verification_commands": state.get("verification_commands", []),
                     }
                 )
+            if call.get("name") in {"LoadMcpTool", "ToolSearchTool"}:
+                need_rebind = True
             produced_messages.append(tool_result)
             messages.append(tool_result)
+
+        # 加载延迟工具后重新 bind
+        if need_rebind and (
+            getattr(runtime, "loaded_mcp_tools", None) or getattr(runtime, "loaded_tools", None)
+        ):
+            code_agent = _bind()
+            # 保持 escalate 后的 max_tokens override（对齐 Claude Code maxOutputTokensOverride）
+            if output_recovery.escalated and output_recovery.max_output_tokens_override:
+                current_agent = model_with_max_tokens(code_agent, output_recovery.max_output_tokens_override)
+            else:
+                current_agent = code_agent
     else:
         produced_messages.append(
             AIMessage(content="codeAgent stopped after the maximum tool loop count; verifier will inspect current files.")
         )
+
+    # ===== 悬空 tool_use 清洗：循环跳出时补占位，防 API 400 =====
+    produced_messages = filter_unresolved_tool_uses(produced_messages)
 
     summary = last_ai_content(produced_messages)
     any_failed = any(
@@ -160,26 +264,126 @@ def run_code_agent(
     }
 
 
+def _tool_call_key(call: dict[str, Any]) -> Any:
+    return call.get("id") or id(call)
+
+
+def _sync_messages_from_produced(messages: list[Any], produced: list[Any]) -> None:
+    """把 produced 的清洗结果同步回 messages（resume 路径用）
+
+    filter_unresolved_tool_uses 可能在 produced 末尾补占位 ToolMessage，
+    需让 messages 末尾也带上这些占位，保持两者一致，防下一轮 API 400。
+    仅同步末尾新增的 ToolMessage（produced 比 messages 多出的尾部）。
+    """
+    # 找 messages 在 produced 中的对齐点：messages 末尾应是 produced 的前缀子集
+    # 简化处理：produced 比 messages 长出的部分追加到 messages
+    if len(produced) > len(messages):
+        for extra in produced[len(messages):]:
+            messages.append(extra)
+
+
+def _order_tool_calls_for_execution(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """LoadMcpTool / ToolSearchTool 最先执行，其余保持相对顺序"""
+    priority = {"LoadMcpTool": 0, "ToolSearchTool": 0}
+    return [
+        call
+        for _, call in sorted(
+            enumerate(tool_calls),
+            key=lambda item: (priority.get(str(item[1].get("name") or ""), 1), item[0]),
+        )
+    ]
+
+
 def execute_code_agent_tool(runtime: RuntimeState, todos: list[dict[str, str]], call: dict[str, Any]):
+    from mokioclaw.core.hooks import HookEvent, HookPayload, HookRunner
+    from mokioclaw.core.tool_gate import gate_tool_call
+    from mokioclaw.memory.microcompact import update_file_state_map
+
     name = call.get("name", "")
     args = call.get("args") or {}
+    tool_call_id = call.get("id") or f"{name}-call"
+    mid = runtime.next_message_id()
+
+    def _tm(payload: dict[str, Any]) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(payload, ensure_ascii=False, default=str),
+            name=name,
+            tool_call_id=tool_call_id,
+            id=mid,
+        )
+
+    # agent_mode 门禁
+    if name != "TodoUpdateTool":
+        blocked = gate_tool_call(runtime, name, args if isinstance(args, dict) else {})
+        if blocked is not None:
+            return _tm(blocked), todos
+
+    # PreToolUse Hook（跳过 TodoUpdateTool，它是内部状态管理）
+    hook_runner = runtime.hook_runner
+    if name != "TodoUpdateTool" and hook_runner and isinstance(hook_runner, HookRunner):
+        pre_payload = HookPayload(event=HookEvent.PreToolUse, tool_name=name, tool_args=dict(args))
+        pre_result = hook_runner.run(HookEvent.PreToolUse, pre_payload)
+        if pre_result.blocked:
+            return _tm({"ok": False, "error": pre_result.feedback or "blocked by hook"}), todos
+        if pre_result.updated_args is not None:
+            args = pre_result.updated_args
+
+    error: Exception | None = None
     if name == "TodoUpdateTool":
         result = update_todo(todos, args.get("todo_id", ""), args.get("status", ""), args.get("note", ""))
         if result.get("ok"):
             todos = result["todos"]
     else:
         tools = {tool.name: tool for tool in build_tools(runtime)}
-        tool = tools.get(name)
+        tool = (
+            tools.get(name)
+            or (getattr(runtime, "loaded_tools", {}) or {}).get(name)
+            or (getattr(runtime, "loaded_mcp_tools", {}) or {}).get(name)
+        )
         if tool is None:
             result = {"ok": False, "error": f"unknown tool: {name}"}
         else:
             try:
                 result = tool.invoke(args)
             except Exception as exc:
+                # catch-and-return：业务异常不崩 loop
+                error = exc
                 logger.warning("codeAgent tool %s failed: %s", name, exc, exc_info=True)
-                result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    tool_call_id = call.get("id") or f"{name}-call"
-    return ToolMessage(content=json.dumps(result, ensure_ascii=False), name=name, tool_call_id=tool_call_id), todos
+                result = {"ok": False, "is_error": True, "error": f"{type(exc).__name__}: {exc}"}
+
+    # PostToolUse / PostToolUseFailure Hook
+    if name != "TodoUpdateTool" and hook_runner and isinstance(hook_runner, HookRunner):
+        post_event = HookEvent.PostToolUseFailure if error else HookEvent.PostToolUse
+        hook_runner.run(post_event, HookPayload(
+            event=post_event, tool_name=name, tool_args=args, tool_result=result, error=error,
+            workspace=str(runtime.workspace),
+        ))
+
+    # L1 Tool-Result Budget：大输出落盘（与 execute_tool_by_name 对齐）
+    if name != "TodoUpdateTool" and not error and isinstance(result, dict):
+        budget = getattr(runtime, "result_budget", None)
+        if budget is not None:
+            try:
+                result = budget.apply(result, name, runtime.workspace)
+            except Exception as exc:
+                logger.debug("result budget skipped: %s", exc)
+        try:
+            from mokioclaw.core.context_modifier import apply_context_modifier
+
+            apply_context_modifier(runtime, result)
+        except Exception:
+            pass
+        try:
+            update_file_state_map(
+                runtime.file_state_map,
+                tool_name=name,
+                tool_result=result,
+                message_id=mid,
+            )
+        except Exception:
+            pass
+
+    return _tm(result if isinstance(result, dict) else {"ok": True, "result": result}), todos
 
 
 def _build_todo_update_tool(todos_ref: dict[str, list[dict[str, str]]]) -> StructuredTool:

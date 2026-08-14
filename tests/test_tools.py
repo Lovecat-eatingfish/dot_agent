@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import sys
+
+import pytest
 
 from mokioclaw.security.approval import ApprovalDecision, classify_command_risk
 from mokioclaw.state.runtime import RuntimeState
@@ -212,6 +215,7 @@ def test_bash_pip_shim_uses_runtime_python(tmp_path: Path) -> None:
     assert str(Path(sys.prefix)) in result["stdout"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX shell script + POSIX PATH separator")
 def test_bash_env_file_expands_existing_variables(tmp_path: Path) -> None:
     state = make_state(tmp_path)
     bin_dir = tmp_path / "bin"
@@ -385,7 +389,7 @@ def test_bash_tool_description_mentions_windows_cmd(monkeypatch) -> None:
     description = bash_tool_description()
 
     assert "cmd.exe" in description
-    assert "Do not use POSIX-only tools" in description
+    assert "POSIX-only" in description
 
 
 def test_bash_tool_description_mentions_posix_for_macos(monkeypatch) -> None:
@@ -499,16 +503,83 @@ def test_notepad_append_and_read(tmp_path: Path) -> None:
     assert "single HTML" in read_result["content"]
 
 
-def test_web_search_tool_requires_tavily_key(monkeypatch) -> None:
-    monkeypatch.setenv("TAVILY_API_KEY", "")
+def test_web_search_local_code_backend(tmp_path: Path, monkeypatch) -> None:
+    """SEARCH_BACKEND=code：工作区代码搜索命中，无需 Tavily key"""
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("SEARCH_BACKEND", "code")
+
+    (tmp_path / "notes.md").write_text(
+        "# Amiya\n\nAmiya is the main character from Arknights.\n",
+        encoding="utf-8",
+    )
+    result = web_search("Amiya Arknights", workspace=tmp_path)
+    assert result["ok"] is True
+    assert result.get("backend") in {"code", "local", "code+rag", "rag+code"}
+    assert len(result.get("results") or []) >= 1
+    urls = " ".join(r.get("url", "") for r in result["results"])
+    assert "notes.md" in urls or "Amiya" in (result.get("answer") or "")
+
+
+def test_web_search_http_backend_parses_ddg_html(monkeypatch) -> None:
+    """默认 web 后端：自己发 HTTP，解析 DDG HTML，无 API key"""
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    monkeypatch.setenv("SEARCH_BACKEND", "web")
+
+    sample_html = """
+    <div class="result results_links">
+      <a class="result__a" href="https://duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Famiya">Amiya Profile</a>
+      <a class="result__snippet">Amiya is from Arknights.</a>
+    </div>
+    <div class="result results_links">
+      <a class="result__a" href="https://example.org/arknights">Arknights Wiki</a>
+      <td class="result__snippet">Game lore and characters.</td>
+    </div>
+    """
+
+    from mokioclaw.tools.search_backend import HttpWebSearchBackend
+
+    def fake_post(self, url, fields):
+        assert "duckduckgo" in url
+        assert fields.get("q") == "Amiya Arknights"
+        return sample_html
+
+    monkeypatch.setattr(HttpWebSearchBackend, "_http_post_form", fake_post)
 
     result = web_search("Amiya Arknights")
+    assert result["ok"] is True
+    assert result.get("backend") == "web"
+    assert len(result["results"]) >= 2
+    assert result["results"][0]["url"] == "https://example.com/amiya"
+    assert "Amiya" in result["results"][0]["title"]
+    assert "Arknights" in (result.get("answer") or "")
 
+
+def test_web_search_http_backend_network_error(monkeypatch) -> None:
+    """HTTP 失败时 ok=False 带 error，不抛异常"""
+    monkeypatch.setenv("SEARCH_BACKEND", "web")
+
+    from mokioclaw.tools.search_backend import HttpWebSearchBackend
+
+    def boom(self, url, fields):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(HttpWebSearchBackend, "_http_post_form", boom)
+    result = web_search("anything")
+    assert result["ok"] is False
+    assert "network down" in result["error"]
+
+
+def test_web_search_tavily_requires_key(monkeypatch) -> None:
+    """显式 SEARCH_BACKEND=tavily 且无 key → 失败"""
+    monkeypatch.setenv("SEARCH_BACKEND", "tavily")
+    monkeypatch.setenv("TAVILY_API_KEY", "")
+    result = web_search("Amiya Arknights")
     assert result["ok"] is False
     assert "TAVILY_API_KEY" in result["error"]
 
 
 def test_web_search_tool_parses_tavily_results(monkeypatch) -> None:
+    monkeypatch.setenv("SEARCH_BACKEND", "tavily")
     monkeypatch.setenv("TAVILY_API_KEY", "test-key")
 
     class FakeClient:
@@ -535,3 +606,4 @@ def test_web_search_tool_parses_tavily_results(monkeypatch) -> None:
     assert result["ok"] is True
     assert result["answer"] == "Amiya is from Arknights."
     assert result["results"][0]["url"] == "https://example.com/amiya"
+    assert result.get("backend") == "tavily"

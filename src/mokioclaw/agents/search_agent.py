@@ -19,20 +19,33 @@
 """
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage
 
 from mokioclaw.core.log import get_logger
-from mokioclaw.core.utils import Writer, dedupe_sources, last_ai_content, parse_json_content, tool_result_event
+from mokioclaw.core.utils import (
+    Writer,
+    dedupe_sources,
+    execute_tool_by_name,
+    last_ai_content,
+    parse_json_content,
+    tool_result_event,
+)
 
 logger = get_logger(__name__)
 from mokioclaw.state.graph import MokioGraphState
-from mokioclaw.prompts.agent_prompt import SEARCH_AGENT_PROMPT
 from mokioclaw.prompts.builder import get_prompt_builder
 from mokioclaw.providers.openai_provider import create_model
+from mokioclaw.reliability.token_budget import (
+    OutputTokenRecovery,
+    PromptTooLongRecovery,
+    filter_unresolved_tool_uses,
+    is_truncated,
+    model_with_max_tokens,
+)
 from mokioclaw.tools.web_search_tool import build_web_search_tool
+from mokioclaw.orchestration.agent_loop import _invoke_with_recovery
 
 
 def run_search_agent(
@@ -60,9 +73,9 @@ def run_search_agent(
     writer = writer or (lambda _: None)
     runtime = state.get("runtime")
     workspace = getattr(runtime, "workspace", None) if runtime else None
-    builder = get_prompt_builder(workspace=workspace)
+    builder = get_prompt_builder(workspace=workspace, runtime=runtime)
     model = create_model()
-    search_tool = build_web_search_tool()
+    search_tool = build_web_search_tool(workspace=workspace)
     search_agent = model.bind_tools([search_tool])
     messages = [
         SystemMessage(content=builder.build("search_agent")),
@@ -81,26 +94,72 @@ def run_search_agent(
     sources: list[dict[str, Any]] = []
     answers: list[str] = []
     tool_events: list[dict[str, Any]] = []
-
-    for _ in range(max_loops):
-        response = search_agent.invoke(messages)
+    tool_ok_count = 0
+    tool_fail_count = 0
+    # ===== 引擎层恢复状态机（对齐 Claude Code） =====
+    output_recovery = OutputTokenRecovery()
+    prompt_recovery = PromptTooLongRecovery()
+    current_agent = search_agent
+    # 用 while 而非 for：escalate 时不消耗迭代配额（对齐 code_agent，#1）
+    loops_done = 0
+    while loops_done < max_loops:
+        loops_done += 1
+        response = _invoke_with_recovery(current_agent, messages, prompt_recovery)
+        if response is None:
+            break
         produced_messages.append(response)
         messages.append(response)
+
+        # ===== max_output_tokens 截断检测与恢复 =====
+        if is_truncated(response):
+            recovery = output_recovery.on_truncated()
+            if recovery is None:
+                break
+            if recovery["action"] == "escalate":
+                current_agent = model_with_max_tokens(search_agent, output_recovery.max_output_tokens_override)
+                messages.pop()
+                produced_messages.pop()
+                loops_done -= 1
+                continue
+            if recovery["action"] == "resume":
+                # 清洗被截断 AIMessage 可能的 partial tool_calls（#2）
+                produced_messages = filter_unresolved_tool_uses(produced_messages)
+                _sync_search_messages(messages, produced_messages)
+                resume_msg = HumanMessage(content=recovery["message"])
+                messages.append(resume_msg)
+                produced_messages.append(resume_msg)
+                continue
+
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
             break
+
+        # 正常进入工具执行前重置截断恢复计数
+        output_recovery.reset_for_new_turn()
+
         for call in tool_calls:
             args = call.get("args") or {}
             query = str(args.get("query", ""))
             if query:
                 queries.append(query)
             writer({"type": "tool_call", "node": "searchAgent", "name": call.get("name"), "args": args})
-            tool_result = _execute_search_tool(search_tool, call)
+            tool_result = execute_tool_by_name(
+                [search_tool],
+                call,
+                hook_runner=getattr(runtime, "hook_runner", None),
+                budget=getattr(runtime, "result_budget", None),
+                workspace=getattr(runtime, "workspace", None),
+                runtime=runtime,
+            )
             event = tool_result_event(tool_result, node="searchAgent")
             tool_events.append(event)
             writer(event)
             parsed = parse_json_content(tool_result.content)
             if isinstance(parsed, dict):
+                if parsed.get("ok") is False:
+                    tool_fail_count += 1
+                else:
+                    tool_ok_count += 1
                 if parsed.get("answer"):
                     answers.append(str(parsed["answer"]))
                 for item in parsed.get("results", []) or []:
@@ -114,51 +173,50 @@ def run_search_agent(
                         "sources": parsed.get("results", []),
                     }
                 )
+            else:
+                tool_fail_count += 1
             produced_messages.append(tool_result)
             messages.append(tool_result)
 
     summary = last_ai_content(produced_messages) or "\n".join(answers)
+    # ===== 悬空 tool_use 清洗：循环跳出时补占位，防 API 400 =====
+    produced_messages = filter_unresolved_tool_uses(produced_messages)
+    deduped_sources = dedupe_sources(sources)
+    ok = True
+    error = ""
+    if tool_fail_count > 0 and tool_ok_count == 0 and not deduped_sources:
+        ok = False
+        error = "all search tool calls failed"
+    elif not queries and not (summary or "").strip():
+        ok = False
+        error = "no search performed and empty summary"
+
     result = {
-        "ok": True,
+        "ok": ok,
         "summary": summary,
         "queries": queries,
-        "sources": dedupe_sources(sources),
+        "sources": deduped_sources,
         "messages": produced_messages,
         "tool_events": tool_events,
     }
+    if error:
+        result["error"] = error
     writer(
         {
             "type": "search_summary",
             "summary": result["summary"],
             "queries": result["queries"],
             "sources": result["sources"],
+            "ok": ok,
         }
     )
     return result
 
 
-def _execute_search_tool(search_tool: Any, call: dict[str, Any]) -> ToolMessage:
-    """执行搜索工具调用
+def _sync_search_messages(messages: list[Any], produced: list[Any]) -> None:
+    """把 produced 的清洗结果同步回 messages（resume 路径用，#2）"""
+    if len(produced) > len(messages):
+        for extra in produced[len(messages):]:
+            messages.append(extra)
 
-    Args:
-        search_tool: 搜索工具实例
-        call: 工具调用字典
 
-    Returns:
-        包含搜索结果的 ToolMessage
-    """
-    name = call.get("name", "")
-    args = call.get("args") or {}
-    if name != search_tool.name:
-        result = {"ok": False, "error": f"unknown tool: {name}"}
-    else:
-        try:
-            result = search_tool.invoke(args)
-        except Exception as exc:
-            logger.warning("searchAgent tool %s failed: %s", name, exc, exc_info=True)
-            result = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    return ToolMessage(
-        content=json.dumps(result, ensure_ascii=False),
-        name=name,
-        tool_call_id=call.get("id") or f"{name}-call",
-    )

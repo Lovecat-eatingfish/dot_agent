@@ -6,6 +6,7 @@ MCP Client
 """
 from __future__ import annotations
 
+import re
 import time
 from typing import Any
 
@@ -13,6 +14,7 @@ from mokioclaw.core.log import get_logger
 from mokioclaw.mcp.protocol import (
     MCPServerState,
     MCPInitializeResult,
+    MCPResource,
     MCPTool,
     MCPToolResult,
     build_error_response,
@@ -24,7 +26,7 @@ from mokioclaw.mcp.protocol import (
     parse_message,
 )
 from mokioclaw.mcp.sandbox import SandboxPolicy
-from mokioclaw.mcp.transport import MCPTransport
+from mokioclaw.mcp.transport import MCPTransportBase
 
 logger = get_logger(__name__)
 
@@ -32,6 +34,8 @@ logger = get_logger(__name__)
 _INIT_TIMEOUT = 15.0
 # 工具调用默认超时
 _CALL_TIMEOUT = 60.0
+# 握手后 resources/list 拉取超时（不应拖慢 connect）
+_RESOURCES_TIMEOUT = 5.0
 
 
 class MCPClient:
@@ -47,7 +51,7 @@ class MCPClient:
     def __init__(
         self,
         name: str,
-        transport: MCPTransport,
+        transport: MCPTransportBase,
         sandbox_policy: SandboxPolicy | None = None,
     ) -> None:
         self.name = name
@@ -56,6 +60,7 @@ class MCPClient:
         self._state = MCPServerState.DISCONNECTED
         self._tools: list[MCPTool] = []
         self._resources: list[dict[str, Any]] = []
+        self._resources_fetched: bool = False
         self._capabilities: dict[str, Any] = {}
         self._server_info: dict[str, Any] = {}
         self._request_counter = 0
@@ -135,6 +140,12 @@ class MCPClient:
             )
             # 发送 initialized 通知
             self._transport.send(build_notification("notifications/initialized"))
+            # 握手成功后按 capabilities 拉取 resources（对齐 Claude Code resources 注入）
+            if self._capabilities.get("resources"):
+                try:
+                    self.list_resources()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("MCP '%s' list_resources after init failed: %s", self.name, exc)
             return True
 
         logger.error("MCP initialize timeout for '%s'", self.name)
@@ -263,6 +274,108 @@ class MCPClient:
         self._transport.disconnect()
         self._state = MCPServerState.DISCONNECTED
         self._tools = []
+        self._resources = []
+        self._resources_fetched = False
+
+    # ===== Resources（对齐 Claude Code MCP resources 注入） =====
+
+    def list_resources(self) -> list[MCPResource]:
+        """获取 server 支持的资源列表（resources/list）
+
+        自动缓存；握手成功后若 capabilities 含 resources 则自动调用。
+        用 _resources_fetched 区分"未拉取"与"拉取到空列表"，避免无资源 server 反复请求。
+        """
+        if self._resources_fetched:
+            return [
+                MCPResource(
+                    uri=r.get("uri", ""),
+                    name=r.get("name", ""),
+                    description=r.get("description", ""),
+                    mime_type=r.get("mimeType", ""),
+                )
+                for r in self._resources
+                if r.get("uri")
+            ]
+
+        req_id = self._next_id()
+        self._transport.send(build_request("resources/list", {}, req_id))
+
+        deadline = time.time() + _RESOURCES_TIMEOUT
+        while time.time() < deadline:
+            msg = self._transport.receive(timeout=deadline - time.time())
+            if msg is None:
+                break
+            if not isinstance(msg, dict):
+                continue
+            if not is_response(msg):
+                continue
+            if str(msg.get("id")) != str(req_id):
+                continue
+            if "error" in msg:
+                logger.error("MCP resources/list error: %s", msg["error"])
+                self._resources_fetched = True
+                return []
+            result = msg.get("result", {})
+            self._resources = result.get("resources", []) or []
+            self._resources_fetched = True
+            return [
+                MCPResource(
+                    uri=r.get("uri", ""),
+                    name=r.get("name", ""),
+                    description=r.get("description", ""),
+                    mime_type=r.get("mimeType", ""),
+                )
+                for r in self._resources
+                if r.get("uri")
+            ]
+
+        return []
+
+    def read_resource(self, uri: str) -> dict[str, Any]:
+        """读取单个资源内容（resources/read）
+
+        Returns:
+            {"contents": [...], "ok": bool, "error": str?}
+        """
+        req_id = self._next_id()
+        self._transport.send(build_request("resources/read", {"uri": uri}, req_id))
+
+        deadline = time.time() + _CALL_TIMEOUT
+        while time.time() < deadline:
+            msg = self._transport.receive(timeout=deadline - time.time())
+            if msg is None:
+                break
+            if not isinstance(msg, dict):
+                continue
+            if not is_response(msg):
+                continue
+            if str(msg.get("id")) != str(req_id):
+                continue
+            if "error" in msg:
+                err = msg["error"]
+                # MCP Server 可能返回 {"error": "string"} 或 {"error": {"message": "..."}}
+                if isinstance(err, dict):
+                    err_msg = str(err.get("message", "unknown"))
+                else:
+                    err_msg = str(err) or "unknown"
+                return {"ok": False, "error": err_msg}
+            result = msg.get("result", {})
+            return {"ok": True, "contents": result.get("contents", [])}
+
+        return {"ok": False, "error": f"resources/read timeout after {_CALL_TIMEOUT}s"}
+
+    @property
+    def resources(self) -> list[MCPResource]:
+        """已缓存的资源列表"""
+        return [
+            MCPResource(
+                uri=r.get("uri", ""),
+                name=r.get("name", ""),
+                description=r.get("description", ""),
+                mime_type=r.get("mimeType", ""),
+            )
+            for r in self._resources
+        ]
 
     def _next_id(self) -> str:
         self._request_counter += 1

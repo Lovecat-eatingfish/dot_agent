@@ -246,19 +246,21 @@ content A is long enough to be split into children.
 
 def test_parent_child_retrieve_returns_parent(tmp_path: Path):
     """查询命中 child，返回 parent 原文（验证上下文完整）"""
-    from mokioclaw.rag.backends.local_file import LocalFileBackend
+    from mokioclaw.rag.backends.local_file import LocalFileBackend, make_child_id, make_parent_id
     from mokioclaw.rag.retrieval import HybridRetriever
     from mokioclaw.rag.types import ChildChunk, ParentChunk
 
     backend = LocalFileBackend(embedder=FakeEmbedder(), persist_dir=tmp_path / "chroma")
+    pid = make_parent_id("d1", 0)
+    cid = make_child_id("d1", 0)
     # 手造父子块：parent 是完整原文，child 是片段
     parents = [ParentChunk(
-        parent_id="d1:p0", doc_id="d1",
+        parent_id=pid, doc_id="d1",
         content="The MokioClaw project uses LangGraph for workflow orchestration and FastAPI for web.",
         metadata={"source": "t", "doc_id": "d1", "chunk_index": 0},
     )]
     children = [ChildChunk(
-        child_id="d1:c0", doc_id="d1", parent_id="d1:p0",
+        child_id=cid, doc_id="d1", parent_id=pid,
         content="LangGraph workflow orchestration",
         metadata={"source": "t", "doc_id": "d1", "chunk_index": 0},
     )]
@@ -273,12 +275,16 @@ def test_parent_child_retrieve_returns_parent(tmp_path: Path):
 
 def test_version_increment_on_reingest(tmp_path: Path):
     """同 doc_id 重新 ingest，version+1"""
-    from mokioclaw.rag.backends.local_file import LocalFileBackend
+    from mokioclaw.rag.backends.local_file import LocalFileBackend, make_child_id, make_parent_id
     from mokioclaw.rag.types import ChildChunk, ParentChunk
 
     backend = LocalFileBackend(embedder=FakeEmbedder(), persist_dir=tmp_path / "chroma")
-    mk = lambda content: ([ParentChunk("d1:p0", "d1", content, {"doc_id": "d1"})],
-                         [ChildChunk("d1:c0", "d1", "d1:p0", content, {"doc_id": "d1"})])
+    def mk(content: str):
+        pid, cid = make_parent_id("d1", 0), make_child_id("d1", 0)
+        return (
+            [ParentChunk(pid, "d1", content, {"doc_id": "d1"})],
+            [ChildChunk(cid, "d1", pid, content, {"doc_id": "d1"})],
+        )
     p, c = mk("first version content")
     backend.add_chunks(p, c)
     p2, c2 = mk("second version content")
@@ -292,19 +298,20 @@ def test_version_increment_on_reingest(tmp_path: Path):
 
 def test_query_only_returns_max_version(tmp_path: Path):
     """旧版本不参与查询（被标记 deleted）"""
-    from mokioclaw.rag.backends.local_file import LocalFileBackend
+    from mokioclaw.rag.backends.local_file import LocalFileBackend, make_child_id, make_parent_id
     from mokioclaw.rag.types import ChildChunk, ParentChunk
 
     backend = LocalFileBackend(embedder=FakeEmbedder(), persist_dir=tmp_path / "chroma")
+    pid, cid = make_parent_id("d1", 0), make_child_id("d1", 0)
     # v1
     backend.add_chunks(
-        [ParentChunk("d1:p0", "d1", "old apples content", {"doc_id": "d1"})],
-        [ChildChunk("d1:c0", "d1", "d1:p0", "old apples", {"doc_id": "d1"})],
+        [ParentChunk(pid, "d1", "old apples content", {"doc_id": "d1"})],
+        [ChildChunk(cid, "d1", pid, "old apples", {"doc_id": "d1"})],
     )
     # v2（覆盖）
     backend.add_chunks(
-        [ParentChunk("d1:p0", "d1", "new zebras content", {"doc_id": "d1"})],
-        [ChildChunk("d1:c0", "d1", "d1:p0", "new zebras", {"doc_id": "d1"})],
+        [ParentChunk(pid, "d1", "new zebras content", {"doc_id": "d1"})],
+        [ChildChunk(cid, "d1", pid, "new zebras", {"doc_id": "d1"})],
     )
     # 查 apples（旧版本词）应不命中
     hits = backend.query_children("apples", k=5)
@@ -316,13 +323,14 @@ def test_query_only_returns_max_version(tmp_path: Path):
 
 def test_logical_delete_keeps_data(tmp_path: Path):
     """逻辑删除：数据仍在但查询不返回"""
-    from mokioclaw.rag.backends.local_file import LocalFileBackend
+    from mokioclaw.rag.backends.local_file import LocalFileBackend, make_child_id, make_parent_id
     from mokioclaw.rag.types import ChildChunk, ParentChunk
 
     backend = LocalFileBackend(embedder=FakeEmbedder(), persist_dir=tmp_path / "chroma")
+    pid, cid = make_parent_id("d1", 0), make_child_id("d1", 0)
     backend.add_chunks(
-        [ParentChunk("d1:p0", "d1", "alpha beta gamma", {"doc_id": "d1"})],
-        [ChildChunk("d1:c0", "d1", "d1:p0", "alpha beta gamma", {"doc_id": "d1"})],
+        [ParentChunk(pid, "d1", "alpha beta gamma", {"doc_id": "d1"})],
+        [ChildChunk(cid, "d1", pid, "alpha beta gamma", {"doc_id": "d1"})],
     )
     backend.delete_doc("d1")
     # list_docs 不再返回
@@ -332,8 +340,6 @@ def test_logical_delete_keeps_data(tmp_path: Path):
     hits = backend.query_children("alpha", k=5)
     assert all(c.doc_id != "d1" for c in hits)
     # 但 parent JSON 文件仍在（逻辑删非物理删）
-    parent_json = tmp_path / "chroma" / ".." / "parents" / "d1.json"
-    # parents 目录在 persist_dir 的父级
     parents_dir = (tmp_path / "chroma").parent / "parents"
     assert (parents_dir / "d1.json").exists()
 
@@ -360,7 +366,7 @@ def test_rrf_fuse_dedup_and_rank():
 
 def test_hybrid_search_bm25_boosts_keyword(tmp_path: Path):
     """专有名词/编号场景，BM25 提升召回（混合检索优于纯向量）"""
-    from mokioclaw.rag.backends.local_file import LocalFileBackend
+    from mokioclaw.rag.backends.local_file import LocalFileBackend, make_child_id, make_parent_id
     from mokioclaw.rag.retrieval import HybridRetriever
     from mokioclaw.rag.types import ChildChunk, ParentChunk
 
@@ -371,9 +377,10 @@ def test_hybrid_search_bm25_boosts_keyword(tmp_path: Path):
         ("doc_b", "Error code ERR-9981 occurred in module router"),
     ]
     for did, content in docs:
+        pid, cid = make_parent_id(did, 0), make_child_id(did, 0)
         backend.add_chunks(
-            [ParentChunk(f"{did}:p0", did, content, {"doc_id": did})],
-            [ChildChunk(f"{did}:c0", did, f"{did}:p0", content, {"doc_id": did})],
+            [ParentChunk(pid, did, content, {"doc_id": did})],
+            [ChildChunk(cid, did, pid, content, {"doc_id": did})],
         )
     retriever = HybridRetriever(backend=backend, embedder=FakeEmbedder(), top_k=2)
     # 查精确编号 ERR-4042，BM25 应强召回 doc_a
@@ -510,18 +517,21 @@ def test_local_file_cache_hit_and_miss(tmp_path: Path):
     now = time.time()
     cache = LocalFileCache(embedder=FakeEmbedder(), cache_dir=tmp_path / "cache")
     # 未命中
-    assert cache.get("hello", FakeEmbedder().embed_query("hello")) is None
+    assert cache.get("hello", FakeEmbedder().embed_query("hello"), cache_key="k1") is None
     # 写入
     cache.put(CacheEntry(
         query="hello world", answer="hi", embedding=FakeEmbedder().embed_query("hello world"),
-        created_at=now, ttl=3600,
+        created_at=now, ttl=3600, cache_key="k1",
     ))
     # 精确命中
-    hit = cache.get("hello world", FakeEmbedder().embed_query("hello world"))
+    hit = cache.get("hello world", FakeEmbedder().embed_query("hello world"), cache_key="k1")
     assert hit is not None
     assert hit.answer == "hi"
+    # 不同 cache_key 不命中（防 filter 串答案）
+    miss_key = cache.get("hello world", FakeEmbedder().embed_query("hello world"), cache_key="k2")
+    assert miss_key is None
     # 不相关 query 不命中
-    miss = cache.get("completely different topic xyz", FakeEmbedder().embed_query("completely different topic xyz"))
+    miss = cache.get("completely different topic xyz", FakeEmbedder().embed_query("completely different topic xyz"), cache_key="k1")
     assert miss is None
 
 
@@ -534,16 +544,16 @@ def test_local_file_cache_persists(tmp_path: Path):
     c1 = LocalFileCache(embedder=FakeEmbedder(), cache_dir=tmp_path / "cache")
     c1.put(CacheEntry(
         query="q1", answer="a1", embedding=FakeEmbedder().embed_query("q1"),
-        created_at=now, ttl=3600,
+        created_at=now, ttl=3600, cache_key="ck1",
     ))
     # 新实例从磁盘加载
     c2 = LocalFileCache(embedder=FakeEmbedder(), cache_dir=tmp_path / "cache")
-    hit = c2.get("q1", FakeEmbedder().embed_query("q1"))
+    hit = c2.get("q1", FakeEmbedder().embed_query("q1"), cache_key="ck1")
     assert hit is not None
     assert hit.answer == "a1"
     # clear
     assert c2.clear() >= 1
-    assert c2.get("q1", FakeEmbedder().embed_query("q1")) is None
+    assert c2.get("q1", FakeEmbedder().embed_query("q1"), cache_key="ck1") is None
 
 
 def test_citation_extract_and_validate():
@@ -721,6 +731,113 @@ def test_service_trace_invalid_id_rejected(tmp_path: Path):
     # 含空格和点（被 safe 过滤后 != 原值）应返回 400
     resp = client.get("/trace/bad id with spaces")
     assert resp.status_code == 400
+
+
+# ===== 11. Review 修复回归：SSRF / doc_id / auth / parent_id / k 上限 =====
+
+def test_load_url_blocks_file_scheme():
+    """file:// 必须被 SSRF 防护拒绝"""
+    from mokioclaw.rag.loader import load_url
+
+    pages = load_url("file:///C:/Windows/win.ini")
+    assert pages == []
+
+
+def test_load_url_blocks_loopback():
+    from mokioclaw.rag.loader import load_url
+
+    assert load_url("http://127.0.0.1:1/") == []
+    assert load_url("http://localhost/secret") == []
+
+
+def test_sanitize_doc_id_blocks_path_traversal(tmp_path: Path):
+    """doc_id 含 ../ 不得写出 parents 目录"""
+    from mokioclaw.rag.backends.local_file import LocalFileBackend, make_child_id, make_parent_id
+    from mokioclaw.rag.security import sanitize_doc_id
+    from mokioclaw.rag.types import ChildChunk, ParentChunk
+
+    assert ".." not in sanitize_doc_id("../escape")
+    assert "/" not in sanitize_doc_id("a/b")
+
+    backend = LocalFileBackend(embedder=FakeEmbedder(), persist_dir=tmp_path / "chroma")
+    evil = "../escape"
+    safe = sanitize_doc_id(evil)
+    pid, cid = make_parent_id(safe, 0), make_child_id(safe, 0)
+    backend.add_chunks(
+        [ParentChunk(pid, evil, "secret", {"doc_id": evil})],
+        [ChildChunk(cid, evil, pid, "secret", {"doc_id": evil})],
+    )
+    parents_dir = (tmp_path / "chroma").parent / "parents"
+    # 不得在 parents 外创建 escape.json
+    assert not (tmp_path / "escape.json").exists()
+    assert (parents_dir / f"{safe}.json").exists()
+
+
+def test_get_parent_with_url_like_doc_id(tmp_path: Path):
+    """url 风格 doc_id（含 :）+ 新 parent_id 格式可正确取回"""
+    from mokioclaw.rag.backends.local_file import LocalFileBackend, make_child_id, make_parent_id
+    from mokioclaw.rag.security import sanitize_doc_id
+    from mokioclaw.rag.types import ChildChunk, ParentChunk
+
+    backend = LocalFileBackend(embedder=FakeEmbedder(), persist_dir=tmp_path / "chroma")
+    raw = "url:http://example.com/a:p/b"
+    doc_id = sanitize_doc_id(raw)
+    pid, cid = make_parent_id(doc_id, 0), make_child_id(doc_id, 0)
+    backend.add_chunks(
+        [ParentChunk(pid, doc_id, "full parent context about widgets", {"doc_id": doc_id})],
+        [ChildChunk(cid, doc_id, pid, "widgets", {"doc_id": doc_id})],
+    )
+    got = backend.get_parent(pid)
+    assert got is not None
+    assert "full parent context" in got.content
+
+
+def test_service_rejects_huge_k(tmp_path: Path):
+    from fastapi.testclient import TestClient
+    from mokioclaw.rag.store import ChromaStore
+    from mokioclaw.rag.service import create_app
+
+    store = ChromaStore(embedder=FakeEmbedder(), persist_dir=tmp_path / "chroma")
+    client = TestClient(create_app(store=store))
+    resp = client.post("/query", json={"query": "x", "k": 10**9})
+    assert resp.status_code == 422
+
+
+def test_service_api_token_auth(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("RAG_API_TOKEN", "secret-token")
+    # create_app 在导入路由时读 env，需在 create 前设置
+    from fastapi.testclient import TestClient
+    from mokioclaw.rag.store import ChromaStore
+    from mokioclaw.rag import service as service_mod
+
+    store = ChromaStore(embedder=FakeEmbedder(), persist_dir=tmp_path / "chroma")
+    app = service_mod.create_app(store=store)
+    client = TestClient(app)
+    # 无 token → 401
+    r = client.post("/ingest/text", json={"content": "hi", "doc_id": "d1"})
+    assert r.status_code == 401
+    # 有 token → 200
+    r2 = client.post(
+        "/ingest/text",
+        json={"content": "hi", "doc_id": "d1"},
+        headers={"X-RAG-Token": "secret-token"},
+    )
+    assert r2.status_code == 200
+    assert r2.json()["ok"] is True
+    # health 不需要 token
+    assert client.get("/health").status_code == 200
+
+
+def test_reranker_not_available_without_stub(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    """配置了模型文件但未开 STUB → available=False"""
+    model = tmp_path / "fake.onnx"
+    model.write_bytes(b"not-real")
+    monkeypatch.setenv("RAG_RERANKER_MODEL", str(model))
+    monkeypatch.delenv("RAG_RERANKER_STUB", raising=False)
+    from mokioclaw.rag.reranker import Reranker
+
+    r = Reranker(model_path=str(model))
+    assert r.available is False
 
 
 if __name__ == "__main__":

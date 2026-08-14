@@ -1,28 +1,38 @@
+"""WebSearchTool — 统一搜索工具壳
+
+默认走 HTTP 公网搜索（DuckDuckGo HTML，自己发请求，无 API key、不依赖 Tavily）。
+通过 SEARCH_BACKEND env 切换：web|local|code|rag|tavily。
+
+对外契约保持不变：{ok, query, answer, results[{title,url,content,score}]}
+"""
 from __future__ import annotations
 
-import os
+from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import StructuredTool
 
 from mokioclaw.core.utils import WebSearchResult, coerce_bool
+from mokioclaw.tools.search_backend import SearchBackend, create_search_backend
 
 
 def web_search(
     query: str,
     max_results: int | str = 5,
     include_answer: bool | str = True,
+    *,
+    backend: SearchBackend | None = None,
+    workspace: Path | None = None,
 ) -> WebSearchResult:
-    """Search the web with Tavily and return a compact structured result."""
-    api_key = os.getenv("TAVILY_API_KEY")
-    if not api_key:
-        return {"ok": False, "error": "missing required .env setting: TAVILY_API_KEY"}
+    """搜索公网或本地资源。
 
-    try:
-        from tavily import TavilyClient
-    except ImportError as exc:
-        return {"ok": False, "error": f"tavily-python is not installed: {exc}"}
-
+    Args:
+        query: 搜索词
+        max_results: 最大结果数 1-10
+        include_answer: 是否生成简要 answer 摘要
+        backend: 可选注入后端（测试用）
+        workspace: 本地 code/rag 搜索的工作区根
+    """
     try:
         max_value = int(max_results)
     except (TypeError, ValueError):
@@ -30,42 +40,47 @@ def web_search(
     max_value = max(1, min(max_value, 10))
     answer_value = coerce_bool(include_answer, default=True)
 
+    b = backend or create_search_backend(workspace)
     try:
-        client = TavilyClient(api_key=api_key)
-        response = client.search(
-            query=query,
-            search_depth="basic",
-            max_results=max_value,
-            include_answer=answer_value,
+        result = b.search(query, max_results=max_value, include_answer=answer_value)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "query": query,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not isinstance(result, dict):
+        return {"ok": False, "query": query, "error": "backend returned non-dict"}
+    result.setdefault("query", query)
+    result.setdefault("results", [])
+    result.setdefault("answer", "")
+    if "ok" not in result:
+        result["ok"] = True
+    return result  # type: ignore[return-value]
+
+
+def build_web_search_tool(workspace: Path | None = None) -> StructuredTool:
+    """构建 WebSearchTool。"""
+
+    def _search(
+        query: str,
+        max_results: int | str = 5,
+        include_answer: bool | str = True,
+    ) -> dict[str, Any]:
+        return web_search(
+            query,
+            max_results=max_results,
+            include_answer=include_answer,
+            workspace=workspace,
         )
-    except Exception as exc:
-        return {"ok": False, "query": query, "error": f"{type(exc).__name__}: {exc}"}
 
-    results = []
-    for item in response.get("results", []) or []:
-        results.append(
-            {
-                "title": str(item.get("title", "")),
-                "url": str(item.get("url", "")),
-                "content": str(item.get("content", ""))[:1200],
-                "score": item.get("score"),
-            }
-        )
-
-    return {
-        "ok": True,
-        "query": query,
-        "answer": response.get("answer") or "",
-        "results": results,
-    }
-
-
-def build_web_search_tool() -> StructuredTool:
     return StructuredTool.from_function(
         name="WebSearchTool",
-        func=web_search,
+        func=_search,
         description=(
-            "Search the web with Tavily. Args: query, optional max_results, optional include_answer. "
+            "Search the web via direct HTTP (DuckDuckGo HTML by default, no API key). "
+            "Set SEARCH_BACKEND=local|code|rag for workspace/RAG-only, or tavily for Tavily API. "
+            "Args: query, optional max_results, optional include_answer. "
             "Returns answer and result sources with title, url, content, and score."
         ),
     )

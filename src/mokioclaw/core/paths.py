@@ -25,6 +25,11 @@ def default_workspace_root(root: Path | None = None) -> Path:
     return (root or find_project_root()) / ".mokioclaw" / "workspaces"
 
 
+def default_rag_dir(root: Path | None = None) -> Path:
+    """RAG 向量库/索引目录（对齐 .mokioclaw 约定，被 grep/glob SKIP_DIRS 排除）"""
+    return (root or find_project_root()) / ".mokioclaw" / "rag"
+
+
 def new_task_workspace(root: Path | None = None) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = uuid4().hex[:6]

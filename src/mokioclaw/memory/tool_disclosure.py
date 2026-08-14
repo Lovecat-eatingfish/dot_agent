@@ -1,5 +1,13 @@
 """
-工具渐进式披露机制
+工具渐进式披露机制（早期面试题设计稿，已弃用）
+
+@deprecated 运行时无功能路径。渐进式工具披露由两处实现接管：
+- ``tools/tool_search.py``：``apply_tool_search_filter`` 按 ``ALWAYS_LOAD`` /
+  ``DEFERRED_BUILTIN`` 决定 bind 哪些工具，``ToolSearchTool`` 按需加载完整 schema；
+- ``mcp/disclosure.py``：``select_mcp_tools_for_bind`` + ``LoadMcpTool`` 对 MCP
+  工具做同样延迟加载。
+本模块仅保留供 ``tests/test_memory_interview.py`` 中的面试考察点回归测试使用，
+新增代码请勿引用。
 
 解决面试官问题："如何减少工具过多带来的 Token 消耗"
 
@@ -48,6 +56,9 @@ class ToolSchema:
 class ToolRegistry:
     """工具注册表
 
+    @deprecated 已被 ``tools/registry.py:build_tools`` + ``tools/tool_search.py``
+    取代。实际工具注册与延迟加载由这两个模块负责。本类仅保留供面试考察点测试。
+
     管理所有可用工具的元数据和完整 Schema
     """
 
@@ -85,6 +96,10 @@ class ToolRegistry:
 
 class ProgressiveToolDisclosure:
     """工具渐进式披露器
+
+    @deprecated 运行时由 ``tools/tool_search.py:apply_tool_search_filter`` 与
+    ``mcp/disclosure.py:select_mcp_tools_for_bind`` 实现实际延迟加载。本类仅保留
+    供面试考察点测试，不接入 agent 运行时。
 
     实现两层披露策略：
     1. 精简列表：只加载名称 + 简短描述（~20 token/工具）

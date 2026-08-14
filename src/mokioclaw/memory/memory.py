@@ -30,6 +30,7 @@ from datetime import datetime
 from typing import Any
 
 from mokioclaw.core.log import get_logger
+from mokioclaw.memory.topic_store import TopicStore
 from mokioclaw.security.path_security import PathSecurityError
 from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.core.utils import truncate, trim_handoffs
@@ -140,6 +141,7 @@ def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[
         "rules": dict(RULES_LAYER),
         "working_memory": working_memory,
         "history_summary_store": history_summary_store,
+        "topic_index": _build_topic_index(runtime),
     }
 
 
@@ -167,6 +169,7 @@ def memory_event(memory: dict[str, Any], *, node: str) -> dict[str, Any]:
     """
     working = memory.get("working_memory", {})
     history = memory.get("history_summary_store", {})
+    topic_index = memory.get("topic_index", {})
     return {
         "type": "memory_snapshot",
         "node": node,
@@ -177,10 +180,12 @@ def memory_event(memory: dict[str, Any], *, node: str) -> dict[str, Any]:
         "notepad_exists": bool(history.get("notepad_exists")),
         "history_exists": bool(history.get("history_exists")),
         "history_path": history.get("history_path", HISTORY_SUMMARY_FILE),
+        "topic_count": topic_index.get("topic_count", 0),
         "layers": {
             "rules": _event_layer_summary(memory.get("rules", {})),
             "working_memory": _event_layer_summary(working),
             "history_summary_store": _event_layer_summary(history),
+            "topic_index": _event_layer_summary(topic_index),
         },
     }
 
@@ -256,3 +261,33 @@ def _trim_handoffs(handoffs: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _short_text(text: str, limit: int) -> str:
     """截断文本到指定长度"""
     return truncate(text, limit)
+
+
+def _build_topic_index(runtime: RuntimeState) -> dict[str, Any]:
+    """构建主题记忆索引层
+
+    加载 MEMORY.md 索引和主题文件列表，不加载完整主题内容。
+    模型需要详细记忆时，自行调用 FileReadTool 读取主题文件。
+
+    Args:
+        runtime: 运行时状态
+
+    Returns:
+        主题索引字典
+    """
+    try:
+        store = TopicStore(runtime.workspace)
+        index_text = store.load_index()
+        topics = store.list_topics()
+    except Exception as exc:
+        logger.debug("topic index build failed: %s", exc)
+        return {"index": "", "topics": [], "topic_count": 0}
+
+    return {
+        "index": _short_text(index_text, MAX_TEXT_CHARS["history_summary"]),
+        "topics": [
+            {"name": t.name, "description": t.description, "type": t.topic_type}
+            for t in topics
+        ],
+        "topic_count": len(topics),
+    }

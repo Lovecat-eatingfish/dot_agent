@@ -65,10 +65,19 @@ class DaemonManager:
         mgr.stop()
     """
 
-    def __init__(self, workspace: Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path | None = None,
+        *,
+        pidfile_name: str = _PIDFILE_NAME,
+        log_file_name: str = _LOG_FILE,
+    ) -> None:
         self._workspace = workspace or Path.cwd()
         self._daemon_dir = self._workspace / _DAEMON_DIR_NAME
         self._daemon_dir.mkdir(parents=True, exist_ok=True)
+        # 允许子类/调用方自定义 pidfile/logfile 名（RAG 服务用 rag.pid/rag.log 避免冲突）
+        self._pidfile_name = pidfile_name
+        self._log_file_name = log_file_name
 
     @property
     def workspace(self) -> Path:
@@ -76,11 +85,11 @@ class DaemonManager:
 
     @property
     def pidfile(self) -> Path:
-        return self._daemon_dir / _PIDFILE_NAME
+        return self._daemon_dir / self._pidfile_name
 
     @property
     def logfile(self) -> Path:
-        return self._daemon_dir / _LOG_FILE
+        return self._daemon_dir / self._log_file_name
 
     def is_running(self) -> bool:
         """检查 daemon 是否在运行"""

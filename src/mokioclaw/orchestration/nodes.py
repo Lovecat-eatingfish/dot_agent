@@ -96,62 +96,51 @@ DEFAULT_TODOS = [
 
 
 def _get_prompt_builder(state: MokioGraphState) -> PromptBuilder:
-    """从 state 的 workspace 构建 PromptBuilder
-
-    使用单例模式，首次调用时加载配置并缓存。
-    """
+    """从 state 的 workspace / runtime 构建 PromptBuilder"""
     runtime = state.get("runtime")
     workspace = runtime.workspace if runtime else None
-    return get_prompt_builder(workspace=workspace)
+    return get_prompt_builder(workspace=workspace, runtime=runtime)
 
 def intent_router_node(state: MokioGraphState) -> dict[str, Any]:
-    """意图路由器节点
+    """意图路由器节点（轻量启发式，默认工具驱动 workflow）
 
-    分析用户输入，判断应该走聊天分支还是工作流分支。
-
-    决策逻辑：
-    1. 调用 LLM 分析用户输入
-    2. 解析返回的 JSON（route, reason, confidence）
-    3. 如果置信度 >= 0.55 且路由有效，则使用 LLM 的决策
-    4. 否则默认走工作流分支
-
-    Args:
-        state: 当前工作流状态
-
-    Returns:
-        更新的状态字段：intent_route, intent_reason, intent_confidence
+    对齐 docs/agent.md：去掉重型意图 LLM，由规则快速分流。
+    仅当启发式置信度不足时，才可选地回退到 LLM（MOKIO_INTENT_LLM=1）。
     """
+    import os
+
+    from mokioclaw.orchestration.intent import classify_intent
+
     writer = _get_writer()
-    builder = _get_prompt_builder(state)
-    route = "workflow"
-    reason = "router fallback: default to workflow"
-    confidence = 0.0
-    try:
-        response = create_model().invoke(
-            [
-                SystemMessage(content=builder.build("intent_router")),
-                HumanMessage(content=_router_input(state)),
-            ]
-        )
-        parsed = _extract_json(str(response.content)) or {}
-        candidate = str(parsed.get("route", "")).strip().lower()
-        parsed_confidence = _coerce_confidence(parsed.get("confidence"))
-        if candidate in {"chat", "workflow"} and parsed_confidence >= 0.55:
-            route = candidate
-            confidence = parsed_confidence
-            reason = str(parsed.get("reason") or "")
-        else:
-            reason = str(parsed.get("reason") or "router returned low-confidence or invalid route")
-            confidence = parsed_confidence
-    except Exception as exc:
-        logger.warning("intent_router failed: %s", exc, exc_info=True)
-        reason = f"router error: {type(exc).__name__}: {exc}"
+    task = str(state.get("task") or "")
+    route, reason, confidence = classify_intent(task)
+
+    use_llm = os.getenv("MOKIO_INTENT_LLM", "").strip() in {"1", "true", "yes"} and confidence < 0.8
+    if use_llm:
+        builder = _get_prompt_builder(state)
+        try:
+            response = create_model().invoke(
+                [
+                    SystemMessage(content=builder.build("intent_router")),
+                    HumanMessage(content=_router_input(state)),
+                ]
+            )
+            parsed = _extract_json(str(response.content)) or {}
+            candidate = str(parsed.get("route", "")).strip().lower()
+            parsed_confidence = _coerce_confidence(parsed.get("confidence"))
+            if candidate in {"chat", "workflow"} and parsed_confidence >= 0.55:
+                route = candidate
+                confidence = parsed_confidence
+                reason = str(parsed.get("reason") or reason)
+        except Exception as exc:
+            logger.warning("intent_router llm fallback failed: %s", exc, exc_info=True)
 
     event = {
         "type": "intent_decision",
         "route": route,
         "reason": reason,
         "confidence": confidence,
+        "method": "llm" if use_llm else "heuristic",
     }
     writer(event)
     return {
@@ -320,6 +309,37 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
     metadata = dict(working_state.get("metadata", {}))
     metadata["planner_raw"] = content
     final_memory = build_layered_memory(working_state, node="planner")
+
+    # plan 模式：写出 id_todo.md，停止执行，等待用户确认
+    runtime = working_state.get("runtime")
+    if runtime is not None and getattr(runtime, "agent_mode", "auto") == "plan":
+        plan_path = _write_plan_todo_file(runtime, working_state)
+        writer(
+            {
+                "type": "plan_mode_waiting",
+                "path": str(plan_path),
+                "message": "Plan written. Confirm then switch /mode auto (or approve) to execute.",
+            }
+        )
+        return {
+            "plan_summary": working_state.get("plan_summary", ""),
+            "todos": working_state.get("todos", []),
+            "acceptance_criteria": working_state.get("acceptance_criteria", []),
+            "verification_commands": working_state.get("verification_commands", []),
+            "messages": [response],
+            "memory_snapshot": final_memory,
+            "history_summary": final_memory.get("history_summary_store", {}).get("history_summary", ""),
+            "metadata": metadata,
+            "planner_route": "final",
+            "planner_route_instruction": (
+                f"Plan-only mode: plan saved to {plan_path}. Awaiting user confirmation."
+            ),
+            "final_answer": (
+                f"Plan ready (agent_mode=plan). Written to `{plan_path}`.\n"
+                "Review the plan, then run `/mode auto` (or `/mode approve`) and continue."
+            ),
+        }
+
     return {
         "plan_summary": working_state.get("plan_summary", ""),
         "todos": working_state.get("todos", []),
@@ -535,6 +555,61 @@ def context_monitor_node(state: MokioGraphState) -> dict[str, Any]:
         step_count=step_count,
     )
 
+    runtime = state.get("runtime")
+    updates: dict[str, Any] = {}
+
+    # L2/L3 微压缩：清理过期 read 结果（0 成本）
+    try:
+        from mokioclaw.memory.microcompact import microcompact_messages
+        file_state_map = getattr(runtime, "file_state_map", {}) if runtime else {}
+        compacted = microcompact_messages(list(state.get("messages", [])), file_state_map)
+        if compacted is not state.get("messages"):
+            updates["messages"] = compacted
+    except Exception as exc:
+        logger.debug("microcompact skipped: %s", exc)
+
+    # Snip 层（对齐 Claude Code HISTORY_SNIP）：裁旧 tool_result，0 成本
+    try:
+        from mokioclaw.memory.snip import snip_compact_if_needed
+
+        base_msgs = updates.get("messages") or list(state.get("messages", []))
+        snipped, tokens_freed = snip_compact_if_needed(base_msgs)
+        if tokens_freed > 0:
+            updates["messages"] = snipped
+            updates["snip_tokens_freed"] = tokens_freed
+    except Exception as exc:
+        logger.debug("snip skipped: %s", exc)
+
+    # Autocompact 连续失败 → 强制 reactive compact（对齐 MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES=3）
+    if runtime is not None and int(getattr(runtime, "autocompact_failures", 0) or 0) >= 3:
+        should_compress = True
+        reason = "reactive_compact_after_failures"
+        stats.strategy = "reactive"
+
+    # /compact 或 runtime.force_compact → 强制走 compressor
+    if runtime is not None and getattr(runtime, "force_compact", False):
+        should_compress = True
+        reason = "user_requested_compact"
+        stats.strategy = "hard"
+        runtime.force_compact = False
+
+    # PreCompact hook（对齐 Claude Code；matcher 区分 manual/auto）
+    if should_compress and runtime is not None:
+        try:
+            from mokioclaw.core.hooks import HookEvent, HookPayload
+
+            trigger = "manual" if reason == "user_requested_compact" else "auto"
+            runtime.hook_runner.run(
+                HookEvent.PreCompact,
+                HookPayload(
+                    event=HookEvent.PreCompact,
+                    workspace=str(runtime.workspace),
+                    compact_trigger=trigger,
+                ),
+            )
+        except Exception as exc:
+            logger.debug("PreCompact hook skipped: %s", exc)
+
     next_node = state.get("context_next_node") or "verifier"
     event = {
         "type": "context_monitor",
@@ -550,6 +625,7 @@ def context_monitor_node(state: MokioGraphState) -> dict[str, Any]:
     writer(event)
 
     return {
+        **updates,
         "context_token_count": token_count,
         "context_token_limit": token_limit,
         "context_should_compress": should_compress,
@@ -633,13 +709,53 @@ def context_compressor_node(state: MokioGraphState) -> dict[str, Any]:
     # 获取压缩策略（由 context_monitor 的 DualThresholdCompressor 判定）
     strategy = state.get("context_compression_strategy", "hard")
     is_incremental = strategy in ("soft", "step_triggered")
+    runtime = state.get("runtime")
+
+    # Reactive：autocompact 连续失败后的激进丢弃，不再调 LLM
+    if strategy == "reactive" or (
+        runtime is not None and int(getattr(runtime, "autocompact_failures", 0) or 0) >= 3
+    ):
+        from mokioclaw.memory.snip import reactive_compact_messages
+
+        remaining = reactive_compact_messages(before_messages, keep_last=8)
+        if runtime is not None:
+            runtime.autocompact_failures = 0
+        writer({
+            "type": "context_compression",
+            "strategy": "reactive",
+            "before_messages": len(before_messages),
+            "after_messages": len(remaining),
+        })
+        return {
+            "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *remaining],
+            "context_should_compress": False,
+            "context_compression_strategy": "reactive",
+            "context_token_count": estimate_context_tokens({**state, "messages": remaining}),
+        }
 
     # 1. 持久化完整历史（用于审计和摘要重建）
     _persist_raw_history(state["runtime"], before_messages)
 
-    # 2. LLM 压缩（生成结构化摘要）
-    compressed = _compress_context_with_model(state)
-    summary = _format_compressed_context(compressed, state)
+    # 2. LLM 压缩（生成结构化摘要）；失败则累加 autocompact_failures
+    try:
+        compressed = _compress_context_with_model(state)
+        summary = _format_compressed_context(compressed, state)
+        if runtime is not None:
+            runtime.autocompact_failures = 0
+    except Exception as exc:
+        logger.warning("autocompact failed: %s", exc, exc_info=True)
+        if runtime is not None:
+            runtime.autocompact_failures = int(getattr(runtime, "autocompact_failures", 0) or 0) + 1
+        # 本轮降级为 force snip，下次达 3 次走 reactive
+        from mokioclaw.memory.microcompact import force_compact_messages
+
+        remaining = force_compact_messages(before_messages, keep_last=10)
+        return {
+            "messages": [RemoveMessage(id=REMOVE_ALL_MESSAGES), *remaining],
+            "context_should_compress": False,
+            "context_compression_strategy": "force_fallback",
+            "context_token_count": estimate_context_tokens({**state, "messages": remaining}),
+        }
     summary_message = AIMessage(content=summary)
     persist_history_summary(state["runtime"], summary)
 
@@ -1056,14 +1172,28 @@ def _execute_planner_tool(state: MokioGraphState, writer, call: dict[str, Any]) 
     name = call.get("name", "")
     args = call.get("args") or {}
     writer({"type": "tool_call", "node": "planner", "name": name, "args": args})
-    tool_message = execute_tool_by_name(_build_planner_tools(state, writer), call)
+    runtime = state["runtime"]
+    tool_message = execute_tool_by_name(
+        _build_planner_tools(state, writer), call,
+        hook_runner=runtime.hook_runner,
+        budget=runtime.result_budget,
+        workspace=runtime.workspace,
+        runtime=runtime,
+    )
     writer(build_tool_result_event(tool_message, node="planner"))
     return tool_message
 
 
 def _execute_read_only_tool(state: MokioGraphState, call: dict[str, Any]) -> ToolMessage:
-    """执行只读工具调用"""
-    return execute_tool_by_name(build_read_only_tools(state["runtime"]), call)
+    """执行只读工具调用（传入 runtime 以启用 agent_mode 门禁）"""
+    runtime = state["runtime"]
+    return execute_tool_by_name(
+        build_read_only_tools(runtime), call,
+        hook_runner=runtime.hook_runner,
+        budget=runtime.result_budget,
+        workspace=runtime.workspace,
+        runtime=runtime,
+    )
 
 
 def _compress_context_with_model(state: MokioGraphState) -> dict[str, Any]:
@@ -1197,6 +1327,45 @@ def _router_input(state: MokioGraphState) -> str:
 
 
 _chat_input = _router_input
+
+
+def _write_plan_todo_file(runtime: Any, state: MokioGraphState) -> Any:
+    """plan 模式：把计划落到 id_todo.md 供用户确认"""
+    from pathlib import Path
+
+    path = Path(runtime.workspace) / "id_todo.md"
+    lines = [
+        "# Plan (agent_mode=plan)",
+        "",
+        f"## Task\n{state.get('task', '')}",
+        "",
+        f"## Summary\n{state.get('plan_summary', '')}",
+        "",
+        "## Todos",
+    ]
+    for todo in state.get("todos", []) or []:
+        status = todo.get("status", "pending")
+        lines.append(f"- [{ 'x' if status == 'completed' else ' ' }] **{todo.get('id', '')}**: {todo.get('content', '')}")
+    lines.extend(["", "## Acceptance Criteria"])
+    for item in state.get("acceptance_criteria", []) or []:
+        lines.append(f"- {item}")
+    lines.extend(["", "## Verification Commands"])
+    for cmd in state.get("verification_commands", []) or []:
+        lines.append(f"- `{cmd}`")
+    lines.extend(
+        [
+            "",
+            "## Next",
+            "Review this plan, then run `/mode auto` or `/mode approve` and continue the task.",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
+    try:
+        runtime.record_read(path, complete=True)
+    except Exception:
+        pass
+    return path
 
 
 def _default_plan(task: str) -> dict[str, Any]:

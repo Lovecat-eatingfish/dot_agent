@@ -7,6 +7,8 @@ from typing import Any, Iterator
 from langgraph.graph import add_messages
 
 from mokioclaw.reliability.checkpoint import CheckpointManager, load_resume_inputs, normalize_checkpoint_mode
+from mokioclaw.core.hook_loader import load_hooks_into_runner
+from mokioclaw.core.hooks import HookEvent, HookPayload, HookRunner, fire_session_hook, fire_stop_hook
 from mokioclaw.core.log import get_logger
 from mokioclaw.core.paths import default_workspace, new_task_workspace
 from mokioclaw.core.workspace_detection import resolve_workspace
@@ -25,6 +27,7 @@ from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.reliability.trace import TraceRecorder, normalize_trace_mode
 from mokioclaw.orchestration.workflow import build_complex_workflow, build_entry_workflow
 from mokioclaw.prompts.builder import reset_prompt_builder
+from mokioclaw.prompts.thinking import apply_thinking_mode
 
 logger = get_logger(__name__)
 
@@ -32,11 +35,13 @@ def create_runtime(
     workspace: Path | None = None,
     *,
     approval_mode: str = "inline",
+    agent_mode: str | None = None,
     approval_handler=None,
     checkpoint_mode: str | None = None,
     resume_from: Path | None = None,
     trace_mode: str | None = None,
     opened_file: Path | None = None,
+    fire_session_start: bool = True,
 ) -> RuntimeState:
     # 智能工作区解析：显式指定 / 打开文件 → resolve_workspace，否则生成唯一 workspace
     if workspace is not None or opened_file is not None:
@@ -56,9 +61,19 @@ def create_runtime(
     except Exception as exc:
         logger.debug("output cleanup skipped: %s", exc)
 
-    return RuntimeState(
+    # agent_mode：显式参数 > 环境变量 > 用户配置 > auto
+    resolved_agent_mode = agent_mode or os.getenv("MOKIO_AGENT_MODE") or ""
+    if not resolved_agent_mode:
+        try:
+            from mokioclaw.config.loader import load_user_config
+            resolved_agent_mode = load_user_config(selected).agent_mode
+        except Exception:
+            resolved_agent_mode = "auto"
+
+    runtime = RuntimeState(
         workspace=selected,
         approval_mode=approval_mode,
+        agent_mode=resolved_agent_mode,
         approval_handler=approval_handler,
         bash_default_timeout_seconds=_env_int("MOKIO_BASH_DEFAULT_TIMEOUT_SECONDS", 120),
         bash_max_timeout_seconds=_env_int("MOKIO_BASH_MAX_TIMEOUT_SECONDS", 600),
@@ -69,6 +84,42 @@ def create_runtime(
         trace_mode=normalize_trace_mode(trace_mode or os.getenv("MOKIO_TRACE_MODE", "on")),
     )
 
+    # 加载用户/项目 hooks.json，并触发 SessionStart
+    try:
+        load_hooks_into_runner(runtime.hook_runner, selected)
+    except Exception as exc:
+        logger.debug("hook load skipped: %s", exc)
+
+    if fire_session_start:
+        result = fire_session_hook(
+            runtime.hook_runner,
+            HookEvent.SessionStart,
+            workspace=str(selected),
+        )
+        # SessionStart stdout 注入上下文（对齐 Claude Code）
+        if result.context_injection:
+            runtime.session_context_injection = result.context_injection
+
+    return runtime
+
+
+def _fire_session_start_once(runtime: RuntimeState) -> None:
+    """触发 SessionStart 钩子并把 stdout 注入上下文（chat-only 会话也要触发，#9）
+
+    单次 CLI 路径 stream_agent_events 在 create_runtime 后调用此函数，
+    覆盖 chat-only 会话原本提前 return 导致 SessionStart 不触发的问题。
+    """
+    try:
+        result = fire_session_hook(
+            runtime.hook_runner,
+            HookEvent.SessionStart,
+            workspace=str(runtime.workspace),
+        )
+        if result.context_injection:
+            runtime.session_context_injection = result.context_injection
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("SessionStart hook fire skipped: %s", exc)
+
 
 def stream_agent_events(
     task: str | None = None,
@@ -77,12 +128,42 @@ def stream_agent_events(
     opened_file: Path | None = None,
     max_attempts: int = 3,
     approval_mode: str = "inline",
+    agent_mode: str | None = None,
     approval_handler=None,
     checkpoint_mode: str | None = None,
     resume_workspace: Path | None = None,
     trace_mode: str | None = None,
 ) -> Iterator[dict[str, Any]]:
+    cleaned_task, thinking_instruction = apply_thinking_mode(task or "")
+    task = cleaned_task or task
+
     resume_path = resume_workspace.expanduser() if resume_workspace is not None else None
+
+    # UserPromptSubmit hook：可注入上下文或阻断
+    _prompt_hook_runner = HookRunner()
+    try:
+        load_hooks_into_runner(_prompt_hook_runner, resume_path or workspace)
+    except Exception as exc:
+        logger.debug("hook load for UserPromptSubmit skipped: %s", exc)
+    _prompt_result = _prompt_hook_runner.run(
+        HookEvent.UserPromptSubmit,
+        HookPayload(
+            event=HookEvent.UserPromptSubmit,
+            user_prompt=task or "",
+            workspace=str(resume_path or workspace or ""),
+        ),
+    )
+    if _prompt_result.blocked:
+        yield {
+            "type": "custom_event",
+            "event": {
+                "type": "prompt_blocked",
+                "reason": _prompt_result.feedback or "blocked by UserPromptSubmit hook",
+            },
+        }
+        return
+    if _prompt_result.context_injection:
+        task = f"{_prompt_result.context_injection}\n\n{task}"
     if resume_path is None:
         route = "workflow"
         entry_state: dict[str, Any] = {"task": task or "", "messages": []}
@@ -96,19 +177,46 @@ def stream_agent_events(
                 _merge_graph_update(entry_state, event)
                 yield {"type": "graph_event", "event": event}
         if route == "chat":
+            # chat-only 会话也要触发 SessionStart（原本提前 return 跳过，#9）：
+            # chat_responder_node 在 entry workflow 内已用临时 runtime 构建 prompt，
+            # SessionStart 注入的 context 无法回灌那条路径，这里至少保证钩子副作用
+            #（如加载会话级配置、记录日志）在 chat 场景也执行一次。
+            try:
+                _chat_runtime = create_runtime(
+                    workspace=workspace,
+                    approval_mode=approval_mode,
+                    agent_mode=agent_mode,
+                    approval_handler=approval_handler,
+                    checkpoint_mode=checkpoint_mode,
+                    trace_mode=trace_mode,
+                    fire_session_start=False,
+                )
+                _fire_session_start_once(_chat_runtime)
+                # chat 场景的 SessionEnd 也应配对触发
+                fire_session_hook(_chat_runtime.hook_runner, HookEvent.SessionEnd, workspace=str(_chat_runtime.workspace))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("chat-only session hook skipped: %s", exc)
             return
 
     state = create_runtime(
         workspace=resume_path or workspace,
         opened_file=opened_file,
         approval_mode=approval_mode,
+        agent_mode=agent_mode,
         approval_handler=approval_handler,
         checkpoint_mode=checkpoint_mode,
         resume_from=resume_path,
         trace_mode=trace_mode,
+        fire_session_start=False,
     )
+    if thinking_instruction:
+        state.thinking_instruction = thinking_instruction
+    _apply_workspace_runtime_flags(state)
+    # SessionStart 钩子：单次 CLI 路径在此触发（chat-only 会话原本提前 return 跳过 #9）
+    _fire_session_start_once(state)
     # 每个新任务重置 PromptBuilder，确保使用当前 workspace 的配置
     reset_prompt_builder()
+
     # 先跑入口流程图 build_entry_workflow 做意图识别；
     # 实时推送 graph_event /custom_event；
     # 若意图判定为 chat 直接终止，不执行复杂工作流；
@@ -166,6 +274,7 @@ def stream_agent_events(
                 yield {"type": "graph_event", "event": event}
     except KeyboardInterrupt:
         cleanup_background_processes()
+        fire_session_hook(state.hook_runner, HookEvent.SessionEnd, workspace=str(state.workspace))
         saved = manager.save(current_state, status="interrupted", latest_node=latest_node)
         if saved:
             trace.record_custom_event(saved)
@@ -176,6 +285,7 @@ def stream_agent_events(
         return
     except Exception as exc:
         cleanup_background_processes()
+        fire_session_hook(state.hook_runner, HookEvent.SessionEnd, workspace=str(state.workspace))
         logger.error("workflow failed: %s", exc, exc_info=True)
         saved = manager.save(current_state, status="failed", latest_node=latest_node)
         if saved:
@@ -187,6 +297,13 @@ def stream_agent_events(
         return
 
     cleanup_background_processes()
+    # Stop hook：模型本轮结束（对齐 Claude Code Stop）
+    fire_stop_hook(
+        state.hook_runner,
+        workspace=str(state.workspace),
+        session_id=str(getattr(state, "trace_id", "") or ""),
+    )
+    fire_session_hook(state.hook_runner, HookEvent.SessionEnd, workspace=str(state.workspace))
     saved = manager.save(current_state, status="finished", latest_node=latest_node)
     if saved:
         trace.record_custom_event(saved)
@@ -216,6 +333,49 @@ def stream_session_events(
 
     if not task:
         return
+
+    cleaned_task, thinking_instruction = apply_thinking_mode(task)
+    task = cleaned_task or task
+
+    # UserPromptSubmit hook：可注入上下文或阻断（TUI 持久会话）
+    _prompt_hook_runner = HookRunner()
+    try:
+        load_hooks_into_runner(_prompt_hook_runner, workspace)
+    except Exception as exc:
+        logger.debug("hook load for UserPromptSubmit skipped: %s", exc)
+    _prompt_result = _prompt_hook_runner.run(
+        HookEvent.UserPromptSubmit,
+        HookPayload(
+            event=HookEvent.UserPromptSubmit,
+            user_prompt=task,
+            workspace=str(workspace),
+            session_id=str(session.get("session_id", "")),
+        ),
+    )
+    if _prompt_result.blocked:
+        yield {
+            "type": "custom_event",
+            "event": {
+                "type": "prompt_blocked",
+                "reason": _prompt_result.feedback or "blocked by UserPromptSubmit hook",
+            },
+        }
+        return
+    if _prompt_result.context_injection:
+        task = f"{_prompt_result.context_injection}\n\n{task}"
+
+    # 显式「记住：...」同步写入记忆
+    try:
+        from mokioclaw.memory.auto_memory import maybe_write_explicit_memory, trigger_autodream_if_needed
+        mem_result = maybe_write_explicit_memory(workspace, task)
+        if mem_result and mem_result.get("ok"):
+            yield {
+                "type": "custom_event",
+                "event": {"type": "memory_write", "path": mem_result.get("path"), "name": mem_result.get("name")},
+            }
+        trigger_autodream_if_needed(workspace)
+    except Exception as exc:
+        logger.debug("auto memory hook skipped: %s", exc)
 
     turn = append_user_turn(session, task)
     save_session(workspace, session)
@@ -259,6 +419,7 @@ def stream_session_events(
         session=session,
         turn=turn,
         session_context=session_context,
+        thinking_instruction=thinking_instruction,
     )
     final_answer = ""
     for event in workflow_events:
@@ -268,6 +429,17 @@ def stream_session_events(
     append_assistant_turn(session, turn=turn, route="workflow", content=final_answer, summary=final_answer)
     save_session(workspace, session)
     yield {"type": "custom_event", "event": session_turn_saved_event(workspace, session, turn=turn, route="workflow")}
+
+    # 后台记忆提取（不阻塞）
+    try:
+        from mokioclaw.memory.auto_memory import trigger_background_extraction
+        trigger_background_extraction(
+            workspace,
+            new_messages=[f"user: {task}", f"assistant: {final_answer}"],
+            session_id=str(session.get("session_id", "")),
+        )
+    except Exception as exc:
+        logger.debug("background extraction skipped: %s", exc)
 
 
 def _stream_complex_workflow(
@@ -283,8 +455,10 @@ def _stream_complex_workflow(
     session: dict[str, Any] | None = None,
     turn: int | None = None,
     session_context: str = "",
+    thinking_instruction: str = "",
 ) -> Iterator[dict[str, Any]]:
     resume_path = resume_workspace.expanduser() if resume_workspace is not None else None
+    # TUI 多轮：每 turn 重建 runtime，但不重复 SessionStart
     state = create_runtime(
         workspace,
         approval_mode=approval_mode,
@@ -292,7 +466,27 @@ def _stream_complex_workflow(
         checkpoint_mode=checkpoint_mode,
         resume_from=resume_path,
         trace_mode=trace_mode,
+        fire_session_start=False,
     )
+    if thinking_instruction:
+        state.thinking_instruction = thinking_instruction
+    _apply_workspace_runtime_flags(state)
+
+    # 会话级 SessionStart：整段 session 只触发一次
+    if session is not None and not session.get("_session_hooks_started"):
+        fire_session_hook(
+            state.hook_runner,
+            HookEvent.SessionStart,
+            workspace=str(state.workspace),
+            session_id=str(session.get("session_id", "")),
+        )
+        session["_session_hooks_started"] = True
+        session.pop("_session_hooks_ended", None)
+        try:
+            save_session(workspace, session)
+        except Exception:
+            pass
+
     # 每个新任务重置 PromptBuilder，确保使用当前 workspace 的配置
     reset_prompt_builder()
     workflow = build_complex_workflow()
@@ -377,6 +571,11 @@ def _stream_complex_workflow(
         return
 
     cleanup_background_processes()
+    fire_stop_hook(
+        state.hook_runner,
+        workspace=str(state.workspace),
+        session_id=str((session or {}).get("session_id", "")),
+    )
     saved = manager.save(current_state, status="finished", latest_node=latest_node)
     if saved:
         trace.record_custom_event(saved)
@@ -384,6 +583,67 @@ def _stream_complex_workflow(
     trace_event = trace.end(status="finished", latest_node=latest_node, final_state=current_state)
     if trace_event:
         yield {"type": "custom_event", "event": trace_event}
+
+
+def end_persistent_session_hooks(workspace: Path | None) -> None:
+    """TUI / 多轮会话结束时触发 SessionEnd（仅当曾发过 SessionStart）
+
+    在 /new、TUI 退出时调用；单次 CLI 流式任务仍由 stream_agent_events 自行收尾。
+    """
+    if workspace is None:
+        return
+    workspace = workspace.expanduser()
+    try:
+        from mokioclaw.reliability.session import load_or_create_session, session_file
+
+        if not session_file(workspace).exists():
+            return
+        session = load_or_create_session(workspace)
+    except Exception as exc:
+        logger.debug("session load for SessionEnd skipped: %s", exc)
+        return
+
+    if not session.get("_session_hooks_started") or session.get("_session_hooks_ended"):
+        return
+
+    from mokioclaw.core.hooks import HookRunner
+
+    runner = HookRunner()
+    try:
+        load_hooks_into_runner(runner, workspace)
+    except Exception as exc:
+        logger.debug("hook load for SessionEnd skipped: %s", exc)
+
+    fire_session_hook(
+        runner,
+        HookEvent.SessionEnd,
+        workspace=str(workspace),
+        session_id=str(session.get("session_id", "")),
+    )
+    session["_session_hooks_ended"] = True
+    session["_session_hooks_started"] = False
+    try:
+        save_session(workspace, session)
+    except Exception as exc:
+        logger.debug("session save after SessionEnd skipped: %s", exc)
+
+
+def _apply_workspace_runtime_flags(runtime: RuntimeState) -> None:
+    """读取 workspace 下的 mode / compact 标记文件"""
+    root = runtime.workspace / ".mokioclaw"
+    mode_file = root / "agent_mode"
+    if mode_file.exists():
+        try:
+            runtime.agent_mode = mode_file.read_text(encoding="utf-8").strip() or runtime.agent_mode
+        except OSError:
+            pass
+    compact_flag = root / "force_compact.flag"
+    if compact_flag.exists():
+        runtime.force_compact = True
+        try:
+            compact_flag.unlink()
+        except OSError:
+            pass
 
 
 def _env_int(name: str, default: int) -> int:

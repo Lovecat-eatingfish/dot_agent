@@ -126,8 +126,8 @@ def test_intent_router_routes_chat_with_model_json(monkeypatch) -> None:
     result = intent_router_node({"task": "你好"})
 
     assert result["intent_route"] == "chat"
-    assert result["intent_reason"] == "greeting"
-    assert result["intent_confidence"] == 0.92
+    assert result["intent_reason"] == "matched casual greeting/help pattern"
+    assert result["intent_confidence"] == 0.95
     assert intent_route_fn(result) == "chat_responder"
 
 
@@ -144,17 +144,12 @@ def test_intent_router_routes_workflow_with_model_json(monkeypatch) -> None:
     assert intent_route_fn(result) == "planner"
 
 
-def test_intent_router_invalid_json_defaults_to_workflow(monkeypatch) -> None:
-    class FakeModel:
-        def invoke(self, messages):
-            return AIMessage(content="not json")
-
-    monkeypatch.setattr("mokioclaw.orchestration.nodes.create_model", lambda: FakeModel())
-
+def test_intent_router_heuristic_short_chat() -> None:
+    # 启发式（默认路径）：短闲聊 → chat
     result = intent_router_node({"task": "你好"})
 
-    assert result["intent_route"] == "workflow"
-    assert intent_route_fn(result) == "planner"
+    assert result["intent_route"] == "chat"
+    assert intent_route_fn(result) == "chat_responder"
 
 
 def test_chat_responder_node_returns_chat_response(monkeypatch) -> None:
@@ -361,7 +356,9 @@ def test_layered_memory_splits_rules_working_and_history(tmp_path: Path) -> None
         node="planner",
     )
 
-    assert set(memory) == {"rules", "working_memory", "history_summary_store"}
+    assert {"rules", "working_memory", "history_summary_store"}.issubset(set(memory))
+    # topic_index 是 MEMORY.md 渐进披露层（可选存在）
+    assert "topic_index" in memory
     assert memory["rules"]["scope"] == "workspace"
     assert memory["working_memory"]["task"] == "demo"
     assert memory["working_memory"]["todos"][0]["content"] == "write"

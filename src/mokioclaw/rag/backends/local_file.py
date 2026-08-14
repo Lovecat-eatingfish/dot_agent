@@ -81,8 +81,8 @@ class LocalFileBackend:
                 p.doc_id = doc_id
         # 当前版本 → 新版本号
         new_version = self._current_version(doc_id) + 1
-        # 旧版本逻辑删除（Chroma metadata update + parent JSON 标记）
-        self._mark_old_versions_deleted(doc_id, new_version)
+        # 旧版本逻辑删除：Chroma 用 raw_doc_id 查询（旧记录存的是原始值），parent JSON 用 safe_doc_id
+        self._mark_old_versions_deleted(raw_doc_id, doc_id, new_version)
 
         # parents 为空：退化模式，用每个 child 自身当 parent
         if not parents:
@@ -207,24 +207,26 @@ class LocalFileBackend:
         """逻辑删除：标记 Chroma 记录 deleted=True + parent JSON deleted=True"""
         if not doc_id:
             return
-        # Chroma：按 doc_id 过滤更新 metadata
-        try:
-            col = self._vectorstore._collection
-            existing = col.get(where={"doc_id": doc_id}, include=["metadatas"])
-            ids = existing.get("ids", [])
-            metas = existing.get("metadatas", [])
-            if ids:
-                new_metas = [
-                    {**(m or {}), "deleted": True} for m in metas
-                ]
-                col.update(ids=ids, metadatas=new_metas)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("rag delete_doc chroma '%s' failed: %s", doc_id, exc)
-        # parent JSON：标记 deleted
-        records = self._read_parents(doc_id)
+        safe_doc_id = sanitize_doc_id(doc_id)
+        # Chroma: 兼容 raw 和 sanitized doc_id
+        for query_id in (doc_id, safe_doc_id) if doc_id != safe_doc_id else (doc_id,):
+            try:
+                col = self._vectorstore._collection
+                existing = col.get(where={"doc_id": query_id}, include=["metadatas"])
+                ids = existing.get("ids", [])
+                metas = existing.get("metadatas", [])
+                if ids:
+                    new_metas = [
+                        {**(m or {}), "deleted": True} for m in metas
+                    ]
+                    col.update(ids=ids, metadatas=new_metas)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("rag delete_doc chroma '%s' failed: %s", query_id, exc)
+        # parent JSON：使用 sanitized doc_id 路径
+        records = self._read_parents(safe_doc_id)
         for p in records:
             p.deleted = True
-        self._write_parent_records(doc_id, records, mark_deleted=True)
+        self._write_parent_records(safe_doc_id, records, mark_deleted=True)
 
     def list_docs(self) -> list[DocRecord]:
         """列出未删除文档（按 doc_id 聚合，返回当前 version）"""
@@ -293,11 +295,15 @@ class LocalFileBackend:
             return 0
         return max((p.version for p in records), default=0)
 
-    def _mark_old_versions_deleted(self, doc_id: str, new_version: int) -> None:
-        """逻辑删除同 doc_id 的旧版本（Chroma metadata update）"""
+    def _mark_old_versions_deleted(self, raw_doc_id: str, safe_doc_id: str, new_version: int) -> None:
+        """逻辑删除同 doc_id 的旧版本（Chroma metadata update + parent JSON 标记）
+
+        raw_doc_id: 用于 Chroma 查询（旧记录存的是未 sanitize 的值）
+        safe_doc_id: 用于 parent JSON 路径（已 sanitize）
+        """
         try:
             col = self._vectorstore._collection
-            existing = col.get(where={"doc_id": doc_id}, include=["metadatas"])
+            existing = col.get(where={"doc_id": raw_doc_id}, include=["metadatas"])
             ids = existing.get("ids", [])
             metas = existing.get("metadatas", [])
             if ids:
@@ -306,17 +312,17 @@ class LocalFileBackend:
                 ]
                 col.update(ids=ids, metadatas=new_metas)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("rag mark_old_versions '%s' failed: %s", doc_id, exc)
+            logger.debug("rag mark_old_versions '%s' failed: %s", raw_doc_id, exc)
         # parent JSON 旧记录也标记 deleted
-        records = self._read_parents(doc_id)
+        records = self._read_parents(safe_doc_id)
         for p in records:
             p.deleted = True
         if records:
-            self._write_parent_records(doc_id, records, mark_deleted=False)
+            self._write_parent_records(safe_doc_id, records, mark_deleted=False)
 
     def _parents_path(self, doc_id: str) -> Path:
-        safe = sanitize_doc_id(doc_id)
-        path = (self._parents_dir / f"{safe}.json").resolve()
+        """将已 sanitize 的 doc_id 转为 parent JSON 路径（调用方保证 doc_id 已净化）"""
+        path = (self._parents_dir / f"{doc_id}.json").resolve()
         # 双重保险：必须仍在 parents_dir 下
         parents_root = self._parents_dir.resolve()
         if not str(path).startswith(str(parents_root)) or path.parent != parents_root:

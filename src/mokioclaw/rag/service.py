@@ -26,14 +26,19 @@ from typing import Any
 from mokioclaw.core.log import get_logger
 from mokioclaw.core.paths import default_rag_dir, find_project_root
 from mokioclaw.rag.loader import load_file, load_text, load_url
+from mokioclaw.rag.security import sanitize_doc_id
 from mokioclaw.rag.splitter import Chunk, StructureAwareSplitter
 from mokioclaw.rag.store import ChromaStore
 
 logger = get_logger(__name__)
 
+# 上传限制
+_MAX_UPLOAD_BYTES = int(os.getenv("RAG_MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))  # 20MB
+_ALLOWED_UPLOAD_SUFFIX = frozenset({".md", ".txt", ".pdf", ".markdown", ".rst", ".html", ".htm"})
+
 
 # ===== 请求/响应模型（模块级，供 FastAPI 正确解析参数签名）=====
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class TextIngest(BaseModel):
@@ -49,7 +54,7 @@ class UrlIngest(BaseModel):
 
 class QueryIn(BaseModel):
     query: str
-    k: int = 5
+    k: int = Field(default=5, ge=1, le=50)
     filter: dict[str, Any] | None = None
     # 高级 RAG 开关（默认关，opt-in）
     rewrite: bool = False        # query 改写（multi-query/hyde/step-back）
@@ -61,9 +66,9 @@ class QueryIn(BaseModel):
 class SplitPreviewIn(BaseModel):
     content: str
     source: str = "preview"
-    parent_size: int = 2000
-    child_size: int = 500
-    child_overlap: int = 80
+    parent_size: int = Field(default=2000, ge=100, le=20000)
+    child_size: int = Field(default=500, ge=50, le=10000)
+    child_overlap: int = Field(default=80, ge=0, le=2000)
 
 
 def create_app(
@@ -80,12 +85,12 @@ def create_app(
         retriever: 混合检索器（测试可注入）。None 时用 HybridRetriever。
         cache: 语义缓存（测试可注入）。None 时用 LocalFileCache。
     """
-    from fastapi import FastAPI, UploadFile
+    from fastapi import FastAPI, Header, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.staticfiles import StaticFiles
     from fastapi.responses import JSONResponse
 
-    app = FastAPI(title="MokioClaw RAG", version="0.4.0")
+    app = FastAPI(title="MokioClaw RAG", version="0.4.1")
 
     # CORS：开发时前端跑在 vite dev server (5173) 调后端 8000
     app.add_middleware(
@@ -94,6 +99,24 @@ def create_app(
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # 可选 API Token：设置 RAG_API_TOKEN 后，除 /health 外需 Header: X-RAG-Token
+    _api_token = os.getenv("RAG_API_TOKEN", "").strip()
+
+    @app.middleware("http")
+    async def _auth_middleware(request, call_next):  # type: ignore[no-untyped-def]
+        if not _api_token:
+            return await call_next(request)
+        path = request.url.path or ""
+        if path in {"/health", "/docs", "/openapi.json", "/redoc"} or path.startswith("/assets"):
+            return await call_next(request)
+        # 静态前端页面 + 根路径：仅放行明确安全的 GET 路径（正向允许列表）
+        if request.method == "GET" and (path in {"/"} or path.startswith("/assets")):
+            return await call_next(request)
+        token = request.headers.get("X-RAG-Token") or request.headers.get("x-rag-token") or ""
+        if token != _api_token:
+            return JSONResponse(status_code=401, content={"ok": False, "error": "unauthorized"})
+        return await call_next(request)
 
     _store = store
     _splitter = splitter
@@ -156,31 +179,56 @@ def create_app(
 
     @app.post("/ingest/text")
     def ingest_text(body: TextIngest) -> dict[str, Any]:
-        doc_id = body.doc_id or f"text:{hash(body.content) & 0xFFFFFFFF:08x}"
+        raw_id = body.doc_id or f"text:{hash(body.content) & 0xFFFFFFFF:08x}"
+        doc_id = sanitize_doc_id(raw_id)
         pages = load_text(body.content)
         count = _ingest_pages(pages, source=body.source, doc_id=doc_id)
         return {"ok": True, "doc_id": doc_id, "chunks": count}
 
     @app.post("/ingest/url")
     def ingest_url(body: UrlIngest) -> dict[str, Any]:
-        doc_id = body.doc_id or f"url:{body.url}"
+        raw_id = body.doc_id or f"url:{body.url}"
+        doc_id = sanitize_doc_id(raw_id)
         pages = load_url(body.url)
         if not pages:
-            return {"ok": False, "error": "failed to fetch url", "doc_id": doc_id, "chunks": 0}
+            return {"ok": False, "error": "failed to fetch url (blocked or unreachable)", "doc_id": doc_id, "chunks": 0}
         count = _ingest_pages(pages, source=body.url, doc_id=doc_id)
         return {"ok": True, "doc_id": doc_id, "chunks": count}
 
     @app.post("/ingest/file")
     async def ingest_file(file: UploadFile) -> dict[str, Any]:
-        # 保存到临时文件再解析（pdf 需文件路径）
         import tempfile
-        suffix = os.path.splitext(file.filename or "")[1]
-        doc_id = f"file:{file.filename or 'upload'}"
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-            tmp.write(await file.read())
+        filename = file.filename or "upload"
+        suffix = os.path.splitext(filename)[1].lower()
+        if suffix and suffix not in _ALLOWED_UPLOAD_SUFFIX:
+            return {
+                "ok": False,
+                "error": f"unsupported file type: {suffix}",
+                "doc_id": "",
+                "chunks": 0,
+            }
+        doc_id = sanitize_doc_id(f"file:{filename}")
+        # 限流读入，防止超大上传
+        chunks_buf: list[bytes] = []
+        total = 0
+        while True:
+            piece = await file.read(1024 * 1024)
+            if not piece:
+                break
+            total += len(piece)
+            if total > _MAX_UPLOAD_BYTES:
+                return {
+                    "ok": False,
+                    "error": f"file too large (max {_MAX_UPLOAD_BYTES} bytes)",
+                    "doc_id": doc_id,
+                    "chunks": 0,
+                }
+            chunks_buf.append(piece)
+        data = b"".join(chunks_buf)
+        with tempfile.NamedTemporaryFile(suffix=suffix or ".txt", delete=False) as tmp:
+            tmp.write(data)
             tmp_path = tmp.name
         try:
-            from pathlib import Path
             pages = load_file(Path(tmp_path))
         finally:
             try:
@@ -189,8 +237,8 @@ def create_app(
                 pass
         if not pages:
             return {"ok": False, "error": "empty or unsupported file", "doc_id": doc_id, "chunks": 0}
-        count = _ingest_pages(pages, source=file.filename or "upload", doc_id=doc_id)
-        return {"ok": True, "doc_id": doc_id, "chunks": count, "source": file.filename}
+        count = _ingest_pages(pages, source=filename, doc_id=doc_id)
+        return {"ok": True, "doc_id": doc_id, "chunks": count, "source": filename}
 
     @app.post("/query")
     def query(body: QueryIn) -> dict[str, Any]:
@@ -204,11 +252,23 @@ def create_app(
             retriever.top_k = body.k
 
             # 0. 语义缓存查（generate_answer 时才有答案可缓存）
-            if body.use_cache and body.generate_answer:
+            # filter 非空时禁用缓存，避免串答案；cache_key 纳入 k/开关
+            from mokioclaw.rag.cache import make_cache_key
+
+            cache_key = make_cache_key(
+                body.query,
+                k=body.k,
+                filter=body.filter,
+                rewrite=body.rewrite,
+                self_query=body.self_query,
+                generate_answer=body.generate_answer,
+            )
+            allow_cache = body.use_cache and body.generate_answer and not body.filter
+            if allow_cache:
                 try:
                     cache = _get_cache()
                     q_emb = store.embedder.embed_query(body.query)
-                    hit = cache.get(body.query, q_emb)
+                    hit = cache.get(body.query, q_emb, cache_key=cache_key)
                     if hit is not None:
                         trace.record("cache_hit")
                         trace.save()
@@ -246,7 +306,6 @@ def create_app(
                     trace.mark_degraded("self_query_failed")
 
             # 3. 多路检索（query 改写时对每个 query 检索后合并）
-            from mokioclaw.rag.retrieval import rrf_fuse
             from mokioclaw.rag.types import ParentChunk
             all_parents: list[ParentChunk] = []
             seen_pids: set[str] = set()
@@ -262,7 +321,10 @@ def create_app(
             reranker = getattr(retriever, "reranker", None)
             if reranker is not None and reranker.available and all_parents:
                 all_parents = reranker.rerank(body.query, all_parents, top_n=body.k)
-                trace.record("rerank", hits=len(all_parents))
+                stub = bool(getattr(reranker, "_stub_mode", False))
+                trace.record("rerank", hits=len(all_parents), stub=stub)
+                if stub:
+                    trace.mark_degraded("reranker_lexical_stub")
             elif reranker is not None:
                 trace.mark_degraded("reranker_unavailable")
 
@@ -296,7 +358,7 @@ def create_app(
                     trace.mark_degraded(f"guardrail:{guard.reason}")
 
                 # 9. 写缓存
-                if body.use_cache:
+                if allow_cache:
                     try:
                         from mokioclaw.rag.cache import CacheEntry
                         import time
@@ -308,6 +370,7 @@ def create_app(
                             created_at=time.time(),
                             ttl=3600,
                             citations=citations,
+                            cache_key=cache_key,
                         ))
                         trace.record("cache_put")
                     except Exception as exc:  # noqa: BLE001
@@ -343,8 +406,9 @@ def create_app(
 
     @app.delete("/documents/{doc_id}")
     def delete_doc(doc_id: str) -> dict[str, Any]:
-        _get_store().delete_doc(doc_id)
-        return {"ok": True, "doc_id": doc_id}
+        safe_id = sanitize_doc_id(doc_id)
+        _get_store().delete_doc(safe_id)
+        return {"ok": True, "doc_id": safe_id}
 
     @app.post("/cache/clear")
     def clear_cache() -> dict[str, Any]:

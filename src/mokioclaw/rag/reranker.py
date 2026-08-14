@@ -37,13 +37,28 @@ class Reranker:
         self._model_path = path.strip() if path else ""
         self._tokenizer = tokenizer
         self._session: Any = None
-        self._available = bool(self._model_path) and os.path.isfile(self._model_path)
-        if self._available:
+        # 真实 ONNX cross-encoder 输入适配尚未实现：即使配置了模型文件，
+        # 也不得声称 available（避免静默用 token-overlap 冒充精排）。
+        # 需要真实推理时设置 RAG_RERANKER_STUB=1 显式启用 lexical stub（仅调试）。
+        self._stub_mode = os.getenv("RAG_RERANKER_STUB", "").strip() in {"1", "true", "yes"}
+        has_file = bool(self._model_path) and os.path.isfile(self._model_path)
+        self._available = False
+        if has_file and self._stub_mode:
             try:
                 self._load()
+                self._available = self._session is not None
+                logger.warning(
+                    "rag reranker running in LEXICAL STUB mode (RAG_RERANKER_STUB=1); "
+                    "not real cross-encoder inference"
+                )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("rag reranker load failed, will degrade: %s", exc)
                 self._available = False
+        elif has_file and not self._stub_mode:
+            logger.info(
+                "rag reranker model configured but real ONNX scoring not implemented; "
+                "set RAG_RERANKER_STUB=1 to force lexical stub, or leave disabled"
+            )
         else:
             logger.info("rag reranker disabled (set RAG_RERANKER_MODEL to enable)")
 

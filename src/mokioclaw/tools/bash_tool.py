@@ -271,12 +271,13 @@ def _handle_tail_command(state: RuntimeState, command: str) -> BashResult | None
 def _handle_workspace_query(state: RuntimeState, command: str) -> BashResult | None:
     if not re.fullmatch(r"\s*(?:cd|pwd)\s*", command, flags=re.IGNORECASE):
         return None
+    cwd = _effective_cwd(state)
     return {
         "ok": True,
         "timed_out": False,
         "command": command.strip() or "cd",
         "exit_code": 0,
-        "stdout": f"{state.workspace}\n",
+        "stdout": f"{cwd}\n",
         "stderr": "",
         "duration_ms": 0,
     }
@@ -377,6 +378,29 @@ def run_bash(
     if blocked:
         return {"ok": False, "error": f"blocked potentially dangerous command pattern: {blocked}"}
 
+    # 纯 cd → contextModifier，不真正起 shell（对齐 Claude Code cwd 更新）
+    from mokioclaw.core.context_modifier import extract_cd_modifier
+
+    cd_mod = extract_cd_modifier(normalized_command, state)
+    if cd_mod is not None:
+        return {
+            "ok": True,
+            "timed_out": False,
+            "command": normalized_command,
+            "exit_code": 0,
+            "stdout": f"cwd -> {cd_mod['cwd']}\n",
+            "stderr": "",
+            "duration_ms": 0,
+            "_context_modifier": cd_mod,
+        }
+
+    # 沙箱（与权限正交）：工作区外绝对路径直接拒绝
+    from mokioclaw.security.sandbox import check_sandbox, sandbox_env_overrides
+
+    sandbox_block = check_sandbox(state, normalized_command)
+    if sandbox_block:
+        return {"ok": False, "error": sandbox_block, "sandboxed": True}
+
     approval = _resolve_approval(state, normalized_command)
     if approval is not None and not approval.get("approved"):
         return approval
@@ -385,13 +409,15 @@ def run_bash(
     env, env_error = _build_env(state)
     if env_error is not None:
         return {"ok": False, "error": env_error}
+    env = sandbox_env_overrides(env)
     max_output_chars = _state_int(state, "bash_max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
+    bash_cwd = _effective_cwd(state)
     if background:
         return _run_background(state, normalized_command, env, approval)
     try:
         completed = subprocess.run(
             normalized_command,
-            cwd=state.workspace,
+            cwd=bash_cwd,
             shell=True,
             capture_output=True,
             timeout=timeout,
@@ -417,6 +443,18 @@ def run_bash(
         "duration_ms": round((time.perf_counter() - started) * 1000),
         **(approval or {}),
     }
+
+
+def _effective_cwd(state: RuntimeState) -> Path:
+    cwd = getattr(state, "cwd", None)
+    if cwd is not None:
+        try:
+            path = Path(cwd)
+            if path.is_dir():
+                return path
+        except OSError:
+            pass
+    return state.workspace
 
 
 # ========== 只读 BashTool 白名单 ==========
@@ -530,6 +568,39 @@ def _resolve_approval(state: RuntimeState, command: str) -> BashResult | None:
         "command": command,
     }
     if state.approval_mode == "auto":
+        # 对齐 Claude Code auto 模式：开启分类器时未知命令走两段式评估，
+        # 否则保持旧的「自动批准」行为
+        from mokioclaw.security.classifier import ClassifierDecision, classifier_enabled, classify_tool_call
+
+        if classifier_enabled():
+            decision, reason = classify_tool_call("BashTool", {"command": command})
+            if decision is ClassifierDecision.ALLOW:
+                return {**base, "approved": True, "classifier": reason}
+            if decision is ClassifierDecision.DENY:
+                return {
+                    **base,
+                    "ok": False,
+                    "approved": False,
+                    "error": f"auto classifier denied: {reason}",
+                }
+            # ASK：有人工 handler 则询问，否则拒绝
+            if state.approval_handler is not None:
+                decision_obj = state.approval_handler(request)
+                approved = decision_obj.approved if isinstance(decision_obj, ApprovalDecision) else bool(decision_obj)
+                if approved:
+                    return {**base, "approved": True}
+                return {
+                    **base,
+                    "ok": False,
+                    "approved": False,
+                    "error": f"human rejected high-risk command: {risk_reason}",
+                }
+            return {
+                **base,
+                "ok": False,
+                "approved": False,
+                "error": f"classifier unsure and no approval handler: {reason}",
+            }
         return {**base, "approved": True}
     if state.approval_mode == "deny" or state.approval_handler is None:
         return {
@@ -574,6 +645,10 @@ def _build_env(state: RuntimeState) -> tuple[dict[str, str], str | None]:
             env.update(_parse_env_file(env_file, env))
         except OSError as exc:
             return env, f"failed to read bash env file {env_file}: {exc}"
+    # contextModifier 注入的额外环境变量
+    extra = getattr(state, "extra_env", None)
+    if isinstance(extra, dict):
+        env.update({str(k): str(v) for k, v in extra.items()})
     # env file may have overwritten PATH; re-prepend harness paths so they stay first
     _prepend_harness_paths(state, env)
     return env, None
@@ -713,7 +788,7 @@ def _run_background(
     try:
         process = subprocess.Popen(
             command,
-            cwd=state.workspace,
+            cwd=_effective_cwd(state),
             shell=True,
             stdout=stdout_handle,
             stderr=stderr_handle,

@@ -36,9 +36,11 @@ logger = get_logger(__name__)
 _GLOBAL_DIR = Path.home() / ".mokioclaw"
 _GLOBAL_CONFIG = _GLOBAL_DIR / "CLAUDE.md"
 
-# 项目级配置文件名
+# 项目级配置文件名（.mokioclaw/config.md 或项目根 CLAUDE.md / CLAUDE.local.md）
 _PROJECT_CONFIG_NAME = "config.md"
 _PROJECT_CONFIG_DIR = ".mokioclaw"
+_PROJECT_CLAUDE_MD = "CLAUDE.md"
+_PROJECT_CLAUDE_LOCAL = "CLAUDE.local.md"
 
 
 @dataclass
@@ -49,6 +51,7 @@ class UserConfig:
     """
     # --- 行为配置 ---
     approval_mode: str = "inline"
+    agent_mode: str = "auto"  # auto | plan | approve | edit
     checkpoint_mode: str = "light"
     trace_mode: str = "on"
 
@@ -121,6 +124,22 @@ def load_user_config(
         except Exception as exc:
             logger.debug("project config load skipped (%s): %s", project_path, exc)
 
+    # 3. 项目根 CLAUDE.md / CLAUDE.local.md（对齐 Claude Code 记忆层级）
+    if workspace is not None:
+        for name in (_PROJECT_CLAUDE_MD, _PROJECT_CLAUDE_LOCAL):
+            claude_md = workspace / name
+            if claude_md.exists():
+                try:
+                    frontmatter, body = _parse_markdown_with_frontmatter(claude_md)
+                    _apply_frontmatter(config, frontmatter)
+                    if body.strip():
+                        config.custom_instructions = _merge_instructions(
+                            config.custom_instructions, body
+                        )
+                    sources.append(f"{name}:{claude_md}")
+                except Exception as exc:
+                    logger.debug("%s load skipped (%s): %s", name, claude_md, exc)
+
     config.config_sources = sources
     return config
 
@@ -187,6 +206,8 @@ def _apply_frontmatter(config: UserConfig, frontmatter: dict[str, Any]) -> None:
     # 已知字段映射
     field_map = {
         "approval_mode": "approval_mode",
+        "agent_mode": "agent_mode",
+        "mode": "agent_mode",
         "checkpoint_mode": "checkpoint_mode",
         "trace_mode": "trace_mode",
         "bash_timeout": "bash_default_timeout_seconds",

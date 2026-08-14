@@ -51,6 +51,16 @@ def _strip_workspace_prefix(file_path: str) -> str:
     return normalized
 
 
+def decode_text_lossy(data: bytes) -> str:
+    """容错解码文本，自动尝试多种编码"""
+    for encoding in TEXT_ENCODINGS:
+        try:
+            return data.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
 def read_text_lossy(path: Path) -> str:
     """容错读取文本文件，自动尝试多种编码
 
@@ -62,15 +72,7 @@ def read_text_lossy(path: Path) -> str:
     Returns:
         文件内容字符串
     """
-    last_error: UnicodeDecodeError | None = None
-    for encoding in TEXT_ENCODINGS:
-        try:
-            return path.read_text(encoding=encoding)
-        except UnicodeDecodeError as exc:
-            last_error = exc
-    if last_error is not None:
-        return path.read_text(encoding="utf-8", errors="replace")
-    return path.read_text(encoding="utf-8")
+    return decode_text_lossy(path.read_bytes())
 
 
 def resolve_workspace_path(state: RuntimeState, file_path: str, operation: str = "read") -> Path:
@@ -218,12 +220,14 @@ def read_file(
     if limit_value <= 0:
         return {"ok": False, "error": "limit must be > 0"}
 
-    text = read_text_lossy(path)
+    raw = path.read_bytes()
+    text = decode_text_lossy(raw)
     lines = text.splitlines()
     limit_value = min(limit_value, MAX_READ_LINES)
     selected = lines[offset_value : offset_value + limit_value]
     complete = offset_value == 0 and len(selected) == len(lines)
-    state.record_read(path, complete=complete)
+    # 传入原始字节做 hash，与 is_file_modified 的 read_bytes 对齐
+    state.record_read(path, complete=complete, content=raw)
 
     numbered = "\n".join(f"{offset_value + idx + 1}: {line}" for idx, line in enumerate(selected))
     return {
@@ -279,7 +283,15 @@ def write_file(state: RuntimeState, file_path: str, content: str) -> FileWriteRe
         snapshot = state.snapshot_for(path)
         if snapshot is None:
             return {"ok": False, "error": "file has not been read yet. Read it before overwriting."}
-        if path.stat().st_mtime_ns != snapshot.mtime_ns:
+        if not snapshot.complete:
+            return {
+                "ok": False,
+                "error": (
+                    "file was only partially read (offset/limit). "
+                    "Read the full file before overwriting."
+                ),
+            }
+        if state.is_file_modified(path):
             return {"ok": False, "error": "file changed after it was read. Read it again before writing."}
         original = read_text_lossy(path)
     else:
@@ -287,6 +299,7 @@ def write_file(state: RuntimeState, file_path: str, content: str) -> FileWriteRe
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
+    # 写后按磁盘字节建快照（避免 str→utf-8 与平台换行不一致）
     state.record_read(path, complete=True)
 
     diff = "\n".join(
@@ -350,7 +363,15 @@ def edit_file(state: RuntimeState, file_path: str, old_text: str, new_text: str)
     snapshot = state.snapshot_for(path)
     if snapshot is None:
         return {"ok": False, "error": "file has not been read yet. Read it before editing."}
-    if path.stat().st_mtime_ns != snapshot.mtime_ns:
+    if not snapshot.complete:
+        return {
+            "ok": False,
+            "error": (
+                "file was only partially read (offset/limit). "
+                "Read the full file before editing."
+            ),
+        }
+    if state.is_file_modified(path):
         return {"ok": False, "error": "file changed after it was read. Read it again before editing."}
     if not old_text:
         return {"ok": False, "error": "old_text must not be empty"}

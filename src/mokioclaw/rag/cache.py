@@ -37,12 +37,20 @@ class CacheEntry:
     created_at: float  # unix timestamp
     ttl: int
     citations: list[dict[str, Any]] = field(default_factory=list)
+    # 缓存维度：防止同 query 不同 filter/k/开关串答案
+    cache_key: str = ""
 
 
 class CacheBackend(Protocol):
     """缓存后端抽象（可换 Redis/Memcached）"""
 
-    def get(self, query: str, query_embedding: list[float]) -> CacheEntry | None:
+    def get(
+        self,
+        query: str,
+        query_embedding: list[float],
+        *,
+        cache_key: str = "",
+    ) -> CacheEntry | None:
         """精确或语义命中返回条目，否则 None"""
         ...
 
@@ -53,6 +61,29 @@ class CacheBackend(Protocol):
     def clear(self) -> int:
         """清空缓存，返回清除条数"""
         ...
+
+
+def make_cache_key(
+    query: str,
+    *,
+    k: int = 5,
+    filter: dict[str, Any] | None = None,
+    rewrite: bool = False,
+    self_query: bool = False,
+    generate_answer: bool = True,
+) -> str:
+    """规范化缓存键（query + 检索/生成参数）"""
+    import json
+
+    payload = {
+        "q": query,
+        "k": int(k),
+        "filter": filter or {},
+        "rewrite": bool(rewrite),
+        "self_query": bool(self_query),
+        "generate_answer": bool(generate_answer),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
 
 
 class LocalFileCache:
@@ -77,26 +108,44 @@ class LocalFileCache:
         self._cache_file = self._cache_dir / "cache.json"
         self._entries: list[CacheEntry] = self._load()
 
-    def get(self, query: str, query_embedding: list[float]) -> CacheEntry | None:
-        """精确命中（query 一致）或语义命中（余弦相似度超阈值）"""
+    def get(
+        self,
+        query: str,
+        query_embedding: list[float],
+        *,
+        cache_key: str = "",
+    ) -> CacheEntry | None:
+        """命中规则：
+        - 提供 cache_key：仅精确匹配 entry.cache_key（防不同 filter/k 串答案）
+        - 未提供 cache_key：兼容旧条目（query 精确 + 无 key 的语义命中）
+        """
         now = time.time()
         for e in self._entries:
-            # TTL 过期跳过
             if now - e.created_at > e.ttl:
                 continue
-            # 精确命中
+            ekey = e.cache_key or ""
+            if cache_key:
+                # 结构化键：必须整键相等，不做跨 key 语义命中
+                if ekey == cache_key:
+                    return e
+                continue
+            # 无 cache_key 调用：仅匹配无结构化键的旧条目
+            if ekey:
+                continue
             if e.query == query:
                 return e
-            # 语义命中
             sim = _cosine(query_embedding, e.embedding)
             if sim >= self.threshold:
                 return e
         return None
 
     def put(self, entry: CacheEntry) -> None:
-        """写入条目（同 query 覆盖旧的）"""
-        # 去重：同 query 替换
-        self._entries = [e for e in self._entries if e.query != entry.query]
+        """写入条目（同 cache_key 覆盖旧的）"""
+        key = entry.cache_key or entry.query
+        self._entries = [
+            e for e in self._entries
+            if (e.cache_key or e.query) != key
+        ]
         self._entries.append(entry)
         # 控制缓存条数（FIFO 淘汰，避免无限增长）
         if len(self._entries) > 1000:
@@ -122,6 +171,7 @@ class LocalFileCache:
                     created_at=e["created_at"],
                     ttl=e.get("ttl", self.ttl),
                     citations=e.get("citations", []),
+                    cache_key=e.get("cache_key", ""),
                 )
                 for e in data.get("entries", [])
             ]
@@ -140,6 +190,7 @@ class LocalFileCache:
                         "created_at": e.created_at,
                         "ttl": e.ttl,
                         "citations": e.citations,
+                        "cache_key": e.cache_key,
                     }
                     for e in self._entries
                 ]
@@ -154,7 +205,13 @@ class LocalFileCache:
 class NoopCache:
     """空缓存（禁用语义缓存时用，所有操作 no-op）"""
 
-    def get(self, query: str, query_embedding: list[float]) -> CacheEntry | None:
+    def get(
+        self,
+        query: str,
+        query_embedding: list[float],
+        *,
+        cache_key: str = "",
+    ) -> CacheEntry | None:
         return None
 
     def put(self, entry: CacheEntry) -> None:

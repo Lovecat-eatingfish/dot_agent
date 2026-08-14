@@ -120,6 +120,11 @@ app = typer.Typer(
     help='mokioclaw: a teaching-first mini CodeAgent. Use `mokioclaw "task"` for Rich output or `mokioclaw tui` for Textual TUI.',
 )
 
+# 挂载 RAG 子命令组（mokioclaw rag serve/stop/status）
+from mokioclaw.rag.cli import rag_app  # noqa: E402
+
+app.add_typer(rag_app, name="rag")
+
 
 def configure_console() -> None:
     """配置标准输出/错误流为 UTF-8 编码。
@@ -174,6 +179,10 @@ def main(
         Literal["inline", "auto", "deny"],
         typer.Option("--approval-mode", help="Human approval mode for high-risk BashTool commands: inline, auto, or deny."),
     ] = "inline",
+    agent_mode: Annotated[
+        Literal["auto", "plan", "approve", "edit"],
+        typer.Option("--agent-mode", help="Agent mode: auto, plan, approve, or edit."),
+    ] = "auto",
     checkpoint_mode: Annotated[
         Literal["light", "strict", "off"],
         typer.Option("--checkpoint-mode", help="Checkpoint mode: light, strict, or off."),
@@ -233,6 +242,7 @@ def main(
             workspace=workspace,
             max_attempts=max_attempts,
             approval_mode=approval_mode,
+            agent_mode=agent_mode,
             approval_handler=approval_handler,
             checkpoint_mode=checkpoint_mode,
             resume_workspace=resume,

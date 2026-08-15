@@ -61,7 +61,7 @@ def load_url(url: str, timeout: float = _DEFAULT_URL_TIMEOUT) -> list[ParsedPage
         return []
 
     req = urllib.request.Request(
-        safe_url,
+        safe_url[0],
         headers={"User-Agent": "mokioclaw-rag/1.0"},
     )
     try:

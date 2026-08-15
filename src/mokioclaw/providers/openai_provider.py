@@ -7,6 +7,7 @@ LLM Provider 模块
 from __future__ import annotations
 
 import os
+import threading
 from typing import Any
 
 import dotenv
@@ -24,30 +25,58 @@ DEFAULT_MAX_RETRIES = 3
 
 # 环境变量缓存，避免每次 create_model() 都重新校验
 _validated_env: dict[str, str] | None = None
+_env_lock = threading.Lock()
 
 
-def _validate_env() -> dict[str, str]:
-    """校验并返回必需的环境变量，只在首次调用时执行"""
+def validate_env() -> dict[str, str]:
+    """校验并返回必需的环境变量，只在首次调用时执行
+
+    使用双重检查锁定模式确保线程安全。
+    """
     global _validated_env
     if _validated_env is not None:
         return _validated_env
 
-    dotenv.load_dotenv()
-    api_key = os.getenv("API_KEY")
-    model = os.getenv("MODEL")
-    base_url = os.getenv("BASE_URL")
+    with _env_lock:
+        if _validated_env is not None:
+            return _validated_env
 
-    missing = [
-        name
-        for name, value in {"API_KEY": api_key, "MODEL": model, "BASE_URL": base_url}.items()
-        if not value
-    ]
-    if missing:
-        raise RuntimeError(f"missing required .env setting(s): {', '.join(missing)}")
+        dotenv.load_dotenv()
+        api_key = os.getenv("API_KEY")
+        model = os.getenv("MODEL")
+        base_url = os.getenv("BASE_URL")
 
-    _validated_env = {"api_key": api_key, "model": model, "base_url": base_url}
-    return _validated_env
+        # 读取嵌入相关变量（可选）
+        embedding_base_url = os.getenv("EMBEDDING_BASE_URL")
+        embedding_api_key = os.getenv("EMBEDDING_API_KEY")
+        embedding_model = os.getenv("EMBEDDING_MODEL")
 
+        # 只校验主模型必须项
+        missing = [
+            name
+            for name, value in {"API_KEY": api_key, "MODEL": model, "BASE_URL": base_url}.items()
+            if not value
+        ]
+        if missing:
+            raise RuntimeError(f"missing required .env setting(s): {', '.join(missing)}")
+
+        # 如果嵌入变量未配置，自动降级为主模型配置（常见于开源网关）
+        if not embedding_base_url:
+            embedding_base_url = base_url
+        if not embedding_api_key:
+            embedding_api_key = api_key
+        if not embedding_model:
+            embedding_model = model  # 或者设置一个默认值如 "text-embedding-3-small"
+
+        _validated_env = {
+            "api_key": api_key,
+            "model": model,
+            "base_url": base_url,
+            "embedding_base_url": embedding_base_url,
+            "embedding_api_key": embedding_api_key,
+            "embedding_model": embedding_model,
+        }
+        return _validated_env
 
 def create_model(
     *,
@@ -65,7 +94,7 @@ def create_model(
     Returns:
         配置好的 ChatOpenAI 实例
     """
-    env = _validate_env()
+    env = validate_env()
 
     timeout = request_timeout or _env_int("MOKIO_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)
     retries = max_retries if max_retries is not None else _env_int("MOKIO_MAX_RETRIES", DEFAULT_MAX_RETRIES)
@@ -137,18 +166,25 @@ def invoke_with_fallback(
                 if _is_bad_request(exc2):
                     # 参数错误，继续降级无意义
                     raise
-                logger.warning("fallback model %s failed: %s", fb_model_name, type(exc2).__name__)
+                logger.error("fallback model %s failed: %s", fb_model_name, type(exc2).__name__, exc_info=True)
                 continue
         raise FallbackTriggeredError(
             f"all models failed (primary + {len(fallback_list)} fallbacks): {last_exc}"
         ) from last_exc
 
 
-def _extract_bound_tools(model: Any) -> list:
-    """从已 bind_tools 的模型实例提取 tools 列表
+def _extract_bound_tools(model: Any) -> list[Any]:
+    """从已绑定工具的模型实例提取工具列表
 
-    LangChain 的 bind_tools 把 tools 存入 model.kwargs['tools']。
-    降级模型需要复用这份 tools 才能发起工具调用。
+    Args:
+        model: 已调用 bind_tools 的模型实例
+
+    Returns:
+        工具列表，如果模型没有绑定工具则返回空列表
+
+    Note:
+        LangChain 的 bind_tools 把工具存储在 model.kwargs['tools'] 中。
+        降级模型需要复用这些工具才能发起工具调用。
     """
     kwargs = getattr(model, "kwargs", None)
     if not isinstance(kwargs, dict):
@@ -180,4 +216,5 @@ def _env_int(name: str, default: int) -> int:
 def reset_env_cache() -> None:
     """重置环境变量缓存（仅用于测试）"""
     global _validated_env
-    _validated_env = None
+    with _env_lock:
+        _validated_env = None

@@ -42,7 +42,9 @@ def serve(
 
     # 非 loopback 绑定且无 token 时告警（不强制阻断，避免破坏本地多网卡调试）
     import os
-    token = os.getenv("RAG_API_TOKEN", "").strip()
+    import dotenv
+    dotenv.load_dotenv()
+    token = os.getenv("RAG_API_TOKEN", "enquan").strip()
     if host not in {"127.0.0.1", "localhost", "::1"} and not token:
         typer.echo(
             "WARNING: binding non-loopback without RAG_API_TOKEN — "

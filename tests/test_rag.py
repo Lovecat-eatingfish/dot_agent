@@ -10,6 +10,7 @@ import pytest
 
 from mokioclaw.rag.splitter import Chunk, StructureAwareSplitter
 from mokioclaw.rag.embedding import FakeEmbedder
+from mokioclaw.rag.security import sanitize_doc_id, validate_fetch_url
 
 
 # ===== 1. Splitter =====
@@ -838,6 +839,128 @@ def test_reranker_not_available_without_stub(monkeypatch: pytest.MonkeyPatch, tm
 
     r = Reranker(model_path=str(model))
     assert r.available is False
+
+
+# ===== 12. 安全修复验证 =====
+
+def test_ssrf_protection():
+    """测试 SSRF 攻击防护"""
+    # 测试内网 IP
+    with pytest.raises(ValueError, match="blocked resolved ip|non-public ip"):
+        validate_fetch_url("http://127.0.0.1/admin")
+
+    with pytest.raises(ValueError, match="blocked host"):
+        validate_fetch_url("http://localhost/secret")
+
+    # 测试 metadata 服务
+    with pytest.raises(ValueError, match="blocked resolved ip|metadata ip not allowed"):
+        validate_fetch_url("http://169.254.169.254/latest/meta-data/")
+
+    # 测试正常的公共 URL
+    url, ips = validate_fetch_url("https://example.com/page")
+    assert url.startswith("https://")
+    assert len(ips) >= 1  # 应该返回解析的 IP 列表
+
+
+def test_validate_fetch_url_returns_ip_list():
+    """验证 validate_fetch_url 返回 IP 列表用于后续验证"""
+    url, ips = validate_fetch_url("https://example.com")
+    assert isinstance(ips, list)
+    assert len(ips) >= 1
+    # 所有 IP 都应该是字符串
+    assert all(isinstance(ip, str) for ip in ips)
+
+
+def test_env_cache_thread_safety():
+    """测试环境变量缓存的线程安全性"""
+    import threading
+    from mokioclaw.providers.openai_provider import validate_env, reset_env_cache
+
+    # 重置缓存
+    reset_env_cache()
+
+    results = []
+    errors = []
+
+    def worker():
+        try:
+            env = validate_env()
+            results.append(env)
+        except Exception as e:
+            errors.append(e)
+
+    # 创建多个线程同时访问
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 所有线程都应该成功获取环境变量
+    assert len(errors) == 0, f"线程安全错误: {errors}"
+    assert len(results) == 10
+
+    # 所有结果应该一致
+    first_result = results[0]
+    for result in results[1:]:
+        assert result == first_result
+
+
+def test_fake_embedder_improved_hash():
+    """测试改进后的 FakeEmbedder 哈希算法"""
+    embedder = FakeEmbedder(dim=128)
+
+    # 相同文本应该产生相同向量
+    text1 = "hello world test"
+    vec1 = embedder.embed_query(text1)
+    vec2 = embedder.embed_query(text1)
+    assert vec1 == vec2
+
+    # 不同文本应该产生不同向量（概率极高）
+    text3 = "different content here"
+    vec3 = embedder.embed_query(text3)
+    assert vec1 != vec3
+
+    # 向量应该正确归一化
+    norm = sum(v * v for v in vec1) ** 0.5
+    assert abs(norm - 1.0) < 0.001  # 允许小的浮点误差
+
+    # 批量嵌入应该一致
+    texts = ["text one", "text two", "text three"]
+    batch_vecs = embedder.embed_texts(texts)
+    assert len(batch_vecs) == len(texts)
+
+    # 批量结果应该与单独结果一致
+    for i, text in enumerate(texts):
+        single_vec = embedder.embed_query(text)
+        batch_vec = batch_vecs[i]
+        assert single_vec == batch_vec
+
+
+def test_sanitize_doc_id_max_length_configurable():
+    """测试 doc_id 最大长度可配置"""
+    import os
+    from mokioclaw.rag.security import sanitize_doc_id
+
+    # 保存原始值
+    original_max = os.getenv("MOKIO_MAX_DOC_ID_LENGTH")
+
+    # 设置新的最大长度
+    os.environ["MOKIO_MAX_DOC_ID_LENGTH"] = "50"
+    # 需要重新加载模块来应用新的环境变量
+    import importlib
+    import mokioclaw.rag.security
+    importlib.reload(mokioclaw.rag.security)
+
+    long_id = "a" * 100  # 100 个字符
+    safe_id = sanitize_doc_id(long_id)
+    assert len(safe_id) <= 50
+
+    # 恢复原始值
+    if original_max is not None:
+        os.environ["MOKIO_MAX_DOC_ID_LENGTH"] = original_max
+    else:
+        os.environ.pop("MOKIO_MAX_DOC_ID_LENGTH", None)
 
 
 if __name__ == "__main__":

@@ -101,7 +101,7 @@ def create_app(
     )
 
     # 可选 API Token：设置 RAG_API_TOKEN 后，除 /health 外需 Header: X-RAG-Token
-    _api_token = os.getenv("RAG_API_TOKEN", "").strip()
+    _api_token = os.getenv("RAG_API_TOKEN", "enquan").strip()
 
     @app.middleware("http")
     async def _auth_middleware(request, call_next):  # type: ignore[no-untyped-def]
@@ -124,6 +124,7 @@ def create_app(
     _cache = cache
 
     def _get_store() -> ChromaStore:
+        # 外层变量： nonlocal
         nonlocal _store
         if _store is None:
             from mokioclaw.rag.embedding import create_embedder

@@ -132,10 +132,10 @@ class DaemonManager:
 
         # 准备输出文件
         out_fh = None
-        if redirect_stdout or redirect_stderr:
-            out_fh = open(self.logfile, "a", encoding="utf-8")
-
         try:
+            if redirect_stdout or redirect_stderr:
+                out_fh = open(self.logfile, "a", encoding="utf-8")
+
             proc = subprocess.Popen(
                 command,
                 env=run_env,
@@ -149,6 +149,11 @@ class DaemonManager:
             if out_fh:
                 out_fh.close()
             raise RuntimeError(f"Failed to start daemon: {exc}") from exc
+        finally:
+            # 启动成功后，文件句柄由子进程管理，这里可以关闭我们的引用
+            # 注意：在 Windows 上不能立即关闭，需要等待子进程启动完成
+            if out_fh and sys.platform != "win32":
+                out_fh.close()
 
         # 写入 pidfile
         self._write_pid(proc.pid)
@@ -193,8 +198,9 @@ class DaemonManager:
                     break
                 time.sleep(0.5)
             else:
-                # 超时，强制杀死
-                _kill_process(pid, force=True)
+                # 超时后先检查进程是否还存在，再强制杀死
+                if _is_process_alive(pid):
+                    _kill_process(pid, force=True)
         except ProcessLookupError:
             pass
         except PermissionError as exc:
@@ -297,12 +303,28 @@ class DaemonManager:
 # 辅助函数
 # ============================================================
 
-def _kill_process(pid: int, force: bool = False) -> None:
-    """终止进程（跨平台）"""
+def _get_platform_signal(force: bool = False) -> int:
+    """获取平台相关的信号
+
+    Args:
+        force: 是否强制终止
+
+    Returns:
+        对应的信号编号
+    """
     if sys.platform == "win32":
-        sig = signal.SIGTERM
-    else:
-        sig = signal.SIGKILL if force else signal.SIGTERM
+        return signal.SIGTERM
+    return signal.SIGKILL if force else signal.SIGTERM
+
+
+def _kill_process(pid: int, force: bool = False) -> None:
+    """终止进程（跨平台）
+
+    Args:
+        pid: 进程 ID
+        force: 是否强制终止
+    """
+    sig = _get_platform_signal(force)
     try:
         os.kill(pid, sig)
     except (ProcessLookupError, PermissionError):
@@ -310,20 +332,40 @@ def _kill_process(pid: int, force: bool = False) -> None:
 
 
 def _is_process_alive(pid: int) -> bool:
-    """检查进程是否存在"""
+    """检查进程是否存在
+
+    Args:
+        pid: 进程 ID
+
+    Returns:
+        进程是否存在
+    """
     try:
         os.kill(pid, 0)
         return True
-    except (ProcessLookupError, PermissionError):
+    except (ProcessLookupError, PermissionError, OSError):
+        # OSError 捕获 WinError 11 等异常
         return False
 
 
 def _now_iso() -> str:
+    """获取当前时间的 ISO 格式字符串
+
+    Returns:
+        UTC 时间的 ISO 格式字符串
+    """
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def get_creation_flags() -> int:
-    """获取 Windows 进程创建标志"""
+    """获取 Windows 进程创建标志
+
+    在 Windows 上使用 CREATE_NO_WINDOW 避免创建控制台窗口，
+    其他平台返回 0。
+
+    Returns:
+        平台相关的进程创建标志
+    """
     if sys.platform == "win32":
         import subprocess
         return subprocess.CREATE_NO_WINDOW  # type: ignore[attr-defined]

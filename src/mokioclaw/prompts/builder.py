@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 from mokioclaw.config.loader import UserConfig, load_user_config
 from mokioclaw.core.log import get_logger
+from mokioclaw.core.paths import project_memory_dir
 from mokioclaw.prompts.agent_prompt import (
     CHAT_RESPONDER_PROMPT,
     CODE_AGENT_PROMPT,
@@ -173,7 +174,8 @@ class PromptBuilder:
             return ""
         try:
             from mokioclaw.memory.topic_store import TopicStore
-            return TopicStore(self._workspace).load_index().strip()
+            project_dir = project_memory_dir()
+            return TopicStore(self._workspace, project_dir=project_dir).load_index().strip()
         except Exception as exc:
             logger.debug("memory index load failed: %s", exc)
             return ""

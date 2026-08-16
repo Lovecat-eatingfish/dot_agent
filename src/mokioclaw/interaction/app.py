@@ -56,6 +56,7 @@ from rich.panel import Panel
 from typer.core import TyperGroup
 
 from mokioclaw.interaction.formatter import print_event, safe_echo, safe_secho
+from mokioclaw.core.utils import utc_now as _utc_now
 from mokioclaw.security.approval import ApprovalDecision, ApprovalRequest
 from mokioclaw.orchestration.agent import stream_agent_events
 from mokioclaw.core.log import get_logger, setup_logging
@@ -192,8 +193,28 @@ def main(
         typer.Option("--trace-mode", help="Trace logging mode: on or off."),
     ] = "on",
     resume: Annotated[
-        Path | None,
-        typer.Option("--resume", help="Resume from an existing MokioClaw workspace."),
+        str | None,
+        typer.Option("--resume", help="Resume session. No arg=latest session, or sessionId (e.g. session-abc123)."),
+    ] = None,
+    continue_session: Annotated[
+        str | None,
+        typer.Option("--continue", help="Continue a session. Alias of --resume."),
+    ] = None,
+    safe_mode: Annotated[
+        bool,
+        typer.Option("--safe-mode", help="Clean start: disable all custom configs, hooks, and auto-memory."),
+    ] = False,
+    worktree: Annotated[
+        bool,
+        typer.Option("--worktree", help="Run in an isolated git worktree."),
+    ] = False,
+    list_sessions: Annotated[
+        bool,
+        typer.Option("--list-sessions", help="List all sessions and exit."),
+    ] = False,
+    rollback: Annotated[
+        int | None,
+        typer.Option("--rollback", help="Rollback to turn N in current session."),
     ] = None,
 ) -> None:
     """
@@ -223,6 +244,67 @@ def main(
     load_dotenv()
     configure_console()
     _install_signal_handlers()
+    utc_stamp = _utc_now().replace(":", "-").replace("+", "").replace("T", "-")[:19]
+
+    # 确定工作区
+    from mokioclaw.core.paths import default_workspace, new_task_workspace
+    workspace_path = workspace or default_workspace()
+    workspace_path.mkdir(parents=True, exist_ok=True)
+
+    # --list-sessions：列出所有 session
+    if list_sessions:
+        from mokioclaw.reliability.session_store import list_sessions as do_list_sessions
+        sessions = do_list_sessions(workspace_path)
+        if not sessions:
+            safe_secho("No sessions found.", fg=typer.colors.YELLOW)
+        else:
+            safe_secho(f"Sessions in {workspace_path}:", fg=typer.colors.CYAN)
+            for s in sessions:
+                status = s.get("status", "unknown")
+                turn = s.get("turn_index", 0)
+                task_preview = (s.get("task", "") or "")[:60]
+                updated = s.get("updated_at", "")
+                safe_secho(
+                    f"  {s['session_id']}  turn={turn}  status={status}  {updated}",
+                    fg=typer.colors.GREEN,
+                )
+                if task_preview:
+                    safe_secho(f"    task: {task_preview}", fg=typer.colors.WHITE)
+        raise typer.Exit()
+
+    # --rollback N：回滚到指定轮次
+    if rollback is not None:
+        from mokioclaw.reliability.session_store import (
+            get_latest_session,
+            rollback_to_turn,
+        )
+        session_data = get_latest_session(workspace_path)
+        if not session_data:
+            safe_secho("No session to rollback.", fg=typer.colors.RED)
+            raise typer.Exit(1)
+        session_id = session_data["session_id"]
+        checkpoint = rollback_to_turn(workspace_path, session_id, rollback)
+        if checkpoint:
+            safe_secho(f"Rolled back session {session_id} to turn {rollback}.", fg=typer.colors.GREEN)
+        else:
+            safe_secho(f"Failed to rollback to turn {rollback}.", fg=typer.colors.RED)
+        raise typer.Exit()
+
+    if continue_session is not None and resume is None:
+        resume = continue_session
+
+    if worktree:
+        import subprocess as sp
+        try:
+            result = sp.run(
+                ["git", "worktree", "add", "-q", str(workspace_path / ".mokioclaw" / "worktree-" + utc_stamp)],
+                cwd=workspace_path, capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                workspace_path = workspace_path / ".mokioclaw" / "worktree-" + utc_stamp
+        except Exception:
+            pass
+
     task = None
     if isinstance(ctx.obj, dict):
         task = ctx.obj.get("task_arg")
@@ -235,24 +317,45 @@ def main(
     safe_secho("mokioclaw stage 5: MultiAgent + context/harness engineering", fg=typer.colors.MAGENTA)
     # inline 模式：危险命令时在终端弹出确认提示
     approval_handler = _inline_approval_handler if approval_mode == "inline" else None
+
+    # --resume 处理：无参数恢复最新 session，有参数恢复指定 session
+    resume_session_id = None
+    if resume is not None:
+        if resume == "" or resume == "true":
+            from mokioclaw.reliability.session_store import get_latest_session
+            latest = get_latest_session(workspace_path)
+            if latest:
+                resume_session_id = latest["session_id"]
+                safe_secho(_format_resume_card(latest), fg=typer.colors.CYAN)
+            else:
+                safe_secho("No session to resume.", fg=typer.colors.YELLOW)
+                raise typer.Exit()
+        elif resume.startswith("session-"):
+            resume_session_id = resume
+        else:
+            workspace_path = Path(resume).expanduser()
+
     # stream_agent_events 是生成器，逐个 yield 事件字典
     try:
         for event in stream_agent_events(
             task,
-            workspace=workspace,
+            workspace=workspace_path,
             max_attempts=max_attempts,
             approval_mode=approval_mode,
             agent_mode=agent_mode,
             approval_handler=approval_handler,
             checkpoint_mode=checkpoint_mode,
-            resume_workspace=resume,
+            resume_workspace=workspace_path if resume else None,
             trace_mode=trace_mode,
-        ):
+        safe_mode=safe_mode,
+    ):
             # print_event(event)就是把事件美化打印到终端。
+            if event.get("type") == "custom_event" and isinstance(event.get("event"), dict) and event["event"].get("type") == "session_resumed":
+                safe_secho(_format_resume_context(event["event"]), fg=typer.colors.CYAN)
             print_event(event)
     except KeyboardInterrupt:
         # KeyboardInterrupt：用户Ctrl+C中断，提示检查点已保存，退出码 130；
-        safe_secho("\nInterrupted by user. Checkpoint saved.", fg=typer.colors.YELLOW)
+        safe_secho("\nInterrupted by user. Session saved.", fg=typer.colors.YELLOW)
         raise typer.Exit(130)
     except Exception as exc:
         # 其他异常：打印致命错误，记录日志，退出码 1。
@@ -285,9 +388,21 @@ def tui(
         typer.Option("--trace-mode", help="Trace logging mode: on or off."),
     ] = "on",
     resume: Annotated[
-        Path | None,
-        typer.Option("--resume", help="Resume from an existing MokioClaw workspace."),
+        str | None,
+        typer.Option("--resume", help="Resume session. No arg=latest, or sessionId (e.g. session-abc123)."),
     ] = None,
+    continue_session: Annotated[
+        str | None,
+        typer.Option("--continue", help="Continue a session. Alias of --resume."),
+    ] = None,
+    safe_mode: Annotated[
+        bool,
+        typer.Option("--safe-mode", help="Clean start: disable all custom configs, hooks, and auto-memory."),
+    ] = False,
+    worktree: Annotated[
+        bool,
+        typer.Option("--worktree", help="Run in an isolated git worktree."),
+    ] = False,
 ) -> None:
     """
     运行命令：mokioclaw tui
@@ -298,6 +413,7 @@ def tui(
     """
     configure_console()
     _install_signal_handlers()
+    utc_stamp = _utc_now().replace(":", "-").replace("+", "").replace("T", "-")[:19]
     try:
         # 延迟导入 MokioClawTuiApp：只有跑 tui 子命令才导入 textual 相关代码；
         from mokioclaw.interaction.tui import MokioClawTuiApp

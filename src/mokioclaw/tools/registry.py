@@ -11,7 +11,6 @@ from mokioclaw.tools.bash_tool import bash_tool_description, run_bash, run_bash_
 from mokioclaw.tools.file_tools import edit_file, read_file, write_file
 from mokioclaw.tools.glob_tool import glob_search
 from mokioclaw.tools.grep_tool import grep
-from mokioclaw.tools.notepad_tool import append_notepad, read_notepad
 from mokioclaw.tools.skill import Skill, discover_skills, load_skill_markdown
 from mokioclaw.tools.web_search_tool import build_web_search_tool
 
@@ -27,7 +26,6 @@ TOOL_CONCURRENCY_META: dict[str, bool] = {
     "FileReadTool": True,
     "GlobTool": True,
     "GrepTool": True,
-    "NotepadReadTool": True,
     "WebSearchTool": True,
     "SkillTool": True,
     "ToolSearchTool": True,
@@ -35,7 +33,6 @@ TOOL_CONCURRENCY_META: dict[str, bool] = {
     "FileWriteTool": False,
     "FileEditTool": False,
     "BashTool": False,
-    "NotepadAppendTool": False,
     "TodoUpdateTool": False,
 }
 
@@ -100,16 +97,6 @@ def build_tools(state: RuntimeState, *, include_mcp: bool = True, include_skills
                 state, command, timeout_seconds, run_in_background
             ),
             description=bash_tool_description(),
-        ),
-        StructuredTool.from_function(
-            name="NotepadReadTool",
-            func=lambda: read_notepad(state),
-            description="Read the durable workspace notepad from NOTEPAD.md.",
-        ),
-        StructuredTool.from_function(
-            name="NotepadAppendTool",
-            func=lambda heading, content: append_notepad(state, heading, content),
-            description="Append a durable markdown note to NOTEPAD.md. Args: heading, content.",
         ),
         build_web_search_tool(workspace=state.workspace),
     ]
@@ -187,11 +174,6 @@ def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
                 state, command, timeout_seconds, run_in_background
             ),
             description=bash_tool_description(),
-        ),
-        StructuredTool.from_function(
-            name="NotepadReadTool",
-            func=lambda: read_notepad(state),
-            description="Read the durable workspace notepad from NOTEPAD.md.",
         ),
         build_web_search_tool(workspace=state.workspace),
     ]

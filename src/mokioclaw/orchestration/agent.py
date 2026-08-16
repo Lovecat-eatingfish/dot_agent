@@ -7,22 +7,24 @@ from typing import Any, Iterator
 from langgraph.graph import add_messages
 
 from mokioclaw.reliability.checkpoint import CheckpointManager, load_resume_inputs, normalize_checkpoint_mode
+from mokioclaw.reliability.session_store import (
+    create_session,
+    load_session,
+    get_latest_session,
+    append_user_turn,
+    append_assistant_turn,
+    save_turn_checkpoint,
+    finish_session,
+    interrupt_session,
+    save_session,
+    build_resume_context,
+)
 from mokioclaw.core.hook_loader import load_hooks_into_runner
 from mokioclaw.core.hooks import HookEvent, HookPayload, HookRunner, fire_session_hook, fire_stop_hook
 from mokioclaw.core.log import get_logger
 from mokioclaw.core.paths import default_workspace, new_task_workspace
 from mokioclaw.core.workspace_detection import resolve_workspace
 from mokioclaw.tools.bash_tool import cleanup_background_processes, cleanup_old_outputs
-from mokioclaw.reliability.session import (
-    append_assistant_turn,
-    append_user_turn,
-    build_session_context,
-    load_or_create_session,
-    save_session,
-    session_started_event,
-    session_turn_saved_event,
-    session_turn_started_event,
-)
 from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.reliability.trace import TraceRecorder, normalize_trace_mode
 from mokioclaw.orchestration.workflow import build_complex_workflow, build_entry_workflow
@@ -30,6 +32,17 @@ from mokioclaw.prompts.builder import reset_prompt_builder
 from mokioclaw.prompts.thinking import apply_thinking_mode
 
 logger = get_logger(__name__)
+
+def _load_model_override(workspace: Path) -> str:
+    """Load model override set by /model command."""
+    try:
+        path = workspace / ".mokioclaw" / "model_override"
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+    except Exception:
+        pass
+    return ""
+
 
 def create_runtime(
     workspace: Path | None = None,
@@ -42,6 +55,7 @@ def create_runtime(
     trace_mode: str | None = None,
     opened_file: Path | None = None,
     fire_session_start: bool = True,
+    safe_mode: bool = False,
 ) -> RuntimeState:
     # 智能工作区解析：显式指定 / 打开文件 → resolve_workspace，否则生成唯一 workspace
     if workspace is not None or opened_file is not None:
@@ -61,34 +75,51 @@ def create_runtime(
     except Exception as exc:
         logger.debug("output cleanup skipped: %s", exc)
 
+    # auto-memory: 注入学到的偏好到 session context（safe-mode 下跳过）
+    if not safe_mode:
+        try:
+            from mokioclaw.memory.auto_memory import auto_memory_summary
+            summary = auto_memory_summary(selected)
+            if summary:
+                runtime.session_context_injection = (runtime.session_context_injection or "") + "\n" + summary
+        except Exception as exc:
+            logger.debug("auto-memory load skipped: %s", exc)
+
+    user_config = None
+    if not safe_mode:
+        try:
+            from mokioclaw.config.loader import load_user_config
+            user_config = load_user_config(selected)
+        except Exception:
+            user_config = None
+
     # agent_mode：显式参数 > 环境变量 > 用户配置 > auto
     resolved_agent_mode = agent_mode or os.getenv("MOKIO_AGENT_MODE") or ""
     if not resolved_agent_mode:
-        try:
-            from mokioclaw.config.loader import load_user_config
-            resolved_agent_mode = load_user_config(selected).agent_mode
-        except Exception:
-            resolved_agent_mode = "auto"
+        resolved_agent_mode = user_config.agent_mode if user_config else "auto"
 
     runtime = RuntimeState(
         workspace=selected,
         approval_mode=approval_mode,
         agent_mode=resolved_agent_mode,
+        allowed_tools=list(user_config.allowed_tools) if user_config else [],
+        disallowed_tools=list(user_config.disallowed_tools) if user_config else [],
         approval_handler=approval_handler,
-        bash_default_timeout_seconds=_env_int("MOKIO_BASH_DEFAULT_TIMEOUT_SECONDS", 120),
-        bash_max_timeout_seconds=_env_int("MOKIO_BASH_MAX_TIMEOUT_SECONDS", 600),
-        bash_max_output_chars=_env_int("MOKIO_BASH_MAX_OUTPUT_CHARS", 6000),
+        bash_default_timeout_seconds=_env_int("MOKIO_BASH_DEFAULT_TIMEOUT_SECONDS", _env_int("BASH_DEFAULT_TIMEOUT_MS", 120000) // 1000 if _env_int("BASH_DEFAULT_TIMEOUT_MS", 0) > 0 else 120),
+        bash_max_timeout_seconds=_env_int("MOKIO_BASH_MAX_TIMEOUT_SECONDS", _env_int("BASH_MAX_TIMEOUT_MS", 600000) // 1000 if _env_int("BASH_MAX_TIMEOUT_MS", 0) > 0 else 600),
+        bash_max_output_chars=_env_int("MOKIO_BASH_MAX_OUTPUT_CHARS", _env_int("BASH_MAX_OUTPUT_LENGTH", 6000)),
         bash_env_file=_env_path("MOKIO_BASH_ENV_FILE"),
         checkpoint_mode=normalize_checkpoint_mode(checkpoint_mode or os.getenv("MOKIO_CHECKPOINT_MODE", "light")),
         resume_from=resume_from,
         trace_mode=normalize_trace_mode(trace_mode or os.getenv("MOKIO_TRACE_MODE", "on")),
     )
 
-    # 加载用户/项目 hooks.json，并触发 SessionStart
-    try:
-        load_hooks_into_runner(runtime.hook_runner, selected)
-    except Exception as exc:
-        logger.debug("hook load skipped: %s", exc)
+    # 加载用户/项目 hooks.json，并触发 SessionStart（safe-mode 下跳过）
+    if not safe_mode:
+        try:
+            load_hooks_into_runner(runtime.hook_runner, selected)
+        except Exception as exc:
+            logger.debug("hook load skipped: %s", exc)
 
     if fire_session_start:
         result = fire_session_hook(
@@ -223,13 +254,50 @@ def stream_agent_events(
     workflow = build_complex_workflow()
     yield {"type": "workspace", "path": str(state.workspace)}
 
+    # Session 管理：创建新 session 或恢复已有 session
+    workspace_path = state.workspace
     resumed = False
     resume_event: dict[str, Any] | None = None
+
     if resume_path is not None:
-        # 调用 load_resume_inputs 读取快照恢复任务上下文，产出恢复事件并推送；
+        # 恢复模式：加载最新 session 或指定 session
+        # resume_path 可能是 session_id 或 workspace 路径
+        resume_str = str(resume_path)
+        if resume_str.startswith("session-"):
+            session_data = load_session(workspace_path, resume_str)
+        else:
+            session_data = get_latest_session(workspace_path)
+
+        if session_data:
+            session_id = session_data["session_id"]
+            resumed = True
+            resume_context = build_resume_context(session_data)
+            yield {"type": "custom_event", "event": {
+                "type": "session_resumed",
+                "session_id": session_id,
+                "turn_index": session_data.get("turn_index", 0),
+                "resume_context": resume_context,
+            }}
+        else:
+            session_data = create_session(workspace_path, task or "")
+            session_id = session_data["session_id"]
+    else:
+        # 新建 session
+        session_data = create_session(workspace_path, task or "")
+        session_id = session_data["session_id"]
+
+    # 添加用户轮次
+    current_turn = append_user_turn(workspace_path, session_data, task or "")
+
+    # 保存轮次检查点（用户输入后，执行前）
+    save_turn_checkpoint(workspace_path, session_data, current_turn, task or "")
+
+    # 准备工作流输入
+    if resumed and session_data.get("turns"):
+        # 恢复模式：加载历史消息
         inputs, resume_event = load_resume_inputs(state, task=task, max_attempts=max_attempts)
-        resumed = True
-        yield {"type": "custom_event", "event": resume_event}
+        if resume_event:
+            yield {"type": "custom_event", "event": resume_event}
     else:
         inputs = {
             "task": task or "",
@@ -239,47 +307,38 @@ def stream_agent_events(
             "max_attempts": max_attempts,
         }
 
+    # 添加 session 信息到输入
+    inputs["session_id"] = session_id
+    inputs["session_turn"] = current_turn
+    if resumed and session_data:
+        inputs["session_context"] = build_resume_context(session_data)
+
     current_state: dict[str, Any] = dict(inputs)
-    # 初始化流程输入 state，创建快照管理器 CheckpointManager、追踪记录器 TraceRecorder；
-    manager = CheckpointManager(state, task=str(current_state.get("task", "")))
+    # 初始化追踪记录器
     trace = TraceRecorder(state, task=str(current_state.get("task", "")))
-    # 任务启动时保存初始快照、记录追踪事件；
     trace.start(current_state, resumed=resumed, resume_event=resume_event)
     if resume_event is not None:
         trace.record_custom_event(resume_event)
-    started_checkpoint = manager.save(current_state, status="started", latest_node="start")
-    if started_checkpoint:
-        trace.record_custom_event(started_checkpoint)
-    latest_node = "start"
 
-        # 流式执行复杂业务流程图 build_complex_workflow，循环处理两类事件：
-        # custom 自定义事件（工具调用、意图判定、压缩事件等）：判断是否需要快照，存盘并推送事件；
-        # graph 状态更新事件：合并全局 state、记录追踪、自动保存快照、推送事件；
+    # 流式执行复杂业务流程图
+    final_answer = ""
     try:
         for mode, event in workflow.stream(inputs, stream_mode=["updates", "custom"]):
             if mode == "custom":
                 trace.record_custom_event(event)
-                if _custom_event_needs_checkpoint(event):
-                    saved = manager.save(current_state, status="running", latest_node=latest_node, event={"mode": mode, "payload": event})
-                    if saved:
-                        trace.record_custom_event(saved)
                 yield {"type": "custom_event", "event": event}
             else:
-                latest_node = _latest_graph_node(event) or latest_node
                 _merge_graph_update(current_state, event)
                 trace.record_graph_update(event)
-                saved = manager.save(current_state, status="running", latest_node=latest_node, event={"mode": mode, "payload": event})
-                if saved:
-                    trace.record_custom_event(saved)
                 yield {"type": "graph_event", "event": event}
+                # 提取 final_answer
+                final_answer = _final_answer_from_event({"type": "graph_event", "event": event}) or final_answer
+
     except KeyboardInterrupt:
         cleanup_background_processes()
         fire_session_hook(state.hook_runner, HookEvent.SessionEnd, workspace=str(state.workspace))
-        saved = manager.save(current_state, status="interrupted", latest_node=latest_node)
-        if saved:
-            trace.record_custom_event(saved)
-            yield {"type": "custom_event", "event": saved}
-        trace_event = trace.end(status="interrupted", latest_node=latest_node, final_state=current_state)
+        interrupt_session(workspace_path, session_id)
+        trace_event = trace.end(status="interrupted", latest_node="", final_state=current_state)
         if trace_event:
             yield {"type": "custom_event", "event": trace_event}
         return
@@ -287,30 +346,35 @@ def stream_agent_events(
         cleanup_background_processes()
         fire_session_hook(state.hook_runner, HookEvent.SessionEnd, workspace=str(state.workspace))
         logger.error("workflow failed: %s", exc, exc_info=True)
-        saved = manager.save(current_state, status="failed", latest_node=latest_node)
-        if saved:
-            trace.record_custom_event(saved)
-            yield {"type": "custom_event", "event": saved}
-        trace_event = trace.end(status="failed", latest_node=latest_node, final_state=current_state)
+        interrupt_session(workspace_path, session_id)
+        trace_event = trace.end(status="failed", latest_node="", final_state=current_state)
         if trace_event:
             yield {"type": "custom_event", "event": trace_event}
         return
 
     cleanup_background_processes()
-    # Stop hook：模型本轮结束（对齐 Claude Code Stop）
+    # Stop hook
     fire_stop_hook(
         state.hook_runner,
         workspace=str(state.workspace),
-        session_id=str(getattr(state, "trace_id", "") or ""),
+        session_id=session_id,
     )
     fire_session_hook(state.hook_runner, HookEvent.SessionEnd, workspace=str(state.workspace))
-    saved = manager.save(current_state, status="finished", latest_node=latest_node)
-    if saved:
-        trace.record_custom_event(saved)
-        yield {"type": "custom_event", "event": saved}
-    trace_event = trace.end(status="finished", latest_node=latest_node, final_state=current_state)
+
+    # 添加 assistant 轮次并标记 session 完成
+    append_assistant_turn(workspace_path, session_data, current_turn, final_answer, state_summary=current_state)
+    finish_session(workspace_path, session_id)
+
+    trace_event = trace.end(status="finished", latest_node="", final_state=current_state)
     if trace_event:
         yield {"type": "custom_event", "event": trace_event}
+
+    # 返回 session 信息
+    yield {"type": "custom_event", "event": {
+        "type": "session_finished",
+        "session_id": session_id,
+        "turn": current_turn,
+    }}
 
 
 def stream_session_events(
@@ -322,13 +386,38 @@ def stream_session_events(
     approval_handler=None,
     checkpoint_mode: str | None = None,
     resume_workspace: Path | None = None,
+    resume_session_id: str | None = None,
     trace_mode: str | None = None,
 ) -> Iterator[dict[str, Any]]:
-    workspace = (resume_workspace or session_workspace or default_workspace()).expanduser()
+    workspace = (session_workspace or default_workspace()).expanduser()
     workspace.mkdir(parents=True, exist_ok=True)
-    session = load_or_create_session(workspace)
-    resumed = resume_workspace is not None
-    yield {"type": "custom_event", "event": session_started_event(workspace, session, resumed=resumed)}
+
+    # Session 管理：恢复或创建
+    resumed = False
+    if resume_session_id:
+        session_data = load_session(workspace, resume_session_id)
+        if session_data:
+            resumed = True
+        else:
+            session_data = create_session(workspace, task or "")
+    elif resume_workspace:
+        session_data = get_latest_session(workspace)
+        if session_data:
+            resumed = True
+        else:
+            session_data = create_session(workspace, task or "")
+    else:
+        session_data = create_session(workspace, task or "")
+
+    session_id = session_data["session_id"]
+
+    yield {"type": "custom_event", "event": {
+        "type": "session_started",
+        "session_id": session_id,
+        "workspace": str(workspace),
+        "resumed": resumed,
+        "turn_index": session_data.get("turn_index", 0),
+    }}
     yield {"type": "workspace", "path": str(workspace)}
 
     if not task:
@@ -337,7 +426,7 @@ def stream_session_events(
     cleaned_task, thinking_instruction = apply_thinking_mode(task)
     task = cleaned_task or task
 
-    # UserPromptSubmit hook：可注入上下文或阻断（TUI 持久会话）
+    # UserPromptSubmit hook
     _prompt_hook_runner = HookRunner()
     try:
         load_hooks_into_runner(_prompt_hook_runner, workspace)
@@ -349,7 +438,7 @@ def stream_session_events(
             event=HookEvent.UserPromptSubmit,
             user_prompt=task,
             workspace=str(workspace),
-            session_id=str(session.get("session_id", "")),
+            session_id=session_id,
         ),
     )
     if _prompt_result.blocked:
@@ -364,7 +453,7 @@ def stream_session_events(
     if _prompt_result.context_injection:
         task = f"{_prompt_result.context_injection}\n\n{task}"
 
-    # 显式「记住：...」同步写入记忆
+    # 显式记忆写入
     try:
         from mokioclaw.memory.auto_memory import maybe_write_explicit_memory, trigger_autodream_if_needed
         mem_result = maybe_write_explicit_memory(workspace, task)
@@ -377,18 +466,24 @@ def stream_session_events(
     except Exception as exc:
         logger.debug("auto memory hook skipped: %s", exc)
 
-    turn = append_user_turn(session, task)
-    save_session(workspace, session)
-    yield {"type": "custom_event", "event": session_turn_started_event(workspace, session, turn=turn, task=task)}
-    session_context = build_session_context(workspace, session)
+    # 添加用户轮次并保存检查点
+    turn = append_user_turn(workspace, session_data, task)
+    save_turn_checkpoint(workspace, session_data, turn, task)
 
+    yield {"type": "custom_event", "event": {
+        "type": "session_turn_started",
+        "session_id": session_id,
+        "turn": turn,
+        "task": task[:500],
+    }}
+
+    # 意图识别
     route = "workflow"
     entry_state: dict[str, Any] = {
         "task": task or "",
         "messages": [],
-        "session_id": session.get("session_id", ""),
+        "session_id": session_id,
         "session_turn": turn,
-        "session_context": session_context,
     }
 
     for mode, event in build_entry_workflow().stream(entry_state, stream_mode=["updates", "custom"]):
@@ -402,11 +497,17 @@ def stream_session_events(
 
     if route == "chat":
         response = str(entry_state.get("chat_response") or entry_state.get("final_answer") or "")
-        append_assistant_turn(session, turn=turn, route="chat", content=response, summary=response)
-        save_session(workspace, session)
-        yield {"type": "custom_event", "event": session_turn_saved_event(workspace, session, turn=turn, route="chat")}
+        append_assistant_turn(workspace, session_data, turn, response)
+        finish_session(workspace, session_id)
+        yield {"type": "custom_event", "event": {
+            "type": "session_turn_saved",
+            "session_id": session_id,
+            "turn": turn,
+            "route": "chat",
+        }}
         return
 
+    # 执行复杂工作流
     workflow_events = _stream_complex_workflow(
         task=task,
         workspace=workspace,
@@ -416,9 +517,8 @@ def stream_session_events(
         checkpoint_mode=checkpoint_mode,
         resume_workspace=resume_workspace,
         trace_mode=trace_mode,
-        session=session,
+        session_data=session_data,
         turn=turn,
-        session_context=session_context,
         thinking_instruction=thinking_instruction,
     )
     final_answer = ""
@@ -426,17 +526,23 @@ def stream_session_events(
         final_answer = _final_answer_from_event(event) or final_answer
         yield event
 
-    append_assistant_turn(session, turn=turn, route="workflow", content=final_answer, summary=final_answer)
-    save_session(workspace, session)
-    yield {"type": "custom_event", "event": session_turn_saved_event(workspace, session, turn=turn, route="workflow")}
+    # 添加 assistant 轮次
+    append_assistant_turn(workspace, session_data, turn, final_answer)
 
-    # 后台记忆提取（不阻塞）
+    yield {"type": "custom_event", "event": {
+        "type": "session_turn_saved",
+        "session_id": session_id,
+        "turn": turn,
+        "route": "workflow",
+    }}
+
+    # 后台记忆提取
     try:
         from mokioclaw.memory.auto_memory import trigger_background_extraction
         trigger_background_extraction(
             workspace,
             new_messages=[f"user: {task}", f"assistant: {final_answer}"],
-            session_id=str(session.get("session_id", "")),
+            session_id=session_id,
         )
     except Exception as exc:
         logger.debug("background extraction skipped: %s", exc)
@@ -452,9 +558,8 @@ def _stream_complex_workflow(
     checkpoint_mode: str | None,
     resume_workspace: Path | None,
     trace_mode: str | None,
-    session: dict[str, Any] | None = None,
+    session_data: dict[str, Any] | None = None,
     turn: int | None = None,
-    session_context: str = "",
     thinking_instruction: str = "",
 ) -> Iterator[dict[str, Any]]:
     resume_path = resume_workspace.expanduser() if resume_workspace is not None else None
@@ -473,99 +578,64 @@ def _stream_complex_workflow(
     _apply_workspace_runtime_flags(state)
 
     # 会话级 SessionStart：整段 session 只触发一次
-    if session is not None and not session.get("_session_hooks_started"):
+    session_id = session_data.get("session_id", "") if session_data else ""
+    if session_data and not session_data.get("_session_hooks_started"):
         fire_session_hook(
             state.hook_runner,
             HookEvent.SessionStart,
             workspace=str(state.workspace),
-            session_id=str(session.get("session_id", "")),
+            session_id=session_id,
         )
-        session["_session_hooks_started"] = True
-        session.pop("_session_hooks_ended", None)
-        try:
-            save_session(workspace, session)
-        except Exception:
-            pass
+        session_data["_session_hooks_started"] = True
+        session_data.pop("_session_ended", None)
 
     # 每个新任务重置 PromptBuilder，确保使用当前 workspace 的配置
     reset_prompt_builder()
     workflow = build_complex_workflow()
 
-    resumed = False
-    resume_event: dict[str, Any] | None = None
-    if resume_path is not None:
-        inputs, resume_event = load_resume_inputs(state, task=task, max_attempts=max_attempts)
-        resumed = True
-        yield {"type": "custom_event", "event": resume_event}
-    else:
-        inputs = {
-            "task": task or "",
-            "runtime": state,
-            "messages": [],
-            "attempts": 0,
-            "max_attempts": max_attempts,
-        }
+    resumed = resume_path is not None
+    inputs: dict[str, Any] = {
+        "task": task or "",
+        "runtime": state,
+        "messages": [],
+        "attempts": 0,
+        "max_attempts": max_attempts,
+    }
 
-    if session is not None:
-        inputs["session_id"] = session.get("session_id", "")
+    if session_id:
+        inputs["session_id"] = session_id
     if turn is not None:
         inputs["session_turn"] = turn
-    if session_context:
-        inputs["session_context"] = session_context
-    metadata = dict(inputs.get("metadata", {}))
-    if session is not None:
-        metadata["session_id"] = session.get("session_id", "")
-    if turn is not None:
-        metadata["session_turn"] = turn
-    if metadata:
-        inputs["metadata"] = metadata
+    if session_data:
+        inputs["session_context"] = build_resume_context(session_data)
 
     current_state: dict[str, Any] = dict(inputs)
-    manager = CheckpointManager(state, task=str(current_state.get("task", "")))
     trace = TraceRecorder(state, task=str(current_state.get("task", "")))
-    trace.start(current_state, resumed=resumed, resume_event=resume_event)
-    if resume_event is not None:
-        trace.record_custom_event(resume_event)
-    started_checkpoint = manager.save(current_state, status="started", latest_node="start")
-    if started_checkpoint:
-        trace.record_custom_event(started_checkpoint)
-    latest_node = "start"
+    trace.start(current_state, resumed=resumed)
 
     try:
         for mode, event in workflow.stream(inputs, stream_mode=["updates", "custom"]):
             if mode == "custom":
                 trace.record_custom_event(event)
-                if _custom_event_needs_checkpoint(event):
-                    saved = manager.save(current_state, status="running", latest_node=latest_node, event={"mode": mode, "payload": event})
-                    if saved:
-                        trace.record_custom_event(saved)
                 yield {"type": "custom_event", "event": event}
             else:
-                latest_node = _latest_graph_node(event) or latest_node
                 _merge_graph_update(current_state, event)
                 trace.record_graph_update(event)
-                saved = manager.save(current_state, status="running", latest_node=latest_node, event={"mode": mode, "payload": event})
-                if saved:
-                    trace.record_custom_event(saved)
                 yield {"type": "graph_event", "event": event}
     except KeyboardInterrupt:
         cleanup_background_processes()
-        saved = manager.save(current_state, status="interrupted", latest_node=latest_node)
-        if saved:
-            trace.record_custom_event(saved)
-            yield {"type": "custom_event", "event": saved}
-        trace_event = trace.end(status="interrupted", latest_node=latest_node, final_state=current_state)
+        if session_data:
+            interrupt_session(workspace, session_id)
+        trace_event = trace.end(status="interrupted", final_state=current_state)
         if trace_event:
             yield {"type": "custom_event", "event": trace_event}
         return
     except Exception as exc:
         cleanup_background_processes()
         logger.error("workflow failed: %s", exc, exc_info=True)
-        saved = manager.save(current_state, status="failed", latest_node=latest_node)
-        if saved:
-            trace.record_custom_event(saved)
-            yield {"type": "custom_event", "event": saved}
-        trace_event = trace.end(status="failed", latest_node=latest_node, final_state=current_state)
+        if session_data:
+            interrupt_session(workspace, session_id)
+        trace_event = trace.end(status="failed", final_state=current_state)
         if trace_event:
             yield {"type": "custom_event", "event": trace_event}
         return
@@ -574,13 +644,9 @@ def _stream_complex_workflow(
     fire_stop_hook(
         state.hook_runner,
         workspace=str(state.workspace),
-        session_id=str((session or {}).get("session_id", "")),
+        session_id=session_id,
     )
-    saved = manager.save(current_state, status="finished", latest_node=latest_node)
-    if saved:
-        trace.record_custom_event(saved)
-        yield {"type": "custom_event", "event": saved}
-    trace_event = trace.end(status="finished", latest_node=latest_node, final_state=current_state)
+    trace_event = trace.end(status="finished", final_state=current_state)
     if trace_event:
         yield {"type": "custom_event", "event": trace_event}
 
@@ -593,17 +659,12 @@ def end_persistent_session_hooks(workspace: Path | None) -> None:
     if workspace is None:
         return
     workspace = workspace.expanduser()
-    try:
-        from mokioclaw.reliability.session import load_or_create_session, session_file
 
-        if not session_file(workspace).exists():
-            return
-        session = load_or_create_session(workspace)
-    except Exception as exc:
-        logger.debug("session load for SessionEnd skipped: %s", exc)
+    session_data = get_latest_session(workspace)
+    if not session_data:
         return
 
-    if not session.get("_session_hooks_started") or session.get("_session_hooks_ended"):
+    if not session_data.get("_session_hooks_started") or session_data.get("_session_ended"):
         return
 
     from mokioclaw.core.hooks import HookRunner
@@ -618,14 +679,11 @@ def end_persistent_session_hooks(workspace: Path | None) -> None:
         runner,
         HookEvent.SessionEnd,
         workspace=str(workspace),
-        session_id=str(session.get("session_id", "")),
+        session_id=str(session_data.get("session_id", "")),
     )
-    session["_session_hooks_ended"] = True
-    session["_session_hooks_started"] = False
-    try:
-        save_session(workspace, session)
-    except Exception as exc:
-        logger.debug("session save after SessionEnd skipped: %s", exc)
+    session_data["_session_ended"] = True
+    session_data["_session_hooks_started"] = False
+    save_session(workspace, session_data)
 
 
 def _apply_workspace_runtime_flags(runtime: RuntimeState) -> None:

@@ -18,6 +18,12 @@ from mokioclaw.memory.auto_memory import extract_with_model
 from mokioclaw.memory.topic_store import TopicStore
 
 
+@pytest.fixture(autouse=True)
+def _patch_project_memory_dir(tmp_path: Path):
+    """不再需要 patch project_memory_dir，auto_memory 直接使用 workspace 内目录"""
+    yield
+
+
 class _FakeModel:
     """模拟一个不 bind 工具的纯 invoke 模型"""
 
@@ -165,7 +171,7 @@ def test_trigger_background_extraction_uses_llm_then_falls_back(tmp_path: Path):
     import time
     time.sleep(0.3)
     names_ok = {t.name for t in TopicStore(tmp_path).list_topics()}
-    assert "ok_topic" in names_ok
+    assert "project_ok_topic" in names_ok
 
     # 场景 2: LLM 抛异常 → 回退正则
     fresh_ws = tmp_path / "ws2"

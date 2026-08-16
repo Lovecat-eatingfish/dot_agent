@@ -80,3 +80,21 @@ def test_cli_passes_trace_mode(monkeypatch, tmp_path) -> None:
     assert result.exit_code == 0
     assert calls
     assert calls[0][1]["trace_mode"] == "off"
+
+
+def test_cli_accepts_continue_option_without_task(monkeypatch, tmp_path) -> None:
+    calls = []
+
+    def fake_stream(*args, **kwargs):
+        calls.append((args, kwargs))
+        return iter(())
+
+    monkeypatch.setattr("mokioclaw.interaction.app.stream_agent_events", fake_stream)
+    from mokioclaw.interaction.app import app
+    from typer.testing import CliRunner
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["--continue", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert calls[0][1]["resume_workspace"] == tmp_path

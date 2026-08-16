@@ -639,6 +639,18 @@ Agent全部执行完毕
             if result.action == "clear":
                 self.action_clear_events()
                 return
+            if result.action == "resume":
+                # /resume 或 /resume <sessionId>
+                session_id = result.meta.get("session_id") if result.meta else None
+                self._resume_session(session_id)
+                return
+            if result.action == "rollback":
+                # /rollback <turn> - 回滚后重新开始
+                session_id = result.meta.get("session_id") if result.meta else None
+                turn = result.meta.get("turn") if result.meta else None
+                if session_id and turn:
+                    self._resume_session(session_id)
+                return
             if result.kind == CommandKind.SYSTEM and result.action in {"none", "compact"}:
                 if result.action == "compact":
                     # force_compact.flag 已由 dispatch 写入；发一个轻量 turn 触发 monitor
@@ -1162,6 +1174,44 @@ Agent全部执行完毕
         self._mount_event_card(
             "New Session",
             str(self.session_workspace),
+            category="info",
+            collapsed=False,
+        )
+
+    def _resume_session(self, session_id: str | None = None) -> None:
+        """恢复 session
+
+        Args:
+            session_id: session ID，None 则恢复最新 session
+        """
+        if self.running:
+            self.notify("MokioClaw is already running a task.", severity="warning")
+            return
+
+        from mokioclaw.reliability.session_store import get_latest_session, load_session
+
+        ws = Path(self.latest_workspace) if self.latest_workspace else self.workspace
+
+        if session_id:
+            session_data = load_session(ws, session_id)
+            if not session_data:
+                self.notify(f"Session not found: {session_id}", severity="error")
+                return
+        else:
+            session_data = get_latest_session(ws)
+            if not session_data:
+                self.notify("No session to resume.", severity="warning")
+                return
+            session_id = session_data["session_id"]
+
+        # 设置恢复状态
+        self.session_id = session_id
+        self.session_turn = session_data.get("turn_index", 0)
+        self.resume = session_id
+
+        self._mount_event_card(
+            "Resumed Session",
+            f"{session_id} (turn {self.session_turn})",
             category="info",
             collapsed=False,
         )

@@ -55,6 +55,10 @@ class UserConfig:
     checkpoint_mode: str = "light"
     trace_mode: str = "on"
 
+    # --- 工具权限配置 ---
+    allowed_tools: list[str] = field(default_factory=list)
+    disallowed_tools: list[str] = field(default_factory=list)
+
     # --- Bash 配置 ---
     bash_default_timeout_seconds: int = 120
     bash_max_timeout_seconds: int = 600
@@ -95,53 +99,105 @@ def load_user_config(
     config = UserConfig()
     sources: list[str] = []
 
-    # 1. 加载全局配置
-    global_path = global_override or _GLOBAL_CONFIG
-    if global_path.exists():
+    # 1. 加载全局配置（仅当显式 override 提供时；默认情况下不读全局）
+    if global_override is not None and global_override.exists():
         try:
-            frontmatter, body = _parse_markdown_with_frontmatter(global_path)
+            frontmatter, body = _parse_markdown_with_frontmatter(global_override)
             _apply_frontmatter(config, frontmatter)
             if body.strip():
                 config.custom_instructions = _merge_instructions(config.custom_instructions, body)
-            sources.append(f"global:{global_path}")
+            sources.append(f"global:{global_override}")
         except Exception as exc:
-            logger.debug("global config load skipped (%s): %s", global_path, exc)
+            logger.debug("global config load skipped (%s): %s", global_override, exc)
 
-    # 2. 加载项目级配置
-    project_path = project_override
-    if project_path is None and workspace is not None:
-        project_path = _find_project_config(workspace)
-    if project_path is None:
-        project_path = _find_project_config(Path.cwd())
-
-    if project_path and project_path.exists():
+    # 2. 加载项目级配置（递归 CLAUDE.md / CLAUDE.local.md / .mokioclaw/config.md）
+    project_root = workspace or Path.cwd()
+    project_sources = _discover_project_config_sources(project_root, override=project_override)
+    for source_path in project_sources:
         try:
-            frontmatter, body = _parse_markdown_with_frontmatter(project_path)
+            frontmatter, body = _parse_markdown_with_frontmatter(source_path)
             _apply_frontmatter(config, frontmatter)
             if body.strip():
                 config.custom_instructions = _merge_instructions(config.custom_instructions, body)
-            sources.append(f"project:{project_path}")
+            sources.append(f"project:{source_path}")
         except Exception as exc:
-            logger.debug("project config load skipped (%s): %s", project_path, exc)
+            logger.debug("project config load skipped (%s): %s", source_path, exc)
 
-    # 3. 项目根 CLAUDE.md / CLAUDE.local.md（对齐 Claude Code 记忆层级）
+    # 2b. 加载模块化规则文件（.claude/rules/*.md 或 .mokioclaw/rules/*.md）
+    rule_files = _discover_rules_dir(project_root)
+    for rule_path in rule_files:
+        try:
+            frontmatter, body = _parse_markdown_with_frontmatter(rule_path)
+            # globs frontmatter: if present, store for file-pattern scoping
+            globs = frontmatter.get("globs") if isinstance(frontmatter, dict) else None
+            if body.strip():
+                if globs:
+                    globs_str = ", ".join(globs) if isinstance(globs, list) else str(globs)
+                    config.custom_instructions = _merge_instructions(
+                        config.custom_instructions,
+                        f"<!-- rules:{rule_path.name} globs:{globs_str} -->\n{body}"
+                    )
+                else:
+                    config.custom_instructions = _merge_instructions(config.custom_instructions, body)
+            sources.append(f"rules:{rule_path}")
+        except Exception as exc:
+            logger.debug("rules file load skipped (%s): %s", rule_path, exc)
+
+    # 3. 加载运行时权限规则（.mokioclaw/permissions.json，由 /permissions 命令维护）
     if workspace is not None:
-        for name in (_PROJECT_CLAUDE_MD, _PROJECT_CLAUDE_LOCAL):
-            claude_md = workspace / name
-            if claude_md.exists():
-                try:
-                    frontmatter, body = _parse_markdown_with_frontmatter(claude_md)
-                    _apply_frontmatter(config, frontmatter)
-                    if body.strip():
-                        config.custom_instructions = _merge_instructions(
-                            config.custom_instructions, body
-                        )
-                    sources.append(f"{name}:{claude_md}")
-                except Exception as exc:
-                    logger.debug("%s load skipped (%s): %s", name, claude_md, exc)
+        perms_path = workspace / ".mokioclaw" / "permissions.json"
+        if perms_path.exists():
+            try:
+                import json
+                data = json.loads(perms_path.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    if data.get("allowed_tools"):
+                        config.allowed_tools = _coerce_string_list(data["allowed_tools"])
+                    if data.get("disallowed_tools"):
+                        config.disallowed_tools = _coerce_string_list(data["disallowed_tools"])
+                    sources.append(f"permissions:{perms_path}")
+            except Exception as exc:
+                logger.debug("permissions.json load skipped (%s): %s", perms_path, exc)
 
     config.config_sources = sources
     return config
+
+
+def _expand_body_imports(body: str, source: Path, *, max_depth: int = 5) -> str:
+    lines: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("@") or line.startswith("@{"):
+            lines.append(raw_line)
+            continue
+        imported = _resolve_import_path(source, line[1:].strip())
+        if imported is None:
+            lines.append(raw_line)
+            continue
+        imported_text = _read_imported_text(imported, max_depth=max_depth - 1 if max_depth > 0 else 0)
+        if imported_text:
+            lines.append(imported_text.rstrip())
+    return "\n".join(lines)
+
+def _resolve_import_path(source: Path, import_ref: str) -> Path | None:
+    candidate = Path(import_ref.strip())
+    if not candidate.is_absolute():
+        candidate = (source.parent / candidate).resolve()
+    return candidate if candidate.exists() else None
+
+
+def _read_imported_text(path: Path, *, max_depth: int) -> str:
+    if max_depth < 0:
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    if max_depth == 0:
+        return text
+    if "@" not in text:
+        return text
+    return _expand_body_imports(text, path, max_depth=max_depth)
 
 
 def _parse_markdown_with_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
@@ -160,7 +216,7 @@ def _parse_markdown_with_frontmatter(path: Path) -> tuple[dict[str, Any], str]:
         return {}, text
 
     frontmatter_raw = text[3:end].strip()
-    body = text[end + 3:].strip()
+    body = _expand_body_imports(text[end + 3:].strip(), path)
 
     frontmatter: dict[str, Any] = {}
     if frontmatter_raw:
@@ -210,6 +266,10 @@ def _apply_frontmatter(config: UserConfig, frontmatter: dict[str, Any]) -> None:
         "mode": "agent_mode",
         "checkpoint_mode": "checkpoint_mode",
         "trace_mode": "trace_mode",
+        "allowed_tools": "allowed_tools",
+        "allowedTools": "allowed_tools",
+        "disallowed_tools": "disallowed_tools",
+        "disallowedTools": "disallowed_tools",
         "bash_timeout": "bash_default_timeout_seconds",
         "bash_default_timeout": "bash_default_timeout_seconds",
         "bash_max_timeout": "bash_max_timeout_seconds",
@@ -234,6 +294,20 @@ def _apply_frontmatter(config: UserConfig, frontmatter: dict[str, Any]) -> None:
                     pass
             elif isinstance(current, str):
                 setattr(config, attr, str(value))
+            elif isinstance(current, list):
+                setattr(config, attr, _coerce_string_list(value))
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        raw_items = value.replace("\n", ",").split(",")
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = [value]
+    return [str(item).strip() for item in raw_items if str(item).strip()]
 
 
 def _merge_instructions(existing: str, new: str) -> str:
@@ -245,6 +319,64 @@ def _merge_instructions(existing: str, new: str) -> str:
     if not new:
         return existing
     return f"{existing}\n\n{new}"
+
+
+def _discover_rules_dir(workspace: Path) -> list[Path]:
+    """Discover modular rule files from .claude/rules/ or .mokioclaw/rules/.
+
+    Aligns with Claude Code's .claude/rules/ directory:
+    - Each .md file is a standalone rule module
+    - Rules are merged into custom_instructions in alphabetical order
+    """
+    rule_files: list[Path] = []
+    visited: set[Path] = set()
+    for rules_dir_name in (".claude/rules", ".mokioclaw/rules"):
+        current = workspace.resolve()
+        for _ in range(6):
+            rules_dir = current / rules_dir_name
+            if rules_dir.is_dir():
+                for md_file in sorted(rules_dir.glob("*.md")):
+                    resolved = md_file.resolve()
+                    if resolved not in visited:
+                        visited.add(resolved)
+                        rule_files.append(md_file)
+            if (current / ".git").exists():
+                break
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+    return rule_files
+
+
+def _discover_project_config_sources(workspace: Path, *, override: Path | None = None) -> list[Path]:
+    sources: list[Path] = []
+    if override is not None:
+        if override.exists():
+            sources.append(override)
+        return sources
+
+    visited: set[Path] = set()
+    current = workspace.resolve()
+    for _ in range(6):
+        for candidate in (
+            current / _PROJECT_CONFIG_DIR / _PROJECT_CONFIG_NAME,
+            current / _PROJECT_CLAUDE_MD,
+            current / _PROJECT_CLAUDE_LOCAL,
+        ):
+            if candidate.exists():
+                resolved = candidate.resolve()
+                if resolved not in visited:
+                    visited.add(resolved)
+                    sources.append(candidate)
+        if (current / ".git").exists():
+            break
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+
+    return sources
 
 
 def _find_project_config(workspace: Path) -> Path | None:
@@ -273,3 +405,5 @@ def get_user_config_paths() -> dict[str, Path | None]:
         "global": _GLOBAL_CONFIG if _GLOBAL_CONFIG.exists() else None,
         "project": _find_project_config(Path.cwd()),
     }
+
+

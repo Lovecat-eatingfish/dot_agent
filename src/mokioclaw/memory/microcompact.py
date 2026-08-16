@@ -19,9 +19,9 @@ from mokioclaw.core.log import get_logger
 logger = get_logger(__name__)
 
 # 会更新 file_state_map 的写工具
-_WRITE_TOOLS = frozenset({"FileWriteTool", "FileEditTool", "NotepadAppendTool"})
+_WRITE_TOOLS = frozenset({"FileWriteTool", "FileEditTool"})
 # 可读结果可能过期的工具
-_STALEABLE_READ_TOOLS = frozenset({"FileReadTool", "NotepadReadTool"})
+_STALEABLE_READ_TOOLS = frozenset({"FileReadTool"})
 
 
 def update_file_state_map(

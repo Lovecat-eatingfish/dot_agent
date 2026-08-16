@@ -20,7 +20,6 @@
 
 存储文件：
 - TODO.md: 待办事项和计划
-- NOTEPAD.md: 持久化笔记
 - HISTORY_SUMMARY.md: 历史对话摘要
 """
 from __future__ import annotations
@@ -30,12 +29,12 @@ from datetime import datetime
 from typing import Any
 
 from mokioclaw.core.log import get_logger
+from mokioclaw.core.paths import project_memory_dir
 from mokioclaw.memory.topic_store import TopicStore
 from mokioclaw.security.path_security import PathSecurityError
 from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.core.utils import truncate, trim_handoffs
 from mokioclaw.tools.file_tools import read_text_lossy
-from mokioclaw.tools.notepad_tool import NOTEPAD_FILE, read_notepad
 
 logger = get_logger(__name__)
 
@@ -50,7 +49,7 @@ RULES_LAYER = {
         "Work inside the current workspace only.",
         "Use paths relative to the workspace; do not prefix paths with workspace/.",
         "Keep durable task context outside the raw messages transcript when possible.",
-        "Treat TODO.md as working plan state, NOTEPAD.md as durable notes, and HISTORY_SUMMARY.md as compressed history.",
+        "Treat TODO.md as working plan state and HISTORY_SUMMARY.md as compressed history.",
         "Do not expose memory write tools to agents; layered memory is assembled by the runtime.",
     ],
 }
@@ -65,7 +64,6 @@ MAX_TEXT_CHARS = {
     "last_error": 1400,              # 最近错误
     "context_summary": 1600,         # 上下文摘要
     "session_context": 1800,         # 会话上下文
-    "notepad": 1800,                 # 笔记本内容
     "history_summary": 2200,         # 历史摘要
 }
 
@@ -86,16 +84,11 @@ def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[
         分层记忆字典，包含 rules, working_memory, history_summary_store
     """
     runtime = state["runtime"]
-    try:
-        notepad = read_notepad(runtime)
-    except Exception as exc:
-        logger.debug("notepad read failed: %s", exc)
-        notepad = {"ok": False, "content": "", "exists": False}
+    history = {"content": "", "exists": False}
     try:
         history = read_history_summary(runtime)
     except Exception as exc:
         logger.debug("history summary read failed: %s", exc)
-        history = {"ok": False, "content": "", "exists": False}
     sources = [
         {
             "title": source.get("title", ""),
@@ -131,9 +124,6 @@ def build_layered_memory(state: dict[str, Any], *, node: str = "graph") -> dict[
         "history_path": HISTORY_SUMMARY_FILE,
         "history_exists": history.get("exists", False),
         "history_summary": _short_text(history_summary, MAX_TEXT_CHARS["history_summary"]),
-        "notepad_path": NOTEPAD_FILE,
-        "notepad_exists": notepad.get("exists", False),
-        "notepad": _short_text(notepad.get("content", ""), MAX_TEXT_CHARS["notepad"]),
         "context_summary": _short_text(state.get("context_summary", ""), MAX_TEXT_CHARS["context_summary"]),
         "compression_events": state.get("compression_events", [])[-3:],
     }
@@ -177,7 +167,6 @@ def memory_event(memory: dict[str, Any], *, node: str) -> dict[str, Any]:
         "todo_count": len(working.get("todos", [])),
         "source_count": len(working.get("sources", [])),
         "handoff_count": len(working.get("agent_handoffs", [])),
-        "notepad_exists": bool(history.get("notepad_exists")),
         "history_exists": bool(history.get("history_exists")),
         "history_path": history.get("history_path", HISTORY_SUMMARY_FILE),
         "topic_count": topic_index.get("topic_count", 0),
@@ -266,7 +255,7 @@ def _short_text(text: str, limit: int) -> str:
 def _build_topic_index(runtime: RuntimeState) -> dict[str, Any]:
     """构建主题记忆索引层
 
-    加载 MEMORY.md 索引和主题文件列表，不加载完整主题内容。
+    加载 MEMORY.md 索引和主题文件列表（合并项目级 + 会话级），不加载完整主题内容。
     模型需要详细记忆时，自行调用 FileReadTool 读取主题文件。
 
     Args:
@@ -276,7 +265,8 @@ def _build_topic_index(runtime: RuntimeState) -> dict[str, Any]:
         主题索引字典
     """
     try:
-        store = TopicStore(runtime.workspace)
+        project_dir = project_memory_dir()
+        store = TopicStore(runtime.workspace, project_dir=project_dir)
         index_text = store.load_index()
         topics = store.list_topics()
     except Exception as exc:

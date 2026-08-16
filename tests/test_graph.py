@@ -339,7 +339,6 @@ def test_call_code_agent_tool_updates_state(monkeypatch, tmp_path: Path) -> None
 
 def test_layered_memory_splits_rules_working_and_history(tmp_path: Path) -> None:
     runtime = RuntimeState(workspace=tmp_path)
-    (tmp_path / "NOTEPAD.md").write_text("# MokioClaw Notepad\n\nImportant durable note.\n", encoding="utf-8")
     persist_history_summary(runtime, "Previous compressed history.")
 
     memory = build_layered_memory(
@@ -363,14 +362,11 @@ def test_layered_memory_splits_rules_working_and_history(tmp_path: Path) -> None
     assert memory["working_memory"]["task"] == "demo"
     assert memory["working_memory"]["todos"][0]["content"] == "write"
     assert memory["working_memory"]["sources"][0]["url"] == "https://example.com"
-    assert memory["history_summary_store"]["notepad_exists"] is True
-    assert "Important durable note" in memory["history_summary_store"]["notepad"]
     assert "Previous compressed history" in memory["history_summary_store"]["history_summary"]
 
 
 def test_layered_memory_trims_long_history_and_handoffs(tmp_path: Path) -> None:
     runtime = RuntimeState(workspace=tmp_path)
-    (tmp_path / "NOTEPAD.md").write_text("note " * 1000, encoding="utf-8")
     handoffs = [
         {"from_agent": "planner", "to_agent": "codeAgent", "instruction": "i" * 1000, "result": "r" * 1000}
         for _ in range(8)
@@ -389,7 +385,6 @@ def test_layered_memory_trims_long_history_and_handoffs(tmp_path: Path) -> None:
     assert len(memory["working_memory"]["research_notes"]) <= 1600
     assert len(memory["working_memory"]["agent_handoffs"]) == 6
     assert len(memory["working_memory"]["agent_handoffs"][0]["instruction"]) <= 500
-    assert len(memory["history_summary_store"]["notepad"]) <= 1800
 
 
 def test_history_summary_read_missing_file(tmp_path: Path) -> None:

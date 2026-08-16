@@ -565,6 +565,12 @@ def _resolve_approval(state: RuntimeState, command: str) -> BashResult | None:
         "requires_approval": True,
         "approval_id": request.id,
         "risk_reason": risk_reason,
+        "approval_preview": {
+            "tool": "BashTool",
+            "action": f"Run shell command: {command}",
+            "risk_reason": risk_reason,
+            "args_preview": command[:500],
+        },
         "command": command,
     }
     if state.approval_mode == "auto":
@@ -582,6 +588,8 @@ def _resolve_approval(state: RuntimeState, command: str) -> BashResult | None:
                     "ok": False,
                     "approved": False,
                     "error": f"auto classifier denied: {reason}",
+                    "recoverable": True,
+                    "suggested_fix": "Ask for explicit approval or use a safer command.",
                 }
             # ASK：有人工 handler 则询问，否则拒绝
             if state.approval_handler is not None:
@@ -594,12 +602,16 @@ def _resolve_approval(state: RuntimeState, command: str) -> BashResult | None:
                     "ok": False,
                     "approved": False,
                     "error": f"human rejected high-risk command: {risk_reason}",
+                    "recoverable": True,
+                    "suggested_fix": "Choose a safer alternative or ask the user to approve the command.",
                 }
             return {
                 **base,
                 "ok": False,
                 "approved": False,
                 "error": f"classifier unsure and no approval handler: {reason}",
+                "recoverable": True,
+                "suggested_fix": "Provide an approval handler or use a lower-risk command.",
             }
         return {**base, "approved": True}
     if state.approval_mode == "deny" or state.approval_handler is None:
@@ -608,6 +620,8 @@ def _resolve_approval(state: RuntimeState, command: str) -> BashResult | None:
             "ok": False,
             "approved": False,
             "error": f"human approval required for high-risk command: {risk_reason}",
+            "recoverable": True,
+            "suggested_fix": "Ask the user for approval before running this command.",
         }
 
     decision = state.approval_handler(request)
@@ -624,6 +638,8 @@ def _resolve_approval(state: RuntimeState, command: str) -> BashResult | None:
         "ok": False,
         "approved": False,
         "error": decision_reason or f"human rejected high-risk command: {risk_reason}",
+        "recoverable": True,
+        "suggested_fix": "Choose a safer alternative or ask the user to approve the command.",
     }
 
 

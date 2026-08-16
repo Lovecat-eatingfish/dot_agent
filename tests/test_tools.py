@@ -6,12 +6,12 @@ import sys
 
 import pytest
 
+from mokioclaw.core.tool_gate import gate_tool_call
 from mokioclaw.security.approval import ApprovalDecision, classify_command_risk
 from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.tools.bash_tool import bash_tool_description, run_bash
 from mokioclaw.tools.file_tools import edit_file, read_file, write_file
 from mokioclaw.tools.grep_tool import grep
-from mokioclaw.tools.notepad_tool import append_notepad, read_notepad
 from mokioclaw.tools.todo_tool import update_todo, write_todos
 from mokioclaw.tools.todo_tool import persist_todos, render_todo_markdown
 from mokioclaw.tools.web_search_tool import web_search
@@ -311,6 +311,9 @@ def test_bash_high_risk_command_requires_approval_by_default(tmp_path: Path) -> 
     assert result["approved"] is False
     assert result["approval_id"].startswith("approval-")
     assert "uv add" in result["risk_reason"]
+    assert result["approval_preview"]["tool"] == "BashTool"
+    assert result["recoverable"] is True
+    assert "approval" in result["suggested_fix"].lower()
 
 
 def test_bash_high_risk_command_auto_approval_executes(monkeypatch, tmp_path: Path) -> None:
@@ -491,18 +494,6 @@ def test_render_todo_markdown_marks_completed() -> None:
     assert "verified" in content
 
 
-def test_notepad_append_and_read(tmp_path: Path) -> None:
-    state = make_state(tmp_path)
-
-    result = append_notepad(state, "Decision", "Use a single HTML file.")
-    read_result = read_notepad(state)
-
-    assert result["ok"] is True
-    assert (tmp_path / "NOTEPAD.md").exists()
-    assert "Decision" in read_result["content"]
-    assert "single HTML" in read_result["content"]
-
-
 def test_web_search_local_code_backend(tmp_path: Path, monkeypatch) -> None:
     """SEARCH_BACKEND=code：工作区代码搜索命中，无需 Tavily key"""
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
@@ -607,3 +598,33 @@ def test_web_search_tool_parses_tavily_results(monkeypatch) -> None:
     assert result["answer"] == "Amiya is from Arknights."
     assert result["results"][0]["url"] == "https://example.com/amiya"
     assert result.get("backend") == "tavily"
+
+
+def test_tool_gate_blocks_disallowed_tool(tmp_path: Path) -> None:
+    state = RuntimeState(workspace=tmp_path, disallowed_tools=["BashTool"])
+
+    result = gate_tool_call(state, "BashTool", {"command": "echo hi"})
+
+    assert result is not None
+    assert result["ok"] is False
+    assert result["permission_rule"] == "BashTool"
+    assert "disallowed_tools" in result["error"]
+
+
+def test_tool_gate_allowed_tools_blocks_unlisted_tool(tmp_path: Path) -> None:
+    state = RuntimeState(workspace=tmp_path, allowed_tools=["FileReadTool"])
+
+    result = gate_tool_call(state, "BashTool", {"command": "echo hi"})
+
+    assert result is not None
+    assert result["ok"] is False
+    assert result["permission_rule"] == "allowed_tools"
+    assert "not listed" in result["error"]
+
+
+def test_tool_gate_allowed_tools_supports_wildcards(tmp_path: Path) -> None:
+    state = RuntimeState(workspace=tmp_path, allowed_tools=["mcp__*"])
+
+    result = gate_tool_call(state, "mcp__demo__read", {})
+
+    assert result is None

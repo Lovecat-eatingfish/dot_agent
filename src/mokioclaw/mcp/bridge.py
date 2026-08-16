@@ -5,7 +5,9 @@ MCP 桥接管理器
 """
 from __future__ import annotations
 
+import json
 import threading
+from pathlib import Path
 from typing import Any
 
 from langchain_core.tools import StructuredTool
@@ -314,25 +316,106 @@ def _get_workspace_path(workspace: Any) -> Any:
     return None
 
 
+# ============================================================
+# 配置加载
+# ============================================================
+
+
+def _load_mcp_servers_from_config(bridge: MCPBridge, workspace: Any = None) -> None:
+    """从配置文件加载 MCP 服务器
+
+    搜索路径（优先级：后加载的覆盖同名 server）：
+    1. ~/.mokioclaw/mcp.json（全局用户配置）
+    2. <workspace>/.mokioclaw/mcp.json（项目级配置）
+
+    配置格式（对齐 Claude Code claude_desktop_config.json）：
+    .. code-block:: json
+
+        {
+            "mcpServers": {
+                "server-name": {
+                    "command": "node",
+                    "args": ["path/to/server.js"],
+                    "env": {"KEY": "VALUE"}
+                }
+            }
+        }
+
+    HTTP/SSE 传输：
+    .. code-block:: json
+
+        {
+            "mcpServers": {
+                "remote-api": {
+                    "url": "http://localhost:3000/mcp",
+                    "headers": {"Authorization": "Bearer token"}
+                }
+            }
+        }
+    """
+    config_paths: list[Path] = [Path.home() / ".mokioclaw" / "mcp.json"]
+    ws_path = _get_workspace_path(workspace)
+    if ws_path is not None:
+        config_paths.append(ws_path / ".mokioclaw" / "mcp.json")
+
+    for config_path in config_paths:
+        if not config_path.is_file():
+            continue
+        try:
+            data = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("MCP config %s parse failed: %s", config_path, exc)
+            continue
+
+        servers = data.get("mcpServers", data)
+        if not isinstance(servers, dict):
+            continue
+
+        for name, server in servers.items():
+            if not isinstance(server, dict):
+                continue
+            bridge.register_server(
+                name,
+                command=server.get("command"),
+                args=server.get("args"),
+                env=server.get("env"),
+                cwd=server.get("cwd"),
+                url=server.get("url"),
+                headers=server.get("headers"),
+                transport_type=server.get("transportType"),
+            )
+
+
+# ============================================================
 # 模块级单例
+# ============================================================
+
 _default_bridge: MCPBridge | None = None
 _bridge_lock = threading.Lock()
+_servers_loaded: bool = False
 
 
 def get_mcp_bridge(workspace: Any = None) -> MCPBridge:
-    """获取全局 MCP 桥接器单例"""
-    global _default_bridge
+    """获取全局 MCP 桥接器单例
+
+    首次创建时自动从配置文件加载 MCP 服务器（仅一次）。
+    """
+    global _default_bridge, _servers_loaded
     if _default_bridge is None:
         with _bridge_lock:
             if _default_bridge is None:
                 _default_bridge = MCPBridge(workspace=workspace)
+                if not _servers_loaded:
+                    _load_mcp_servers_from_config(_default_bridge, workspace)
+                    _servers_loaded = True
     return _default_bridge
 
 
 def reset_mcp_bridge() -> None:
     """重置全局单例"""
-    global _default_bridge
+    global _default_bridge, _servers_loaded
     with _bridge_lock:
         if _default_bridge is not None:
             _default_bridge.disconnect_all()
         _default_bridge = None
+        _servers_loaded = False

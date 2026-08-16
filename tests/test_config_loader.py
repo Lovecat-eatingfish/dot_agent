@@ -29,6 +29,8 @@ class TestUserConfig:
         assert config.approval_mode == "inline"
         assert config.checkpoint_mode == "light"
         assert config.trace_mode == "on"
+        assert config.allowed_tools == []
+        assert config.disallowed_tools == []
         assert config.bash_default_timeout_seconds == 120
         assert config.bash_max_timeout_seconds == 600
         assert config.bash_max_output_chars == 6000
@@ -112,6 +114,21 @@ class TestCoerceValue:
 # ============================================================
 # Frontmatter application
 # ============================================================
+
+
+def test_tool_permission_frontmatter_parses_lists(tmp_path: Path):
+    cfg = tmp_path / ".mokioclaw" / "config.md"
+    cfg.parent.mkdir()
+    cfg.write_text(
+        "---\nallowedTools:\n  - FileReadTool\n  - mcp__*\ndisallowed_tools: BashTool, WebSearchTool\n---\nBody",
+        encoding="utf-8",
+    )
+
+    config = load_user_config(workspace=tmp_path)
+
+    assert config.allowed_tools == ["FileReadTool", "mcp__*"]
+    assert config.disallowed_tools == ["BashTool", "WebSearchTool"]
+
 
 class TestApplyFrontmatter:
     def test_known_fields(self):
@@ -227,10 +244,10 @@ class TestLoadUserConfig:
             encoding="utf-8",
         )
         config = load_user_config(workspace=tmp_path / "project")
-        # max_attempts from project (3), approval_mode from global (auto)
-        assert config.approval_mode == "auto"
+        # 只读取 workspace 内的项目配置；全局配置需显式 override
+        assert config.approval_mode == "inline"
         assert config.max_attempts == 3
-        assert "Global rules" in config.custom_instructions
+        assert "Global rules" not in config.custom_instructions
         assert "Project rules" in config.custom_instructions
 
     def test_global_override_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -369,3 +386,27 @@ class TestPromptContent:
         builder = PromptBuilder()
         prompt = builder.build("verifier")
         assert "JSON" in prompt or "json" in prompt
+
+
+def test_rules_dir_loaded(tmp_path: Path) -> None:
+    """Test that .claude/rules/*.md files are loaded as custom instructions."""
+    rules_dir = tmp_path / ".claude" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "coding-style.md").write_text("Always use 4-space indentation.", encoding="utf-8")
+    (rules_dir / "testing.md").write_text("Write tests for every function.", encoding="utf-8")
+
+    config = load_user_config(workspace=tmp_path)
+
+    assert "4-space indentation" in config.custom_instructions
+    assert "Write tests" in config.custom_instructions
+    assert any("rules:" in src for src in config.config_sources)
+
+
+def test_mokioclaw_rules_dir_also_works(tmp_path: Path) -> None:
+    rules_dir = tmp_path / ".mokioclaw" / "rules"
+    rules_dir.mkdir(parents=True)
+    (rules_dir / "deploy.md").write_text("Deploy with --check flag.", encoding="utf-8")
+
+    config = load_user_config(workspace=tmp_path)
+
+    assert "--check flag" in config.custom_instructions

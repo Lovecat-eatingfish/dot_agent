@@ -141,6 +141,7 @@ def test_stream_agent_events_routes_model_workflow_to_complex_graph(monkeypatch,
 
 def test_stream_agent_events_saves_checkpoint_on_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:
     from mokioclaw.orchestration.agent import stream_agent_events
+    from mokioclaw.reliability.session_store import get_latest_session
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
@@ -159,9 +160,12 @@ def test_stream_agent_events_saves_checkpoint_on_keyboard_interrupt(monkeypatch,
         )
     )
 
-    assert any(event.get("type") == "custom_event" and event["event"].get("type") == "checkpoint_saved" for event in events)
-    assert (tmp_path / ".mokioclaw" / "checkpoints" / "RECOVERY.md").exists()
-    assert "plan" in (tmp_path / ".mokioclaw" / "checkpoints" / "RECOVERY.md").read_text(encoding="utf-8")
+    # 新机制：session 被标记为 interrupted
+    session = get_latest_session(tmp_path)
+    assert session is not None
+    assert session["status"] == "interrupted"
+    # 轮次检查点已保存
+    assert (tmp_path / ".mokioclaw" / "sessions").exists()
 
 
 def test_stream_agent_events_writes_trace_summary_on_finish(monkeypatch, tmp_path: Path) -> None:
@@ -195,6 +199,7 @@ def test_stream_agent_events_writes_trace_summary_on_finish(monkeypatch, tmp_pat
 
 def test_stream_agent_events_checkpoints_only_at_safety_points(monkeypatch, tmp_path: Path) -> None:
     from mokioclaw.orchestration.agent import stream_agent_events
+    from mokioclaw.reliability.session_store import get_latest_session, list_turn_checkpoints
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
@@ -225,10 +230,11 @@ def test_stream_agent_events_checkpoints_only_at_safety_points(monkeypatch, tmp_
         )
     )
 
-    trace_events = [event["event"] for event in events if event.get("type") == "custom_event" and event["event"].get("type") == "trace_summary"]
-    assert trace_events
-    # started + planner graph update + failed/approval tool result + final graph update + finished
-    assert trace_events[-1]["checkpoint_count"] == 5
+    # 新机制：每个用户输入保存一个轮次检查点
+    session = get_latest_session(tmp_path)
+    assert session is not None
+    checkpoints = list_turn_checkpoints(tmp_path, session["session_id"])
+    assert len(checkpoints) >= 1  # 至少保存了一个轮次检查点
 
 
 def test_stream_agent_events_writes_trace_summary_on_keyboard_interrupt(monkeypatch, tmp_path: Path) -> None:
@@ -284,22 +290,20 @@ def test_stream_agent_events_trace_off_creates_no_trace_dir(monkeypatch, tmp_pat
 
 def test_stream_agent_events_trace_records_resume(monkeypatch, tmp_path: Path) -> None:
     from mokioclaw.orchestration.agent import stream_agent_events
-    from mokioclaw.reliability.checkpoint import CheckpointManager
-    from mokioclaw.state.runtime import RuntimeState
+    from mokioclaw.reliability.session_store import create_session, save_turn_checkpoint
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
             yield ("updates", {"final": {"final_answer": "PASSED"}})
 
-    runtime = RuntimeState(workspace=tmp_path, checkpoint_mode="light")
-    CheckpointManager(runtime, task="original task").save(
-        {"task": "original task", "runtime": runtime, "messages": [], "max_attempts": 3},
-        status="interrupted",
-        latest_node="planner",
-    )
+    # 创建一个已有的 session 用于恢复
+    session = create_session(tmp_path, "original task")
+    save_turn_checkpoint(tmp_path, session, 1, "original task")
+
+    monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: _WorkflowEntry())
     monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", lambda: FakeWorkflow())
 
-    list(
+    events = list(
         stream_agent_events(
             workspace=tmp_path,
             resume_workspace=tmp_path,
@@ -309,27 +313,22 @@ def test_stream_agent_events_trace_records_resume(monkeypatch, tmp_path: Path) -
         )
     )
 
-    events_files = list((tmp_path / ".mokioclaw" / "traces").glob("trace-*/events.jsonl"))
-    assert events_files
-    content = events_files[0].read_text(encoding="utf-8")
-    assert "checkpoint_resumed" in content
+    # 新机制：检查 session_resumed 事件
+    custom_events = [event["event"] for event in events if event.get("type") == "custom_event"]
+    assert any(e.get("type") == "session_resumed" for e in custom_events)
 
 
 def test_stream_agent_events_resume_skips_entry_router(monkeypatch, tmp_path: Path) -> None:
     from mokioclaw.orchestration.agent import stream_agent_events
-    from mokioclaw.reliability.checkpoint import CheckpointManager
-    from mokioclaw.state.runtime import RuntimeState
+    from mokioclaw.reliability.session_store import create_session, save_turn_checkpoint
 
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
             yield ("updates", {"final": {"final_answer": "PASSED"}})
 
-    runtime = RuntimeState(workspace=tmp_path, checkpoint_mode="light")
-    CheckpointManager(runtime, task="original task").save(
-        {"task": "original task", "runtime": runtime, "messages": [], "max_attempts": 3},
-        status="interrupted",
-        latest_node="planner",
-    )
+    # 创建一个已有的 session 用于恢复
+    session = create_session(tmp_path, "original task")
+    save_turn_checkpoint(tmp_path, session, 1, "original task")
 
     def fail_entry_workflow():
         raise AssertionError("resume should skip entry router")
@@ -339,15 +338,17 @@ def test_stream_agent_events_resume_skips_entry_router(monkeypatch, tmp_path: Pa
 
     events = list(stream_agent_events(workspace=tmp_path, resume_workspace=tmp_path, checkpoint_mode="off", trace_mode="off", approval_mode="deny"))
 
-    assert any(event.get("type") == "custom_event" and event["event"].get("type") == "checkpoint_resumed" for event in events)
+    # 新机制：检查 session_resumed 事件
+    custom_events = [event["event"] for event in events if event.get("type") == "custom_event"]
+    assert any(e.get("type") == "session_resumed" for e in custom_events)
 
 
 def test_stream_session_events_chat_writes_session_without_harness(monkeypatch, tmp_path: Path) -> None:
     from mokioclaw.orchestration.agent import stream_session_events
+    from mokioclaw.reliability.session_store import get_latest_session
 
     class FakeEntryWorkflow:
         def stream(self, inputs, stream_mode):
-            assert inputs["session_context"]
             yield (
                 "custom",
                 {"type": "intent_decision", "route": "chat", "reason": "greeting", "confidence": 0.9},
@@ -365,14 +366,16 @@ def test_stream_session_events_chat_writes_session_without_harness(monkeypatch, 
     custom_types = [event["event"]["type"] for event in events if event.get("type") == "custom_event"]
     assert "session_started" in custom_types
     assert "session_turn_saved" in custom_types
-    assert not (tmp_path / ".mokioclaw" / "checkpoints").exists()
-    assert not (tmp_path / ".mokioclaw" / "traces").exists()
-    assert (tmp_path / ".mokioclaw" / "session" / "session.json").exists()
-    assert (tmp_path / "SESSION_SUMMARY.md").exists()
+    # 新机制：session 存储在 .mokioclaw/sessions/ 目录
+    assert (tmp_path / ".mokioclaw" / "sessions").exists()
+    session = get_latest_session(tmp_path)
+    assert session is not None
+    assert session["status"] == "finished"
 
 
 def test_stream_session_events_workflow_reuses_workspace_and_session_context(monkeypatch, tmp_path: Path) -> None:
     from mokioclaw.orchestration.agent import stream_session_events
+    from mokioclaw.reliability.session_store import get_latest_session
 
     captured = {}
 
@@ -386,7 +389,7 @@ def test_stream_session_events_workflow_reuses_workspace_and_session_context(mon
     class FakeWorkflow:
         def stream(self, inputs, stream_mode):
             captured["workspace"] = inputs["runtime"].workspace
-            captured["session_context"] = inputs.get("session_context", "")
+            captured["session_id"] = inputs.get("session_id", "")
             captured["session_turn"] = inputs.get("session_turn")
             yield ("updates", {"final": {"final_answer": "PASSED: done"}})
 
@@ -405,9 +408,11 @@ def test_stream_session_events_workflow_reuses_workspace_and_session_context(mon
 
     assert captured["workspace"] == tmp_path
     assert captured["session_turn"] == 1
-    assert "帮我创建 app.py" in captured["session_context"]
+    assert captured["session_id"]  # session_id 应该存在
     assert any(event.get("type") == "workspace" and event.get("path") == str(tmp_path) for event in events)
-    assert (tmp_path / ".mokioclaw" / "session" / "session.json").exists()
+    # 新机制：session 存储在 .mokioclaw/sessions/ 目录
+    session = get_latest_session(tmp_path)
+    assert session is not None
 
 
 class _WorkflowEntry:

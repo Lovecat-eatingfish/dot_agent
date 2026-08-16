@@ -239,7 +239,7 @@ def summarize_graph_event(payload: dict[str, Any]) -> EventSummary:
     if node == "verifier":
         return EventSummary("Verifier", _format_verifier(update), "verifier", "green" if update.get("passed") else "red")
     if node == "final":
-        return EventSummary("Final", shorten(update.get("final_answer", update), 1200), "final", "green")
+        return EventSummary("Final", _format_final(update), "final", "green")
     if node == "context_monitor":
         return summarize_custom_event({"type": "context_monitor", **update})
     if node == "context_compressor":
@@ -321,6 +321,22 @@ def _format_verifier(update: dict[str, Any]) -> str:
             lines.append(f"{status}: {check.get('name', 'check')} - {shorten(check.get('detail', ''), 160)}")
     lines.append(f"passed={update.get('passed')} | attempts={update.get('attempts')}")
     return "\n".join(lines)
+
+
+def _format_final(update: dict[str, Any]) -> str:
+    final_answer = str(update.get("final_answer", "")).strip()
+    if final_answer:
+        return shorten(final_answer, 1200)
+    parts = []
+    if update.get("passed") is not None:
+        parts.append(f"passed={update.get('passed')}")
+    if update.get("verifier_summary"):
+        parts.append(f"verifier={shorten(update.get('verifier_summary'), 300)}")
+    if update.get("plan_summary"):
+        parts.append(f"plan={shorten(update.get('plan_summary'), 300)}")
+    if update.get("repair_instruction"):
+        parts.append(f"repair={shorten(update.get('repair_instruction'), 300)}")
+    return " | ".join(parts) or "(final state)"
 
 
 def _latest_compression(event: dict[str, Any]) -> dict[str, Any]:

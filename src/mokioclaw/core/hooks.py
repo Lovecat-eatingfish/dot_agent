@@ -42,11 +42,13 @@ class HookEvent(Enum):
     SessionStart = "SessionStart"
     SessionEnd = "SessionEnd"
     UserPromptSubmit = "UserPromptSubmit"
+    UserPromptExpansion = "UserPromptExpansion"
     # 压缩前触发（对齐 Claude Code PreCompact；matcher 区分 manual/auto）
     PreCompact = "PreCompact"
     # 模型 end_turn / 子代理结束（对齐 Claude Code Stop / SubagentStop）
     Stop = "Stop"
     SubagentStop = "SubagentStop"
+    StopFailure = "StopFailure"
 
 
 # 工具相关事件（需要 matcher 过滤）

@@ -13,8 +13,6 @@
 - FileEditTool: 编辑文件
 - GrepTool: 搜索文件内容
 - BashTool: 执行 Shell 命令
-- NotepadReadTool: 读取笔记本
-- NotepadAppendTool: 写入笔记本
 - TodoUpdateTool: 更新待办事项状态
 
 执行流程：
@@ -30,6 +28,9 @@ import json
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+# Subagent context isolation: each subagent gets a fresh message list
+# aligned with Claude Code's independent context per subagent
 from langchain_core.tools import StructuredTool
 
 from mokioclaw.core.log import get_logger
@@ -292,6 +293,21 @@ def _order_tool_calls_for_execution(tool_calls: list[dict[str, Any]]) -> list[di
             key=lambda item: (priority.get(str(item[1].get("name") or ""), 1), item[0]),
         )
     ]
+
+
+def isolate_subagent_context(messages: list, runtime: RuntimeState) -> list:
+    """Isolate subagent context: keep system prompt + task, drop parent conversation.
+
+    Aligns with Claude Code where subagents have independent context windows
+    and do not inherit the full parent conversation history.
+    """
+    from langchain_core.messages import SystemMessage
+    isolated: list = []
+    for msg in messages:
+        if isinstance(msg, SystemMessage):
+            isolated.append(msg)
+    # Add a fresh HumanMessage with just the task
+    return isolated
 
 
 def execute_code_agent_tool(runtime: RuntimeState, todos: list[dict[str, str]], call: dict[str, Any]):

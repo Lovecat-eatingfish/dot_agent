@@ -184,6 +184,11 @@ def build_session_summary_markdown(workspace: Path, session: dict[str, Any]) -> 
         f"- turns: {session.get('turn_index', 0)}",
         f"- updated_at: {session.get('updated_at', '')}",
         f"- last_route: {session.get('last_route', '') or '(none)'}",
+        f"- status: {session.get('status', '') or '(unknown)'}",
+        "",
+        "## Current State",
+        "",
+        _render_state_snapshot(session),
         "",
         "## Summary",
         "",
@@ -202,6 +207,23 @@ def build_session_summary_markdown(workspace: Path, session: dict[str, Any]) -> 
 def trim_text(text: str, limit: int) -> str:
     """截断文本（兼容 None 输入）"""
     return truncate(text or "", limit)
+
+
+def _render_state_snapshot(session: dict[str, Any]) -> str:
+    state = session.get("last_state_summary") or {}
+    if not isinstance(state, dict) or not state:
+        return "(no recorded state snapshot yet)"
+    lines = [
+        f"- passed: {state.get('passed', '')}",
+        f"- attempts: {state.get('attempts', '')}",
+        f"- trace_id: {state.get('trace_id', '') or '(none)'}",
+        f"- verifier_summary: {trim_text(str(state.get('verifier_summary', '') or ''), 500) or '(none)'}",
+        f"- repair_instruction: {trim_text(str(state.get('repair_instruction', '') or ''), 500) or '(none)'}",
+        f"- plan_summary: {trim_text(str(state.get('plan_summary', '') or ''), 500) or '(none)'}",
+        f"- acceptance_criteria: {len(state.get('acceptance_criteria', []) or [])}",
+        f"- verification_checks: {len(state.get('verification_checks', []) or [])}",
+    ]
+    return "\n".join(lines)
 
 
 #  保证会话字典字段永远齐全，缺失自动填充默认值：

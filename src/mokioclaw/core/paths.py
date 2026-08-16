@@ -30,6 +30,11 @@ def default_rag_dir(root: Path | None = None) -> Path:
     return (root or find_project_root()) / ".mokioclaw" / "rag"
 
 
+def project_memory_dir(root: Path | None = None) -> Path:
+    """项目级记忆目录（跨会话持久），位于 <project_root>/.mokioclaw/memory/"""
+    return (root or find_project_root()) / ".mokioclaw" / "memory"
+
+
 def new_task_workspace(root: Path | None = None) -> Path:
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     suffix = uuid4().hex[:6]

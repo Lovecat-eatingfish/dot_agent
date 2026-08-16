@@ -29,8 +29,6 @@ _EDIT_MODE_ALLOW = frozenset({
     "FileEditTool",
     "GlobTool",
     "GrepTool",
-    "NotepadReadTool",
-    "NotepadAppendTool",
     "SkillTool",
     "TodoUpdateTool",
     "MemoryIndexTool",
@@ -42,7 +40,6 @@ _PLAN_MODE_ALLOW = frozenset({
     "FileReadTool",
     "GlobTool",
     "GrepTool",
-    "NotepadReadTool",
     "WebSearchTool",
     "SkillTool",
     "TodoUpdateTool",
@@ -55,7 +52,6 @@ _MUTATING_TOOLS = frozenset({
     "FileWriteTool",
     "FileEditTool",
     "BashTool",
-    "NotepadAppendTool",
     "MemoryWriteTool",
     "AgentTool",  # 派生子 Agent 可间接写盘，approve 模式需确认
 })

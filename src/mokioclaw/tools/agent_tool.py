@@ -38,8 +38,6 @@ _DEFAULT_SUBAGENT_TOOLS = frozenset({
     "GlobTool",
     "GrepTool",
     "BashTool",
-    "NotepadReadTool",
-    "NotepadAppendTool",
     "WebSearchTool",
     "SkillTool",
     "MemoryIndexTool",

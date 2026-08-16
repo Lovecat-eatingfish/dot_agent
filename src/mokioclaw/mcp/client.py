@@ -10,6 +10,7 @@ import re
 import time
 from typing import Any
 
+import os
 from mokioclaw.core.log import get_logger
 from mokioclaw.mcp.protocol import (
     MCPServerState,
@@ -29,6 +30,18 @@ from mokioclaw.mcp.sandbox import SandboxPolicy
 from mokioclaw.mcp.transport import MCPTransportBase
 
 logger = get_logger(__name__)
+
+
+def _mcp_timeout(default: int) -> int:
+    return int(os.getenv("MCP_TIMEOUT", str(default)))
+
+
+def _mcp_tool_timeout(default: int) -> int:
+    return int(os.getenv("MCP_TOOL_TIMEOUT", str(default)))
+
+
+def _max_mcp_output_tokens(default: int) -> int:
+    return int(os.getenv("MAX_MCP_OUTPUT_TOKENS", str(default)))
 
 # initialize 超时时间（秒）
 _INIT_TIMEOUT = 15.0

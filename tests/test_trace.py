@@ -101,3 +101,35 @@ def test_trace_timeline_keeps_head_and_tail_with_omission(tmp_path: Path) -> Non
     assert "event-0" in timeline
     assert "event-139" in timeline
     assert "omitted" in timeline
+
+
+def test_trace_summary_includes_final_state_summary(tmp_path: Path) -> None:
+    trace = TraceRecorder(RuntimeState(workspace=tmp_path, trace_mode="on"), task="trace-demo")
+    trace.end(
+        status="finished",
+        latest_node="final",
+        final_state={
+            "passed": True,
+            "attempts": 2,
+            "plan_summary": "refine outputs",
+            "verifier_summary": "looks good",
+            "repair_instruction": "tighten memory",
+            "acceptance_criteria": ["a"],
+            "verification_checks": ["b"],
+        },
+    )
+
+    summary = trace.summary_payload()
+
+    assert "refine outputs" in summary["summary"]
+    assert summary["final_state"]["attempts"] == 2
+
+
+def test_trace_summary_field_order(tmp_path: Path) -> None:
+    trace = TraceRecorder(RuntimeState(workspace=tmp_path, trace_mode="on"), task="demo")
+    trace.end(status="finished", latest_node="final", final_state={"passed": True, "attempts": 1, "plan_summary": "plan"})
+
+    summary = trace.summary_payload()
+
+    keys = list(summary.keys())
+    assert keys[:4] == ["trace_id", "status", "final_status", "summary"]

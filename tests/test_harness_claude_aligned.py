@@ -98,6 +98,14 @@ def test_slash_help_and_custom_command(tmp_path: Path):
     (cmd_dir / "hello.md").write_text("Say hello politely.", encoding="utf-8")
     help_result = dispatch_slash_command("/help", workspace=tmp_path)
     assert help_result.kind == CommandKind.SYSTEM
+    assert "[Help]" in help_result.ui_message
+    assert "/resume" in help_result.ui_message
+    status_result = dispatch_slash_command("/status", workspace=tmp_path)
+    assert status_result.kind == CommandKind.SYSTEM
+    assert "[Status]" in status_result.ui_message
+    memory_result = dispatch_slash_command("/memory", workspace=tmp_path)
+    assert memory_result.kind == CommandKind.SYSTEM
+    assert "[Memory]" in memory_result.ui_message
     custom = dispatch_slash_command("/hello", workspace=tmp_path)
     assert custom.kind == CommandKind.CUSTOM
     assert "Say hello" in custom.inject_message
@@ -129,15 +137,15 @@ def test_load_mcp_tool_ordered_first():
 
 def test_end_persistent_session_hooks(tmp_path: Path):
     from mokioclaw.orchestration.agent import end_persistent_session_hooks
-    from mokioclaw.reliability.session import load_or_create_session, save_session, session_file
+    from mokioclaw.reliability.session_store import create_session, load_session, save_session
 
-    session = load_or_create_session(tmp_path)
+    session = create_session(tmp_path, "test task")
     session["_session_hooks_started"] = True
     save_session(tmp_path, session)
     end_persistent_session_hooks(tmp_path)
-    saved = json.loads(session_file(tmp_path).read_text(encoding="utf-8"))
+    saved = load_session(tmp_path, session["session_id"])
     assert saved.get("_session_hooks_started") is False
-    assert saved.get("_session_hooks_ended") is True
+    assert saved.get("_session_ended") is True
     end_persistent_session_hooks(tmp_path)  # idempotent
 
 

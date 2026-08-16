@@ -25,8 +25,6 @@ ALWAYS_LOAD = frozenset({
     "GlobTool",
     "GrepTool",
     "BashTool",
-    "NotepadReadTool",
-    "NotepadAppendTool",
     "TodoUpdateTool",
     "ToolSearchTool",
     "LoadMcpTool",

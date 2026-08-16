@@ -1,7 +1,7 @@
 """
 Memory 索引器
 
-为 workspace 中的记忆文件（TODO.md, NOTEPAD.md, HISTORY_SUMMARY.md, RAW_HISTORY.md）
+为 workspace 中的记忆文件（TODO.md, HISTORY_SUMMARY.md, RAW_HISTORY.md）
 建立持久化索引，支持渐进式披露和关键词检索。
 
 索引文件：{workspace}/.mokioclaw/memory_index.json
@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 
-MEMORY_FILES = ("TODO.md", "NOTEPAD.md", "HISTORY_SUMMARY.md", "RAW_HISTORY.md")
+MEMORY_FILES = ("TODO.md", "HISTORY_SUMMARY.md", "RAW_HISTORY.md")
 MEMORY_INDEX_FILE = ".mokioclaw/memory_index.json"
 MAX_INDEX_CHARS_PER_FIELD = 500
 
@@ -95,8 +95,6 @@ def build_memory_index(workspace: Path) -> MemoryIndex:
         # 文件特定统计
         if filename == "TODO.md":
             file_info.update(_index_todo(content))
-        elif filename == "NOTEPAD.md":
-            file_info.update(_index_notepad(content))
         elif filename == "HISTORY_SUMMARY.md":
             file_info["turn_range"] = _extract_turn_range(content)
         elif filename == "RAW_HISTORY.md":
@@ -148,15 +146,6 @@ def _index_todo(content: str) -> dict[str, Any]:
         "completed": sum(1 for s in todos if s == "x"),
         "in_progress": sum(1 for s in todos if s == "-"),
         "blocked": sum(1 for s in todos if s == "!"),
-    }
-
-
-def _index_notepad(content: str) -> dict[str, Any]:
-    """索引 NOTEPAD.md 内容"""
-    sections = re.findall(r"^#{1,3}\s+(.+)$", content, re.MULTILINE)
-    return {
-        "section_count": len(sections),
-        "headings": sections[:20],
     }
 
 

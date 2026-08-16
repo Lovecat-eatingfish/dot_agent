@@ -189,6 +189,9 @@ def print_custom_event(event: dict[str, Any]) -> None:
     if event_type == "trace_summary":
         render_trace_summary(event)
         return
+    if event_type == "final":
+        render_final(event)
+        return
     console.print(Panel(_shorten(event, 1000), title="Event", box=box.ROUNDED))
 
 
@@ -323,9 +326,20 @@ def render_verifier(update: dict[str, Any]) -> None:
 
 
 def render_final(update: dict[str, Any]) -> None:
-    answer = update.get("final_answer", "")
-    style = "green" if "PASSED" in answer else "red"
-    console.print(Panel(_shorten(answer, 2000), title="Final", border_style=style, box=box.ROUNDED))
+    answer = str(update.get("final_answer", ""))
+    lines = [
+        f"status: {update.get('final_status', '') or ('passed' if update.get('passed') else 'failed')}",
+        f"passed: {update.get('passed', '')}",
+        f"attempts: {update.get('attempts', '')}",
+    ]
+    if update.get("verifier_summary"):
+        lines.append(f"verifier: {_shorten(update.get('verifier_summary'), 320)}")
+    if update.get("repair_instruction"):
+        lines.append(f"repair: {_shorten(update.get('repair_instruction'), 320)}")
+    lines.append("")
+    lines.append(_shorten(answer, 1800))
+    style = "green" if update.get("passed") else "red"
+    console.print(Panel("\n".join(lines), title="Final", border_style=style, box=box.ROUNDED))
 
 
 def render_context_monitor(update: dict[str, Any]) -> None:
@@ -382,7 +396,6 @@ def render_memory_snapshot(update: dict[str, Any]) -> None:
         f"todos={update.get('todo_count', 0)} | "
         f"sources={update.get('source_count', 0)} | "
         f"handoffs={update.get('handoff_count', 0)} | "
-        f"notepad={update.get('notepad_exists')} | "
         f"history={update.get('history_exists')} {update.get('history_path', '')}"
     )
     body = Table.grid(expand=True)
@@ -425,13 +438,14 @@ def render_trace_summary(event: dict[str, Any]) -> None:
     lines = [
         f"trace: {event.get('trace_id', '')}",
         f"status: {event.get('status', '')}",
+        f"final: {event.get('final_status', '') or '(unknown)'}",
         f"duration_ms: {event.get('duration_ms', 0)}",
         f"path: {event.get('trace_dir', '')}",
-        f"nodes: {node_text}",
         f"tools: {event.get('tool_calls', 0)} total / {event.get('failed_tool_calls', 0)} failed",
         f"approvals: {event.get('approval_count', 0)}",
         f"checkpoints: {event.get('checkpoint_count', 0)}",
-        f"final: {event.get('final_status', '') or '(unknown)'}",
+        f"nodes: {node_text}",
+        f"summary: {_shorten(event.get('summary', ''), 700)}",
     ]
     errors = event.get("errors") if isinstance(event.get("errors"), list) else []
     if errors:

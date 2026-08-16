@@ -27,7 +27,6 @@ from mokioclaw.memory.dual_threshold_compression import (
     SummaryChain,
 )
 from mokioclaw.memory.retrieval import IntentBasedRetrievalTrigger, SimpleMemoryRetriever
-from mokioclaw.memory.tool_disclosure import ProgressiveToolDisclosure, ToolRegistry, ToolSchema, ToolMetadata
 
 
 class TestDualThresholdCompression:
@@ -210,76 +209,6 @@ class TestMemoryRetrieval:
         assert trigger.should_retrieve("继续之前的任务", intent="continuation") is False
 
 
-class TestToolDisclosure:
-    """测试工具渐进式披露"""
-
-    def test_brief_tool_list_estimation(self):
-        """精简工具列表的 token 估算
-
-        面试官考察点：
-        - "如何减少工具过多的 Token 消耗"
-        - 关键数据：50 工具全量 20000 token → 渐进式 2200 token（节省 89%）
-        """
-        registry = ToolRegistry()
-
-        # 注册 50 个工具
-        for i in range(50):
-            registry.register(
-                ToolMetadata(
-                    name=f"Tool_{i}",
-                    description=f"Tool number {i} for testing purposes with a longer description",
-                    category="test",
-                ),
-                ToolSchema(
-                    name=f"Tool_{i}",
-                    description=f"Tool number {i} for testing purposes with a longer description",
-                    parameters={"type": "object", "properties": {"param": {"type": "string"}}},
-                ),
-            )
-
-        disclosure = ProgressiveToolDisclosure(registry)
-
-        # 估算精简列表
-        brief_stats = disclosure.estimate_token_usage("brief")
-        assert brief_stats["tool_count"] == 50
-        assert brief_stats["estimated_tokens"] < 3000  # 远少于 20000
-
-        # 加载 3 个完整 Schema
-        disclosure.get_full_schemas_for_intent("test", "test")
-        full_stats = disclosure.estimate_token_usage("full")
-
-        # 总 token 应该远小于全量加载
-        total = brief_stats["estimated_tokens"] + full_stats["estimated_tokens"]
-        assert total < 5000  # 远少于 20000
-
-    def test_intent_based_tool_selection(self):
-        """基于意图的工具选择"""
-        registry = ToolRegistry()
-
-        registry.register(
-            ToolMetadata(name="FileReadTool", description="Read files", keywords=["read", "file"]),
-            ToolSchema(name="FileReadTool", description="Read files", parameters={}),
-        )
-        registry.register(
-            ToolMetadata(name="FileWriteTool", description="Write files", keywords=["write", "file"]),
-            ToolSchema(name="FileWriteTool", description="Write files", parameters={}),
-        )
-        registry.register(
-            ToolMetadata(name="BashTool", description="Execute commands", keywords=["bash", "shell"]),
-            ToolSchema(name="BashTool", description="Execute commands", parameters={}),
-        )
-
-        disclosure = ProgressiveToolDisclosure(registry)
-
-        # 文件操作意图应该匹配文件工具
-        result = disclosure.get_full_schemas_for_intent("file_operation", "read a file")
-        assert "FileReadTool" in result
-
-        # 代码执行意图应该匹配 BashTool
-        result = disclosure.get_full_schemas_for_intent("code_execution", "run python script")
-        assert "BashTool" in result
-
-
 class TestMemoryArchitectureInterview:
     """面试官考察点集成测试
 
@@ -359,46 +288,6 @@ class TestMemoryArchitectureInterview:
         # 实际实现中会调用 _persist_raw_history()
         # 这里只验证思路正确
         assert len(messages) == 10
-
-    def test_interview_question_11_tool_token_saving(self):
-        """Q11: 如何减少工具过多的 Token 消耗？
-
-        答案：意图识别 + 渐进式披露
-        - 50 工具全量：50 × 400 = 20000 token
-        - 渐进式：50 × 20 + 3 × 400 = 2200 token
-        - 节省 89%
-        """
-        registry = ToolRegistry()
-
-        # 模拟 50 个工具
-        for i in range(50):
-            registry.register(
-                ToolMetadata(
-                    name=f"Tool_{i}",
-                    description=f"Tool {i} - " + "long description " * 10,
-                    keywords=["test"],
-                )
-            )
-
-        disclosure = ProgressiveToolDisclosure(registry)
-
-        # 精简列表
-        brief = disclosure.get_brief_tool_list()
-        brief_stats = disclosure.estimate_token_usage("brief")
-
-        # 完整 Schema（3个）
-        disclosure.get_full_schemas_for_intent("test", "test")
-        full_stats = disclosure.estimate_token_usage("full")
-
-        total_tokens = brief_stats["estimated_tokens"] + full_stats["estimated_tokens"]
-
-        # 验证节省效果
-        full_load_estimate = 50 * 400  # 20000
-        savings_pct = (1 - total_tokens / full_load_estimate) * 100
-
-        assert total_tokens < 5000  # 远少于 20000
-        assert savings_pct > 75  # 节省 >75%
-
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

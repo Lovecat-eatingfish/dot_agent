@@ -77,6 +77,10 @@ class RuntimeState:
     # Agent 运行模式：auto / plan / approve / edit
     agent_mode: str = "auto"
 
+    # 工具权限规则：支持精确名称与通配符（如 mcp__*）
+    allowed_tools: list[str] = field(default_factory=list)
+    disallowed_tools: list[str] = field(default_factory=list)
+
     # 审批处理函数，当 approval_mode=inline 时，由 CLI 或 TUI 提供
     approval_handler: Callable[[ApprovalRequest], ApprovalDecision | bool] | None = None
 
@@ -123,6 +127,11 @@ class RuntimeState:
 
     # 追踪 ID，用于关联同一任务的所有事件
     trace_id: str | None = None
+
+    # 模型名称/提供方/会话标识等状态信息
+    model_name: str = ""
+    model_provider: str = ""
+    account_name: str = ""
 
     # Hook 执行引擎，工具执行前后调用
     hook_runner: HookRunner = field(default_factory=HookRunner)

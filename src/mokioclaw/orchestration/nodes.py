@@ -462,9 +462,14 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
         "recommended_next_instruction": "Return valid verifier JSON after inspecting the result.",
     }
     checks = _normalize_checks(parsed.get("checks"))
-    passed = bool(parsed.get("passed"))
+    checks = _merge_acceptance_gate_checks(state, checks)
+    passed = bool(parsed.get("passed")) and _checks_passed(checks)
     reason = str(parsed.get("reason") or "")
     recommended = str(parsed.get("recommended_next_instruction") or "")
+    if not passed and not recommended:
+        recommended = _recommended_from_failed_checks(checks)
+    if not reason:
+        reason = _summarize_checks(checks, passed)
     attempts = state.get("attempts", 0) + 1
     todos = [dict(todo) for todo in state.get("todos", [])]
     if passed:
@@ -995,47 +1000,13 @@ def verifier_route(state: MokioGraphState) -> str:
 def final_node(state: MokioGraphState) -> dict[str, Any]:
     """结束节点
 
-    生成任务执行的最终结果摘要，包括：
-    - 任务状态（PASSED/FAILED）
-    - 计划摘要
-    - 待办事项列表
-    - 研究来源
-    - 校验结果
-    - 上下文压缩统计
-    - 代码智能体摘要
-
-    Args:
-        state: 当前工作流状态
-
-    Returns:
-        包含 final_answer 的状态更新
+    生成更紧凑、可操作的最终结果摘要。
     """
     status = "PASSED" if state.get("passed") else "FAILED"
-    checks = "\n".join(
-        f"- {check.get('name', 'check')}: {'PASS' if check.get('passed') else 'FAIL'} - {check.get('detail', '')}"
-        for check in state.get("verification_checks", [])
-    )
-    todos = "\n".join(f"- [{todo.get('status', '')}] {todo.get('content', '')}" for todo in state.get("todos", []))
-    sources = "\n".join(f"- {source.get('title', '')}: {source.get('url', '')}" for source in state.get("sources", []))
-    compression_events = state.get("compression_events", [])
-    compression_text = "(none)"
-    if compression_events:
-        latest = compression_events[-1]
-        compression_text = (
-            f"{len(compression_events)} compression(s); "
-            f"latest {latest.get('before_tokens')} -> {latest.get('after_tokens')} tokens; "
-            f"removed {latest.get('removed_messages')} message(s)"
-        )
-    final_answer = (
-        f"LangGraph MultiAgent workflow finished: {status}\n\n"
-        f"Plan: {state.get('plan_summary', '')}\n\n"
-        f"Todos:\n{todos}\n\n"
-        f"Research sources:\n{sources or '(none)'}\n\n"
-        f"Verifier:\n{state.get('verifier_summary', '')}\n\n"
-        f"Checks:\n{checks or '(none)'}\n\n"
-        f"Context compression:\n{compression_text}\n\n"
-        f"CodeAgent summary:\n{state.get('code_agent_summary') or state.get('last_actor_summary', '')}"
-    )
+    verdict = _final_verdict_line(state, status)
+    summary = _final_summary_block(state)
+    next_step = _final_next_step(state)
+    final_answer = "\n\n".join(part for part in [verdict, summary, next_step] if part)
     return {"final_answer": final_answer}
 
 
@@ -1249,15 +1220,27 @@ def _fallback_compression(state: MokioGraphState, *, error: str = "") -> dict[st
 
 
 def _format_compressed_context(compressed: dict[str, Any], state: MokioGraphState) -> str:
+    active_goal = str(state.get("task", ""))
+    continuation = "Continue the current plan."
+    if state.get("verifier_summary") and not state.get("passed"):
+        continuation = f"Resume the repair loop: verify and fix remaining issues."
+    elif state.get("plan_summary"):
+        continuation = f"Continue the current plan: {state.get('plan_summary', '')[:300]}"
+    elif active_goal:
+        continuation = f"Continue the original task: {active_goal[:300]}"
     payload = {
         "type": "mokio_context_summary",
-        "task": state.get("task", ""),
+        "task": active_goal,
+        "active_goal": active_goal,
+        "continuation_hint": continuation,
         "plan_summary": state.get("plan_summary", ""),
         "todos": state.get("todos", []),
         "acceptance_criteria": state.get("acceptance_criteria", []),
         "verification_commands": state.get("verification_commands", []),
         "attempts": state.get("attempts", 0),
         "passed": state.get("passed"),
+        "verifier_summary": state.get("verifier_summary", ""),
+        "repair_instruction": state.get("repair_instruction", ""),
         "compression": compressed,
     }
     return json.dumps(payload, ensure_ascii=False, indent=2, default=str)
@@ -1311,10 +1294,26 @@ def _planner_input(state: MokioGraphState, memory: dict[str, Any]) -> str:
 
 def _verifier_input(state: MokioGraphState, memory: dict[str, Any]) -> str:
     parts = [f"Task: {sanitize_user_input(state['task'])}"]
+    if state.get("plan_summary"):
+        parts.append("Plan summary:\n" + str(state.get("plan_summary", "")))
+    if state.get("todos"):
+        parts.append("Todos:\n" + json.dumps(state.get("todos", []), ensure_ascii=False, default=str))
+    if state.get("acceptance_criteria"):
+        criteria = "\n".join(f"- {item}" for item in state.get("acceptance_criteria", []) or [])
+        parts.append("Acceptance criteria that must all be checked:\n" + criteria)
+    if state.get("verification_commands"):
+        commands = "\n".join(f"- {cmd}" for cmd in state.get("verification_commands", []) or [])
+        parts.append("Relevant verification commands:\n" + commands)
+    if state.get("last_actor_summary"):
+        parts.append("Latest actor summary:\n" + str(state.get("last_actor_summary", "")))
     if state.get("session_context"):
         parts.append("Session context for this multi-turn coding session:\n" + str(state.get("session_context", "")))
     parts.append("Layered memory snapshot:\n" + format_layered_memory_for_prompt(memory))
-    parts.append("Inspect the workspace with tools and return only verifier JSON.")
+    parts.append(
+        "Inspect the workspace with tools and return only verifier JSON. "
+        "Include one check for every acceptance criterion and relevant verification command. "
+        "Do not pass the task unless all listed criteria are concretely satisfied."
+    )
     return "\n\n".join(parts)
 
 
@@ -1461,12 +1460,141 @@ def _normalize_checks(raw: Any) -> list[VerificationCheck]:
     return checks
 
 
+def _merge_acceptance_gate_checks(state: MokioGraphState, checks: list[VerificationCheck]) -> list[VerificationCheck]:
+    merged = list(checks)
+    if state.get("acceptance_criteria") and not merged:
+        merged.append(
+            {
+                "name": "acceptance_criteria_checked",
+                "passed": False,
+                "detail": "Verifier returned no concrete checks for the acceptance criteria.",
+            }
+        )
+    if state.get("verification_commands"):
+        command_checks = [check for check in merged if "command" in check.get("name", "").lower()]
+        if not command_checks:
+            merged.append(
+                {
+                    "name": "verification_commands_checked",
+                    "passed": False,
+                    "detail": "Verifier did not report whether the requested verification commands were run or justified as irrelevant.",
+                }
+            )
+    return merged
+
+
+def _checks_passed(checks: list[VerificationCheck]) -> bool:
+    return bool(checks) and all(bool(check.get("passed")) for check in checks)
+
+
+def _recommended_from_failed_checks(checks: list[VerificationCheck]) -> str:
+    failed = [check for check in checks if not check.get("passed")]
+    if not failed:
+        return "Inspect the workspace and complete any missing acceptance criteria."
+    details = "; ".join(f"{check.get('name', 'check')}: {check.get('detail', '')}" for check in failed[:3])
+    return f"Fix the failed verification checks, then rerun verification: {details}"
+
+
+def _summarize_checks(checks: list[VerificationCheck], passed: bool) -> str:
+    if not checks:
+        return "Verifier returned no checks."
+    failed = [check for check in checks if not check.get("passed")]
+    if passed:
+        return f"All {len(checks)} verification check(s) passed."
+    return f"{len(failed)} of {len(checks)} verification check(s) failed."
+
+
 def _format_verifier_error(reason: str, recommended: str, tool_events: list[dict[str, Any]]) -> str:
     event_text = json.dumps(tool_events[-3:], ensure_ascii=False, default=str)[:1600]
     return (
         f"Verifier failed: {reason}\n"
         f"Recommended next instruction: {recommended}\n"
         f"Recent verifier tool events:\n{event_text}"
+    )
+
+
+def _final_verdict_line(state: MokioGraphState, status: str) -> str:
+    attempts = state.get("attempts", 0)
+    return f"{status}: {state.get('task', '').strip() or 'Task completed'} ({attempts} attempt(s))"
+
+
+def _final_summary_block(state: MokioGraphState) -> str:
+    parts = []
+    plan = str(state.get("plan_summary", "")).strip()
+    if plan:
+        parts.append(f"Plan: {plan}")
+    todos = _format_todo_summary(state.get("todos", []))
+    if todos:
+        parts.append(f"Todos: {todos}")
+    verifier = str(state.get("verifier_summary", "")).strip()
+    if verifier:
+        parts.append(f"Verifier: {verifier}")
+    checks = _format_check_summary(state.get("verification_checks", []))
+    if checks:
+        parts.append(f"Checks: {checks}")
+    sources = _format_source_summary(state.get("sources", []))
+    if sources:
+        parts.append(f"Sources: {sources}")
+    compression = _format_compression_summary(state.get("compression_events", []))
+    if compression:
+        parts.append(f"Context: {compression}")
+    actor = str(state.get("code_agent_summary") or state.get("last_actor_summary", "")).strip()
+    if actor:
+        parts.append(f"Implementation: {actor}")
+    return "\n".join(parts)
+
+
+def _final_next_step(state: MokioGraphState) -> str:
+    if state.get("passed"):
+        return "Next: review the changes, then run a quick verification if you want extra confidence."
+    recommendation = str(state.get("repair_instruction") or state.get("last_error") or "").strip()
+    if recommendation:
+        return f"Next: {recommendation}"
+    return "Next: inspect the failed checks and repair the workspace."
+
+
+def _format_todo_summary(todos: list[dict[str, Any]]) -> str:
+    items = []
+    for todo in todos[:4]:
+        status = todo.get("status", "")
+        content = str(todo.get("content", "")).strip()
+        if content:
+            items.append(f"{status}: {content}")
+    if len(todos) > 4:
+        items.append(f"+{len(todos) - 4} more")
+    return "; ".join(items)
+
+
+def _format_check_summary(checks: list[dict[str, Any]]) -> str:
+    if not checks:
+        return "(none)"
+    passed = sum(1 for check in checks if check.get("passed"))
+    total = len(checks)
+    return f"{passed}/{total} passed"
+
+
+def _format_source_summary(sources: list[dict[str, Any]]) -> str:
+    items = []
+    for source in sources[:3]:
+        title = str(source.get("title", "")).strip()
+        url = str(source.get("url", "")).strip()
+        if title and url:
+            items.append(f"{title} ({url})")
+        elif url:
+            items.append(url)
+    if len(sources) > 3:
+        items.append(f"+{len(sources) - 3} more")
+    return "; ".join(items)
+
+
+def _format_compression_summary(events: list[dict[str, Any]]) -> str:
+    if not events:
+        return "(none)"
+    latest = events[-1]
+    return (
+        f"{len(events)} compression(s), "
+        f"latest {latest.get('before_tokens')} -> {latest.get('after_tokens')} tokens, "
+        f"removed {latest.get('removed_messages')} message(s)"
     )
 
 

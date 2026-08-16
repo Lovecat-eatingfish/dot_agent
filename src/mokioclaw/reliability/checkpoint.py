@@ -257,7 +257,6 @@ def build_light_resume_inputs(runtime: Any, *, task: str | None = None, max_atte
     checkpoint = read_checkpoint(runtime.workspace)
     recovery = read_checkpoint_text(runtime.workspace, RECOVERY_FILE)
     todo = read_workspace_text(runtime.workspace, "TODO.md")
-    notepad = read_workspace_text(runtime.workspace, "NOTEPAD.md")
     history = read_workspace_text(runtime.workspace, "HISTORY_SUMMARY.md")
 
     original_task = str(checkpoint.get("task") or "").strip()
@@ -272,8 +271,6 @@ def build_light_resume_inputs(runtime: Any, *, task: str | None = None, max_atte
         recovery,
         "## TODO.md",
         todo,
-        "## NOTEPAD.md",
-        notepad,
         "## HISTORY_SUMMARY.md",
         history,
     ]

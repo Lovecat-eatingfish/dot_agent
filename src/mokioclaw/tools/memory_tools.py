@@ -22,9 +22,7 @@ def build_memory_tools(state: RuntimeState) -> list[StructuredTool]:
         if topic_type not in TOPIC_TYPES:
             topic_type = "project"
         result = store.write_topic(name, content, topic_type=topic_type, description=description)
-        # 用 write_topic 返回的 safe name 构造路径，避免原始 name 含 ../ 越界（#8）
         safe_name = result.get("name") or name
-        # 同步 SnapshotTracker，避免后续 edit 误判外部修改
         try:
             path = state.workspace / ".mokioclaw" / "memory" / f"{safe_name}.md"
             if path.exists():

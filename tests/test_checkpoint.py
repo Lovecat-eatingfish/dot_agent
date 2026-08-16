@@ -18,6 +18,7 @@ from mokioclaw.reliability.checkpoint import (
     deserialize_state,
     workspace_manifest,
 )
+from mokioclaw.reliability.session_store import build_resume_context
 from mokioclaw.state.runtime import RuntimeState
 
 
@@ -110,7 +111,6 @@ def test_light_checkpoint_git_snapshot_handles_relative_workspace(tmp_path: Path
 def test_light_resume_context_includes_workspace_memory(tmp_path: Path) -> None:
     runtime = RuntimeState(workspace=tmp_path, checkpoint_mode="light")
     (tmp_path / "TODO.md").write_text("TODO from disk", encoding="utf-8")
-    (tmp_path / "NOTEPAD.md").write_text("Important note", encoding="utf-8")
     (tmp_path / "HISTORY_SUMMARY.md").write_text("History summary", encoding="utf-8")
     CheckpointManager(runtime, task="original task").save(sample_state(runtime), status="interrupted", latest_node="verifier")
 
@@ -118,7 +118,6 @@ def test_light_resume_context_includes_workspace_memory(tmp_path: Path) -> None:
 
     assert "Continue this MokioClaw task" in inputs["task"]
     assert "TODO from disk" in inputs["context_summary"]
-    assert "Important note" in inputs["context_summary"]
     assert "History summary" in inputs["context_summary"]
     assert inputs["plan_summary"] == "demo plan"
     assert inputs["max_attempts"] == 5
@@ -214,3 +213,43 @@ def test_rollback_raises_for_missing_checkpoint(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("expected FileNotFoundError")
+
+
+def test_resume_context_includes_continuation_hint(tmp_path: Path) -> None:
+    session = {
+        "session_id": "session-1",
+        "status": "running",
+        "turn_index": 3,
+        "task": "Fix parser and tests",
+        "latest_checkpoint": "turn-003",
+        "last_state_summary": {
+            "attempts": 2,
+            "plan_summary": "Refactor the loader chain",
+            "repair_instruction": "Keep the config chain stable",
+            "passed": False,
+        },
+        "turns": [],
+    }
+
+    context = build_resume_context(session)
+
+    assert "continuation_hint" in context
+    assert "Keep the config chain stable" in context
+    assert "attempts=2" in context
+
+
+def test_resume_context_prefers_repair_instruction(tmp_path: Path) -> None:
+    session = {
+        "session_id": "session-2",
+        "status": "running",
+        "turn_index": 1,
+        "task": "Finish core parity",
+        "last_state_summary": {
+            "repair_instruction": "Fix tool gate semantics first",
+        },
+        "turns": [],
+    }
+
+    context = build_resume_context(session)
+
+    assert "Fix tool gate semantics first" in context

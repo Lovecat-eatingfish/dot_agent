@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from mokioclaw.core.utils import json_safe, utc_now, write_json
+from mokioclaw.core.utils import json_safe, truncate, utc_now, write_json
 
 
 VALID_TRACE_MODES = {"on", "off"}
@@ -42,6 +42,9 @@ class TraceRecorder:
         self.node_visits: dict[str, int] = {}
         self.tool_calls = 0
         self.failed_tool_calls = 0
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
         self.approval_count = 0
         self.checkpoint_count = 0
         self.handoff_count = 0
@@ -71,6 +74,14 @@ class TraceRecorder:
                 "checkpoint_mode": getattr(self.runtime, "checkpoint_mode", ""),
             },
         )
+
+    def record_token_usage(self, prompt_tokens: int, completion_tokens: int) -> None:
+        if not self.enabled:
+            return
+        self.prompt_tokens += prompt_tokens
+        self.completion_tokens += completion_tokens
+        self.total_tokens = self.prompt_tokens + self.completion_tokens
+        self.record("token_usage", {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": self.total_tokens})
 
     def record_custom_event(self, event: dict[str, Any]) -> None:
         if not self.enabled:
@@ -133,7 +144,13 @@ class TraceRecorder:
             "attempts": (final_state or {}).get("attempts"),
             "passed": (final_state or {}).get("passed"),
             "final_status": self.final_status,
+            "plan_summary": truncate(str((final_state or {}).get("plan_summary", "")), 600),
+            "verifier_summary": truncate(str((final_state or {}).get("verifier_summary", "")), 600),
+            "repair_instruction": truncate(str((final_state or {}).get("repair_instruction", "")), 600),
+            "acceptance_criteria": (final_state or {}).get("acceptance_criteria", []),
+            "verification_checks": (final_state or {}).get("verification_checks", []),
         }
+        self.final_state_summary = payload
         self.record("run_end", payload)
         return self.write_summary()
 
@@ -168,9 +185,12 @@ class TraceRecorder:
         return trace_summary_event(summary)
 
     def summary_payload(self) -> dict[str, Any]:
+        final_state = getattr(self, "final_state_summary", {}) or {}
         return {
             "trace_id": self.trace_id,
             "status": self.status,
+            "final_status": self.final_status,
+            "summary": self._build_summary_text(final_state),
             "workspace": str(self.workspace),
             "trace_dir": str(self.root),
             "events_file": str(self.root / EVENTS_FILE),
@@ -183,13 +203,32 @@ class TraceRecorder:
             "node_visits": dict(sorted(self.node_visits.items())),
             "tool_calls": self.tool_calls,
             "failed_tool_calls": self.failed_tool_calls,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
             "approval_count": self.approval_count,
             "checkpoint_count": self.checkpoint_count,
             "handoff_count": self.handoff_count,
-            "final_status": self.final_status,
+            "final_state": final_state,
             "errors": list(self.errors),
             "timeline_omitted": self.timeline_omitted,
         }
+
+    def _build_summary_text(self, final_state: dict[str, Any] | None = None) -> str:
+        state = final_state or {}
+        status = "PASSED" if state.get("passed") else "FAILED"
+        parts = [
+            f"{status} after {state.get('attempts', 0)} attempt(s)",
+            f"trace_id={self.trace_id}",
+            f"workspace={self.workspace}",
+        ]
+        if state.get("plan_summary"):
+            parts.append(f"plan={truncate(str(state.get('plan_summary', '')), 300)}")
+        if state.get("verifier_summary"):
+            parts.append(f"verifier={truncate(str(state.get('verifier_summary', '')), 300)}")
+        if state.get("repair_instruction"):
+            parts.append(f"repair={truncate(str(state.get('repair_instruction', '')), 300)}")
+        return " | ".join(parts)
 
     def elapsed_ms(self) -> int:
         return round((time.perf_counter() - self.started_at) * 1000)
@@ -250,12 +289,17 @@ def build_timeline_markdown(summary: dict[str, Any], timeline: list[str]) -> str
         "",
         "## Summary",
         "",
+        f"- summary: {summary.get('summary', '')}",
         f"- nodes: {summary.get('node_visits', {})}",
         f"- tool_calls: {summary.get('tool_calls', 0)}",
         f"- failed_tool_calls: {summary.get('failed_tool_calls', 0)}",
         f"- approvals: {summary.get('approval_count', 0)}",
         f"- checkpoints: {summary.get('checkpoint_count', 0)}",
         f"- final_status: {summary.get('final_status', '')}",
+        "",
+        "## Final State",
+        "",
+        _render_final_state(summary.get('final_state', {})),
         "",
         "## Timeline",
         "",
@@ -268,6 +312,21 @@ def build_timeline_markdown(summary: dict[str, Any], timeline: list[str]) -> str
 
 def normalize_trace_path(path: Path) -> Path:
     return path.resolve()
+
+
+def _render_final_state(final_state: dict[str, Any]) -> str:
+    if not isinstance(final_state, dict) or not final_state:
+        return "(no final state recorded)"
+    lines = [
+        f"- passed: {final_state.get('passed', '')}",
+        f"- attempts: {final_state.get('attempts', '')}",
+        f"- plan_summary: {truncate(str(final_state.get('plan_summary', '') or ''), 350) or '(none)'}",
+        f"- verifier_summary: {truncate(str(final_state.get('verifier_summary', '') or ''), 350) or '(none)'}",
+        f"- repair_instruction: {truncate(str(final_state.get('repair_instruction', '') or ''), 350) or '(none)'}",
+        f"- acceptance_criteria: {len(final_state.get('acceptance_criteria', []) or [])}",
+        f"- verification_checks: {len(final_state.get('verification_checks', []) or [])}",
+    ]
+    return "\n".join(lines)
 
 
 def _trim_nested(value: Any, *, limit: int) -> Any:

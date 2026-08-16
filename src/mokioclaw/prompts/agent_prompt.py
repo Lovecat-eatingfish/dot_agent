@@ -79,8 +79,6 @@ Workflow:
 2. Make the minimal changes needed to satisfy the instruction.
 3. Update todo status as you progress (in_progress → completed/blocked).
 4. Run checks (type check, lint, tests) when applicable.
-5. Record durable findings in NOTEPAD.md when you discover something that
-   should survive context compression.
 
 Rules:
 - You must update todo progress explicitly.
@@ -91,9 +89,6 @@ Rules:
 - Use FileWriteTool for new files.
 - Use FileEditTool for focused edits in existing files.
 - Use BashTool for non-interactive checks.
-- Use NotepadAppendTool to record durable findings, decisions, important files,
-  blockers, and next-step context that should survive compression.
-- Use NotepadReadTool when you need to recover prior notes.
 - BashTool description tells you the current platform shell. Follow it exactly:
   use cmd syntax on Windows, and POSIX shell syntax on macOS/Linux.
 - BashTool already runs inside the workspace. Never run "cd /workspace",

@@ -572,18 +572,37 @@ def execute_tool_calls(
 
 
 def tool_result_event(tool_message: ToolMessage, *, node: str) -> dict[str, Any]:
-    """构建工具结果事件字典
-
-    Args:
-        tool_message: 工具执行结果消息
-        node: 当前节点名称
-
-    Returns:
-        事件字典
-    """
+    """构建工具结果事件字典"""
+    result = parse_json_content(tool_message.content)
     return {
         "type": "tool_result",
         "node": node,
         "name": tool_message.name,
-        "result": parse_json_content(tool_message.content),
+        "result": result,
+        "error": normalize_tool_error(tool_message.name or "", result),
     }
+
+
+def normalize_tool_error(tool_name: str, result: Any) -> dict[str, Any] | None:
+    if not isinstance(result, dict) or result.get("ok", True):
+        return None
+    reason = str(result.get("error_message") or result.get("error") or "tool failed")
+    return {
+        "tool": tool_name,
+        "reason": reason,
+        "recoverable": bool(result.get("recoverable", True)),
+        "suggested_fix": str(result.get("suggested_fix") or _default_tool_error_fix(tool_name, reason)),
+    }
+
+
+def _default_tool_error_fix(tool_name: str, reason: str) -> str:
+    lowered = reason.lower()
+    if "not been read" in lowered or "read it" in lowered:
+        return "Read the file again before editing or overwriting it."
+    if "permission" in lowered or "denied" in lowered or "blocked" in lowered:
+        return "Ask for approval or choose an allowed, safer alternative."
+    if "timeout" in lowered:
+        return "Retry with a narrower command or increase the timeout if appropriate."
+    if "does not exist" in lowered or "not found" in lowered:
+        return "Verify the path or create the missing prerequisite first."
+    return f"Inspect the {tool_name} result, fix the cause, then retry if needed."

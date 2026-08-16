@@ -99,6 +99,7 @@ def build_complex_workflow():
             "verifier": "verifier",
             "final": "final",
             "planner": "planner",
+            "repair": "repair"
         },
     )
     graph.add_edge("search_agent", "context_monitor")          # 搜索 → 上下文监控

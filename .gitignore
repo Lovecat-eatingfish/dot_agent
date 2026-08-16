@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 .agent-sync/
 .agent-sync-store/
+docs/

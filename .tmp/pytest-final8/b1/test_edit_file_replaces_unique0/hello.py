@@ -1,2 +1,0 @@
-name = 'new'
-print(name)

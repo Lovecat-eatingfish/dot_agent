@@ -1,3 +1,0 @@
----
-approval_mode: auto
----

@@ -7,7 +7,8 @@ from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.core.utils import TodoPersistResult, TodoUpdateResult, TodoWriteResult
 
 VALID_TODO_STATUSES = {"pending", "in_progress", "completed", "blocked"}
-TODO_FILE = "TODO.md"
+# Agent 内部工作文件：收进 .mokioclaw，避免污染用户项目根目录
+TODO_FILE = ".mokioclaw/TODO.md"
 
 
 # AI 的任务拆解、待办清单管理、状态更新、落地写入本地 todolist.md 文件
@@ -95,11 +96,11 @@ def persist_todos(
     verification_commands: list[str] | None = None,
     plan_summary: str = "",
 ) -> TodoPersistResult:
-    path = state.assert_workspace_path(state.workspace / TODO_FILE)
+    # .mokioclaw 在工具黑名单内（防模型误改内部状态），内部写入直接落盘不走 assert
+    path = state.workspace / TODO_FILE
     content = render_todo_markdown(todos, acceptance_criteria or [], verification_commands or [], plan_summary)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
-    state.record_read(path, complete=True)
+    path.write_text(content, encoding="utf-8", newline="\n")
     return {"ok": True, "path": TODO_FILE, "lines": len(content.splitlines()), "todos": todos}
 
 

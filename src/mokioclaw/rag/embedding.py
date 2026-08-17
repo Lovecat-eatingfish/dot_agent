@@ -81,17 +81,13 @@ def create_embedder() -> Embedder:
         model = os.getenv("RAG_LOCAL_MODEL", "BAAI/bge-small-zh-v1.5")
         return LocalEmbedder(model_name=model)
 
-    # openai backend
+    # openai backend：EMBEDDING_* 未配置时降级到主 API_KEY/MODEL/BASE_URL（validate_env 内置该逻辑）
     from mokioclaw.providers.openai_provider import validate_env
     env = validate_env()
-    model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
     return OpenAIEmbedder(
-        # api_key=env["api_key"],
-        # base_url=env.get("base_url"),  # 使用 .get() 避免 KeyError
-        # model=model,
-        api_key=os.getenv("EMBEDDING_API_KEY"),
-        model=os.getenv("EMBEDDING_MODEL"),
-        base_url=os.getenv("EMBEDDING_BASE_URL")
+        api_key=env["embedding_api_key"] or env["api_key"],
+        base_url=env.get("embedding_base_url") or env.get("base_url"),
+        model=env.get("embedding_model") or env.get("model") or "text-embedding-3-small",
     )
 
 

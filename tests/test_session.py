@@ -3,13 +3,13 @@ from __future__ import annotations
 import json
 
 from mokioclaw.reliability.session import (
-    SESSION_SUMMARY_FILE,
     append_assistant_turn,
     append_user_turn,
     build_session_context,
     load_or_create_session,
     save_session,
     session_file,
+    session_summary_file,
 )
 
 
@@ -20,7 +20,7 @@ def test_session_create_save_and_context(tmp_path) -> None:
     save_session(tmp_path, session)
 
     assert session_file(tmp_path).exists()
-    assert (tmp_path / SESSION_SUMMARY_FILE).exists()
+    assert session_summary_file(tmp_path).exists()
 
     saved = json.loads(session_file(tmp_path).read_text(encoding="utf-8"))
     assert saved["turn_index"] == 1

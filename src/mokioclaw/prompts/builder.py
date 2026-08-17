@@ -174,8 +174,7 @@ class PromptBuilder:
             return ""
         try:
             from mokioclaw.memory.topic_store import TopicStore
-            project_dir = project_memory_dir()
-            return TopicStore(self._workspace, project_dir=project_dir).load_index().strip()
+            return TopicStore(self._workspace).load_index().strip()
         except Exception as exc:
             logger.debug("memory index load failed: %s", exc)
             return ""
@@ -250,7 +249,8 @@ def get_prompt_builder(workspace: Path | None = None, runtime: Any | None = None
     if _builder is None:
         _builder = PromptBuilder(workspace=workspace)
     elif workspace is not None and _builder._workspace != workspace:
-        _builder = PromptBuilder(workspace=workspace, user_config=_builder.user_config)
+        # 重建并重新加载该 workspace 的用户配置（复用旧 config 会注入过期指令）
+        _builder = PromptBuilder(workspace=workspace)
     return _builder
 
 

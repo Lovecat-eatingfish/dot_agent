@@ -37,6 +37,7 @@ logger = get_logger(__name__)
 from mokioclaw.state.graph import MokioGraphState
 from mokioclaw.prompts.builder import get_prompt_builder
 from mokioclaw.providers.openai_provider import create_model
+from mokioclaw.reliability.cost import record_llm_usage
 from mokioclaw.reliability.token_budget import (
     OutputTokenRecovery,
     PromptTooLongRecovery,
@@ -107,6 +108,7 @@ def run_search_agent(
         response = _invoke_with_recovery(current_agent, messages, prompt_recovery)
         if response is None:
             break
+        record_llm_usage(response)  # /cost usage 统计
         produced_messages.append(response)
         messages.append(response)
 
@@ -214,9 +216,13 @@ def run_search_agent(
 
 
 def _sync_search_messages(messages: list[Any], produced: list[Any]) -> None:
-    """把 produced 的清洗结果同步回 messages（resume 路径用，#2）"""
-    if len(produced) > len(messages):
-        for extra in produced[len(messages):]:
-            messages.append(extra)
+    """把 produced 的清洗结果同步回 messages（resume 路径用，#2）
+
+    不变量：messages = [SystemMessage, HumanMessage] + produced（公共追加部分），
+    即 len(messages) == len(produced) + 2；清洗后 produced 多出的尾部即占位消息。
+    """
+    append_count = len(produced) - (len(messages) - 2)
+    if append_count > 0:
+        messages.extend(produced[-append_count:])
 
 

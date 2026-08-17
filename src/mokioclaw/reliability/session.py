@@ -11,7 +11,7 @@ from mokioclaw.core.utils import truncate, utc_now
 
 SESSION_ROOT = Path(".mokioclaw") / "session"  # 会话存储根目录
 SESSION_FILE = "session.json"                 # 会话结构化数据文件
-SESSION_SUMMARY_FILE = "SESSION_SUMMARY.md"   # 人可读会话摘要
+SESSION_SUMMARY_FILE = "SESSION_SUMMARY.md"   # 人可读会话摘要（存 .mokioclaw/session/ 下，避免污染用户项目根目录）
 MAX_RECENT_TURNS = 18       # 内存只保留最近18轮完整对话
 MAX_TURN_CONTENT = 1800     # 单轮消息最大字符
 MAX_SESSION_SUMMARY = 5000  # 全局压缩摘要上限
@@ -30,7 +30,7 @@ def session_file(workspace: Path) -> Path:
 
 
 def session_summary_file(workspace: Path) -> Path:
-    return workspace / SESSION_SUMMARY_FILE
+    return session_dir(workspace) / SESSION_SUMMARY_FILE
 
 
 # 加载会话，不存在 / 文件损坏则新建空会话：
@@ -98,7 +98,9 @@ def save_session(workspace: Path, session: dict[str, Any]) -> dict[str, Any]:
     path = session_file(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(session, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
-    session_summary_file(workspace).write_text(build_session_summary_markdown(workspace, session), encoding="utf-8")
+    summary_path = session_summary_file(workspace)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.write_text(build_session_summary_markdown(workspace, session), encoding="utf-8", newline="\n")
     return session
 
 

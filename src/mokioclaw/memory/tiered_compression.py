@@ -121,6 +121,10 @@ def compress_messages_by_tier(messages: list[Any], *, context_summary: str = "")
     3. COMPRESS_HEAVILY (20): 替换为摘要
     4. DROP (0): 删除
 
+    保持消息原始顺序，且保护 AIMessage(tool_calls) 与 ToolMessage 的配对：
+    - 父 AIMessage 被摘要/删除时，其对应的 ToolMessage 一并移除（否则悬空 tool message 会触发 API 400）
+    - 父 AIMessage 保留时，其 ToolMessage 至少截断保留，绝不移除（截断时保留 tool_call_id）
+
     Args:
         messages: 原始消息列表
         context_summary: 上下文摘要（用于替换被删除的消息）
@@ -131,36 +135,55 @@ def compress_messages_by_tier(messages: list[Any], *, context_summary: str = "")
     if not messages:
         return messages
 
-    # 分类
     classified: list[tuple[int, Any]] = [(classify_message_for_compression(msg), msg) for msg in messages]
 
-    # 统计
-    keep_always = [msg for score, msg in classified if score >= KEEP_ALWAYS_PRIORITY]
-    compress_lightly = [msg for score, msg in classified if COMPRESS_LIGHTLY_PRIORITY <= score < KEEP_ALWAYS_PRIORITY]
-    compress_heavily = [msg for score, msg in classified if COMPRESS_HEAVILY_PRIORITY <= score < COMPRESS_LIGHTLY_PRIORITY]
-    drop = [msg for score, msg in classified if score < COMPRESS_HEAVILY_PRIORITY]
+    # 收集将被移除（摘要/DROP）的 AIMessage 的 tool_call_id，
+    # 这些 id 对应的 ToolMessage 必须一起移除，避免悬空。
+    removed_parent_call_ids: set[str] = set()
+    for score, msg in classified:
+        if score < COMPRESS_LIGHTLY_PRIORITY and isinstance(msg, AIMessage):
+            for tc in getattr(msg, "tool_calls", None) or []:
+                call_id = str(tc.get("id") or "")
+                if call_id:
+                    removed_parent_call_ids.add(call_id)
 
     result: list[Any] = []
+    heavily_buffer: list[Any] = []
+    first_heavily_idx: int | None = None
+    counts = {"keep": 0, "lightly": 0, "heavily": 0, "drop": 0}
 
-    # 1. 永远保留
-    result.extend(keep_always)
+    for score, msg in classified:
+        # 悬空 ToolMessage：父 AIMessage 已被摘要/删除 → 一并丢弃（计入 heavily）
+        if isinstance(msg, ToolMessage) and str(getattr(msg, "tool_call_id", "") or "") in removed_parent_call_ids:
+            heavily_buffer.append(msg)
+            counts["heavily"] += 1
+            continue
 
-    # 2. 轻度压缩（截断超长消息）
-    for msg in compress_lightly:
-        result.append(_truncate_message_if_needed(msg))
+        if score >= KEEP_ALWAYS_PRIORITY:
+            result.append(msg)
+            counts["keep"] += 1
+        elif score >= COMPRESS_LIGHTLY_PRIORITY:
+            result.append(_truncate_message_if_needed(msg))
+            counts["lightly"] += 1
+        elif score >= COMPRESS_HEAVILY_PRIORITY:
+            if first_heavily_idx is None:
+                first_heavily_idx = len(result)
+            heavily_buffer.append(msg)
+            counts["heavily"] += 1
+        else:
+            counts["drop"] += 1
 
-    # 3. 重度压缩（替换为摘要）
-    if compress_heavily:
-        result.append(_create_compression_summary(compress_heavily, context_summary))
-
-    # 4. 删除 DROP 级别（不添加到 result）
+    # 摘要插到第一条被摘要消息原来的位置，保持时间线可读
+    if heavily_buffer:
+        summary = _create_compression_summary(heavily_buffer, context_summary)
+        result.insert(first_heavily_idx if first_heavily_idx is not None else len(result), summary)
 
     logger.debug(
-        "compression: keep_always=%d, lightly=%d, heavily=%d, drop=%d → %d total",
-        len(keep_always),
-        len(compress_lightly),
-        len(compress_heavily),
-        len(drop),
+        "compression: keep=%d, lightly=%d, heavily=%d, drop=%d → %d total",
+        counts["keep"],
+        counts["lightly"],
+        counts["heavily"],
+        counts["drop"],
         len(result),
     )
 
@@ -189,6 +212,7 @@ def _truncate_message_if_needed(msg: Any, max_chars: int = 2000) -> Any:
         content=truncated,
         name=msg.name,
         id=msg.id,
+        tool_call_id=msg.tool_call_id,
     )
 
 

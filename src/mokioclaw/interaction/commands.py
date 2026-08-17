@@ -194,7 +194,13 @@ def filter_command_suggestions(prefix: str, workspace: Path | None = None, *, li
     needle = prefix.lstrip().lstrip("/").lower()
     cmds = list_available_commands(workspace)
     if not needle:
-        return cmds[:limit]
+        # 空 prefix：高价值命令优先（系统命令已有 24 个，纯字母序会把 plugin 等截出前 12）
+        priority = [
+            "help", "new", "resume", "continue", "compact", "plugin",
+            "mode", "model", "memory", "status", "sessions", "rollback",
+        ]
+        ordered = [c for c in priority if c in cmds] + [c for c in cmds if c not in priority]
+        return ordered[:limit]
     exact = [c for c in cmds if c.lower().startswith(needle)]
     contains = [c for c in cmds if needle in c.lower() and c not in exact]
     # fuzzy: subsequence match (e.g. "pr" matches "permissions")
@@ -591,6 +597,11 @@ def _find_skill(name: str, workspace: Path | None) -> Skill | None:
 def _load_custom_command(name: str, workspace: Path | None) -> str | None:
     if workspace is None:
         return None
+    # 名字直接拼路径：../x 可读工作区命令目录之外的 .md，先校验字符集
+    import re as _re
+
+    if not _re.match(r"^[A-Za-z0-9_\-一-鿿]+$", name or ""):
+        return None
     path = workspace / ".mokioclaw" / "commands" / f"{name}.md"
     if not path.exists():
         return None
@@ -749,10 +760,16 @@ def _cost_command(workspace: Path | None) -> CommandResult:
     total_prompt = 0
     total_completion = 0
     total_tokens = 0
+    total_cost = 0.0
     tool_calls = 0
     trace_count = 0
+    latest_cost = 0.0
+    latest_tokens = 0
+    latest_name = ""
+    per_model: dict[str, dict[str, float]] = {}
     if trace_root.exists():
-        for trace_dir in sorted(trace_root.iterdir(), reverse=True):
+        trace_dirs = sorted(trace_root.iterdir(), reverse=True)
+        for idx, trace_dir in enumerate(trace_dirs):
             summary_path = trace_dir / "summary.json"
             if not summary_path.exists():
                 continue
@@ -760,38 +777,84 @@ def _cost_command(workspace: Path | None) -> CommandResult:
                 data = json.loads(summary_path.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
                     trace_count += 1
-                    total_prompt += int(data.get("prompt_tokens", 0))
-                    total_completion += int(data.get("completion_tokens", 0))
-                    total_tokens += int(data.get("total_tokens", 0))
+                    p = int(data.get("prompt_tokens", 0))
+                    c = int(data.get("completion_tokens", 0))
+                    total_prompt += p
+                    total_completion += c
+                    total_tokens += int(data.get("total_tokens", 0)) or (p + c)
                     tool_calls += int(data.get("tool_calls", 0))
+                    # 新 summary 直接有 cost_usd；旧 summary 按 token 估算
+                    cost = float(data.get("cost_usd", 0) or 0)
+                    if cost <= 0 and (p or c):
+                        from mokioclaw.reliability.cost import estimate_cost_usd
+                        cost = estimate_cost_usd(str(data.get("model", "")), p, c)
+                    total_cost += cost
+                    if idx == 0:
+                        latest_cost = cost
+                        latest_tokens = int(data.get("total_tokens", 0)) or (p + c)
+                        latest_name = str(data.get("model", ""))
+                    model = str(data.get("model", "") or "(unknown)")
+                    entry = per_model.setdefault(model, {"prompt": 0, "completion": 0, "cost": 0.0})
+                    entry["prompt"] += p
+                    entry["completion"] += c
+                    entry["cost"] += cost
             except Exception:
                 continue
     lines = [
         f"workspace: {workspace}",
         f"traces: {trace_count}",
-        f"prompt tokens: {total_prompt:,}",
-        f"completion tokens: {total_completion:,}",
-        f"total tokens: {total_tokens:,}",
+        f"latest trace: {latest_tokens:,} tokens, ${latest_cost:.4f}" + (f" ({latest_name})" if latest_name else ""),
+        f"session total prompt tokens: {total_prompt:,}",
+        f"session total completion tokens: {total_completion:,}",
+        f"session total tokens: {total_tokens:,}",
+        f"session total cost (est.): ${total_cost:.4f}",
         f"tool calls: {tool_calls}",
     ]
+    if len(per_model) > 1:
+        lines.append("per model:")
+        for model, entry in sorted(per_model.items(), key=lambda kv: -kv[1]["cost"]):
+            lines.append(f"  {model}: {int(entry['prompt'] + entry['completion']):,} tokens, ${entry['cost']:.4f}")
     return CommandResult(kind=CommandKind.SYSTEM, name="cost", ui_message=_card("Cost", lines), action="none")
 
 
 def _model_command(args: str, workspace: Path | None) -> CommandResult:
     """Show or switch the active model at runtime.
 
-    /model            Show current model
+    /model            Show current model and override status
     /model <name>     Switch to <name> (takes effect next turn)
+    /model reset      Clear the override, fall back to env default
     """
     import os
-    current = os.getenv("MOKIO_MODEL_NAME", "") or os.getenv("MODEL", "") or os.getenv("OPENAI_MODEL", "") or "(default)"
+    from mokioclaw.providers.openai_provider import get_active_model
+
+    env_model = os.getenv("MOKIO_MODEL_NAME", "") or os.getenv("MODEL", "") or os.getenv("OPENAI_MODEL", "") or "(default)"
+    override = get_active_model()
     model_arg = (args or "").strip()
     if not model_arg:
         lines = [
-            f"current: {current}",
+            f"current: {override or env_model}",
             f"provider: {os.getenv('MOKIO_MODEL_PROVIDER', '') or os.getenv('BASE_URL', '') or 'openai'}",
+            f"override: {override or '(none, using env default)'}",
+            "usage: /model <name> | /model reset",
         ]
         return CommandResult(kind=CommandKind.SYSTEM, name="model", ui_message=_card("Model", lines), action="none")
+    # reset：清除覆盖文件与进程内覆盖，回落 env 默认
+    if model_arg.lower() in {"reset", "default", "clear"}:
+        if workspace is not None:
+            try:
+                path = workspace / ".mokioclaw" / "model_override"
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        from mokioclaw.providers.openai_provider import set_active_model
+        set_active_model(None)
+        return CommandResult(
+            kind=CommandKind.SYSTEM,
+            name="model",
+            ui_message=_card("Model", [f"cleared override: {override or '(none)'}", f"restored env default: {env_model}"]),
+            action="model_switch",
+            meta={"model": ""},
+        )
     # Persist to workspace so create_runtime picks it up
     if workspace is not None:
         try:
@@ -800,10 +863,12 @@ def _model_command(args: str, workspace: Path | None) -> CommandResult:
             path.write_text(model_arg, encoding="utf-8")
         except OSError:
             pass
+    from mokioclaw.providers.openai_provider import set_active_model
+    set_active_model(model_arg)
     return CommandResult(
         kind=CommandKind.SYSTEM,
         name="model",
-        ui_message=_card("Model", [f"previous: {current}", f"switched to: {model_arg}", "Takes effect on next turn."]),
+        ui_message=_card("Model", [f"previous: {override or env_model}", f"switched to: {model_arg}", "Takes effect on next turn."]),
         action="model_switch",
         meta={"model": model_arg},
     )
@@ -916,8 +981,15 @@ def _status_command(workspace: Path | None) -> CommandResult:
                 break
     model_name = os.getenv("MOKIO_MODEL_NAME", "") or os.getenv("OPENAI_MODEL", "") or "(default)"
     model_provider = os.getenv("MOKIO_MODEL_PROVIDER", "") or os.getenv("OPENAI_API_BASE", "") or "openai"
+    try:
+        from mokioclaw.providers.openai_provider import get_active_model
+        active = get_active_model()
+        if active:
+            model_name = f"{active} (/model override)"
+    except Exception:
+        pass
     account_name = os.getenv("MOKIO_ACCOUNT_NAME", "") or os.getenv("USER", "") or os.getenv("USERNAME", "") or "(unknown)"
-    api_connected = bool(os.getenv("OPENAI_API_KEY") or os.getenv("MOKIO_API_KEY"))
+    api_connected = bool(os.getenv("API_KEY") or os.getenv("OPENAI_API_KEY") or os.getenv("MOKIO_API_KEY"))
     lines = [
         f"workspace: {ws}",
         f"sessions: {len(sessions)}",
@@ -1017,7 +1089,10 @@ def _init_command(args: str, workspace: Path | None) -> CommandResult:
     # Count source files
     import os
     py_count = sum(1 for _ in workspace.rglob("*.py") if ".venv" not in str(_) and ".mokioclaw" not in str(_)) if has_pyproject else 0
-    js_count = sum(1 for _ in workspace.rglob("*.{js,ts}") if "node_modules" not in str(_)) if has_package_json else 0
+    js_count = (
+        sum(1 for _ in workspace.rglob("*.js") if "node_modules" not in str(_))
+        + sum(1 for _ in workspace.rglob("*.ts") if "node_modules" not in str(_))
+    ) if has_package_json else 0
 
     template = f"""---
 agent_mode: auto
@@ -1081,7 +1156,7 @@ def _batch_command(args: str, workspace: Path | None) -> CommandResult:
     raw = args.strip()
     if raw.startswith("--seq"):
         sequential = True
-        raw = raw[4:].strip()
+        raw = raw[len("--seq"):].strip()
     tasks = [t.strip() for t in raw.split("|") if t.strip()]
     if not tasks:
         return CommandResult(

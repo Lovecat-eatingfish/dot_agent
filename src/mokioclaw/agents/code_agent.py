@@ -43,6 +43,7 @@ from mokioclaw.state.graph import MokioGraphState
 from mokioclaw.prompts.agent_prompt import CODE_AGENT_PROMPT
 from mokioclaw.prompts.builder import get_prompt_builder
 from mokioclaw.providers.openai_provider import create_model
+from mokioclaw.reliability.cost import record_llm_usage
 from mokioclaw.reliability.token_budget import (
     BudgetTracker,
     OutputTokenRecovery,
@@ -127,6 +128,7 @@ def run_code_agent(
         response = _invoke_with_recovery(current_agent, messages, prompt_recovery)
         if response is None:
             break
+        record_llm_usage(response)  # /cost usage 统计
         produced_messages.append(response)
         messages.append(response)
         accounted_tokens = budget.account(response)
@@ -198,7 +200,11 @@ def run_code_agent(
             ordered = _order_tool_calls_for_execution(tool_calls)
             results_by_key: dict[Any, tuple[ToolMessage, list[dict[str, str]]]] = {}
             for call in ordered:
-                results_by_key[_tool_call_key(call)] = _exec(call)
+                result = _exec(call)
+                results_by_key[_tool_call_key(call)] = result
+                # 串行执行立即回写 todos：同批多个 TodoUpdate 依次基于最新状态计算，
+                # 否则都基于批前快照、最后写入者胜出（前面的更新被静默丢弃）
+                _todos_ref["todos"] = result[1]
             results = [results_by_key[_tool_call_key(c)] for c in tool_calls]
         else:
             results = execute_tool_calls(tool_calls, _exec, max_workers=4, writer=writer, node="codeAgent")
@@ -207,6 +213,10 @@ def run_code_agent(
         for call, (tool_result, new_todos) in zip(tool_calls, results):
             todos = new_todos
             _todos_ref["todos"] = todos
+        # 串行分支以即时回写的 _todos_ref 为准（非 todo 工具会回显执行时的旧 todos，
+        # 若它按原始顺序排在末尾会覆盖真实状态）
+        if has_todo_update or has_load or len(tool_calls) == 1:
+            todos = _todos_ref["todos"]
             event = build_tool_result_event(tool_result, node="codeAgent")
             tool_events.append(event)
             writer(event)
@@ -274,13 +284,13 @@ def _sync_messages_from_produced(messages: list[Any], produced: list[Any]) -> No
 
     filter_unresolved_tool_uses 可能在 produced 末尾补占位 ToolMessage，
     需让 messages 末尾也带上这些占位，保持两者一致，防下一轮 API 400。
-    仅同步末尾新增的 ToolMessage（produced 比 messages 多出的尾部）。
+
+    不变量：messages = [SystemMessage, HumanMessage] + produced（公共追加部分），
+    即 len(messages) == len(produced) + 2；清洗后 produced 多出的尾部即占位消息。
     """
-    # 找 messages 在 produced 中的对齐点：messages 末尾应是 produced 的前缀子集
-    # 简化处理：produced 比 messages 长出的部分追加到 messages
-    if len(produced) > len(messages):
-        for extra in produced[len(messages):]:
-            messages.append(extra)
+    append_count = len(produced) - (len(messages) - 2)
+    if append_count > 0:
+        messages.extend(produced[-append_count:])
 
 
 def _order_tool_calls_for_execution(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:

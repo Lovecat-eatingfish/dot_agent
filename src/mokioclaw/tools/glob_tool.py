@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from mokioclaw.state.runtime import RuntimeState
+from mokioclaw.security.path_security import PathSecurityError
 from mokioclaw.tools.file_tools import display_path, resolve_workspace_path
 
 # 递归搜索时跳过的目录（与 GrepTool 保持一致）
@@ -65,7 +66,7 @@ def glob_search(
 
     try:
         root = resolve_workspace_path(state, path)
-    except ValueError as exc:
+    except (ValueError, PathSecurityError) as exc:
         return {"ok": False, "error": str(exc)}
     if not root.exists():
         return {"ok": False, "error": f"path does not exist: {display_path(state, root)}"}

@@ -36,6 +36,8 @@ class SandboxPolicy:
     allow_network: bool = False
     max_execution_seconds: int = 30
     max_output_chars: int = 10000
+    # 相对路径的解析基准（不设则按进程 CWD，几乎必然落在白名单外导致误拦）
+    workspace_root: str = ""
 
     def check_file_access(self, path: str) -> tuple[bool, str]:
         """检查文件访问权限
@@ -43,7 +45,10 @@ class SandboxPolicy:
         Returns:
             (allowed, reason)
         """
-        resolved = str(Path(path).resolve())
+        candidate = Path(path)
+        if not candidate.is_absolute() and self.workspace_root:
+            candidate = Path(self.workspace_root) / candidate
+        resolved = str(candidate.resolve())
 
         # 检查黑名单
         for pattern in self.denied_paths:
@@ -138,6 +143,7 @@ def workspace_policy(workspace: Path) -> SandboxPolicy:
     ws = str(workspace.resolve())
     return SandboxPolicy(
         allowed_paths=[ws],
+        workspace_root=ws,
         allowed_commands=[
             "cat", "ls", "dir", "echo", "head", "tail", "grep", "find",
             "python*", "pip*", "uv*", "node*", "npm*", "npx*",

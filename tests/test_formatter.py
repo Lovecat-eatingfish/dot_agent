@@ -707,15 +707,29 @@ def test_review_command_shows_diff(tmp_path) -> None:
 
 
 def test_rules_globs_frontmatter(tmp_path) -> None:
-    from mokioclaw.config.loader import load_user_config
+    from mokioclaw.config.loader import format_glob_rules_for_read, load_user_config, matching_glob_rules
 
     rules_dir = tmp_path / ".claude" / "rules"
     rules_dir.mkdir(parents=True)
     (rules_dir / "python-style.md").write_text(
         '---\nglobs: ["**/*.py"]\n---\nUse 4-space indentation.\n', encoding="utf-8"
     )
+    (rules_dir / "always.md").write_text(
+        "Always answer concisely.\n", encoding="utf-8"
+    )
 
     config = load_user_config(workspace=tmp_path)
 
-    assert "4-space indentation" in config.custom_instructions
-    assert "globs" in config.custom_instructions
+    # globs 规则不再无条件进 custom_instructions，而是按文件命中注入
+    assert "Always answer concisely." in config.custom_instructions
+    assert "4-space indentation" not in config.custom_instructions
+    assert len(config.glob_rules) == 1
+    assert config.glob_rules[0]["name"] == "python-style.md"
+    assert config.glob_rules[0]["globs"] == ["**/*.py"]
+
+    # 命中 .py 文件（含嵌套路径）
+    matched = matching_glob_rules(tmp_path, tmp_path / "src" / "pkg" / "mod.py")
+    assert len(matched) == 1
+    assert "4-space indentation" in format_glob_rules_for_read(matched)
+    # 不命中非 .py 文件
+    assert matching_glob_rules(tmp_path, tmp_path / "docs" / "readme.md") == []

@@ -22,6 +22,7 @@ from mokioclaw.core.utils import execute_tool_by_name, last_ai_content
 from mokioclaw.prompts.builder import SYSTEM_PROMPT_DYNAMIC_BOUNDARY, PromptBuilder
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.reliability.background_tasks import get_background_registry, run_in_thread
+from mokioclaw.reliability.cost import record_llm_usage
 from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.tools.registry import TOOL_CONCURRENCY_META, build_tools
 
@@ -88,6 +89,7 @@ def fork_subagent(
             bound = create_model().bind_tools(tools)
 
             response = bound.invoke(messages)
+            record_llm_usage(response, model_name=model if model != "inherit" else None)  # /cost 统计
             messages.append(response)
             calls = getattr(response, "tool_calls", None) or []
             if not calls:

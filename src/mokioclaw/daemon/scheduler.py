@@ -21,6 +21,8 @@ from typing import Any, Callable
 
 from mokioclaw.core.log import get_logger
 
+_DAEMON_DIR_NAME = ".mokioclaw"  # 与 daemon/manager.py 保持一致（不导入以免循环依赖）
+
 logger = get_logger(__name__)
 
 # ============================================================
@@ -148,6 +150,8 @@ class ScheduledTask:
     max_failures: int = 5
     created_at: str = ""
     description: str = ""
+    # 上次触发时间（ISO）：补触发判断的基线；空 = 尚未触发过（首次检查只看当前分钟）
+    last_triggered: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -164,6 +168,7 @@ class ScheduledTask:
             "max_failures": self.max_failures,
             "created_at": self.created_at,
             "description": self.description,
+            "last_triggered": self.last_triggered,
         }
 
     @classmethod
@@ -182,6 +187,7 @@ class ScheduledTask:
             max_failures=data.get("max_failures", 5),
             created_at=data.get("created_at", ""),
             description=data.get("description", ""),
+            last_triggered=data.get("last_triggered", ""),
         )
 
 
@@ -320,7 +326,13 @@ class CronScheduler:
             time.sleep(self._check_interval)
 
     def _check_triggers(self, now: datetime) -> None:
-        """检查并触发到期的任务"""
+        """检查并触发到期的任务（基于 last_triggered 补触发）
+
+        旧实现只测"采样瞬间是否命中"，循环漂移 / 系统休眠会整分钟漏触发。
+        现在用 next_run(after=last_triggered) 判断是否有已错过的触发点：
+        - 无 last_triggered（新建/旧数据）：保持旧语义，仅当前分钟命中才触发
+        - 有 last_triggered：错过就补跑一次（补跑后基线推进，不会连环补）
+        """
         with self._lock:
             tasks = list(self._tasks.values())
 
@@ -338,13 +350,21 @@ class CronScheduler:
             except ValueError:
                 logger.warning("Invalid cron for task %s: %s", task.id, task.cron)
                 continue
-            if schedule.matches(now):
-                self._execute_task(task)
+            baseline = _parse_iso(task.last_triggered) if task.last_triggered else None
+            if baseline is None:
+                if schedule.matches(now):
+                    self._execute_task(task, now)
+                continue
+            upcoming = schedule.next_run(baseline)
+            if upcoming is not None and upcoming <= now:
+                logger.info("Task %s catch-up trigger (missed %s)", task.id, upcoming.isoformat())
+                self._execute_task(task, now)
 
-    def _execute_task(self, task: ScheduledTask) -> None:
+    def _execute_task(self, task: ScheduledTask, now: datetime | None = None) -> None:
         """执行任务"""
         task.status = "running"
         task.last_run = _now_iso()
+        task.last_triggered = (now or datetime.now(timezone.utc)).isoformat()
         self._save_tasks()
         logger.info("Task triggered: %s (%s)", task.id, task.name)
 
@@ -382,14 +402,24 @@ class CronScheduler:
             logger.error("Failed to load tasks: %s", exc)
 
     def _save_tasks(self) -> None:
-        """持久化任务到文件"""
+        """持久化任务到文件（锁内快照 + 原子写）
+
+        调度线程（_execute_task）与 API 线程（add/update/remove）都会调用：
+        无锁迭代 self._tasks 会撞 dict changed size，并发 write_text 会交错
+        损坏 tasks.json。_lock 是 RLock，持锁调用方不会自锁。
+        """
+        import os
+
         try:
             self._tasks_file.parent.mkdir(parents=True, exist_ok=True)
-            payload = [task.to_dict() for task in self._tasks.values()]
-            self._tasks_file.write_text(
+            with self._lock:
+                payload = [task.to_dict() for task in self._tasks.values()]
+            tmp_path = self._tasks_file.with_suffix(".json.tmp")
+            tmp_path.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
+            os.replace(tmp_path, self._tasks_file)
         except Exception as exc:
             logger.error("Failed to save tasks: %s", exc)
 
@@ -404,6 +434,15 @@ def _gen_task_id() -> str:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso(value: str) -> datetime | None:
+    """解析 ISO 时间戳（容错：无时区按 UTC）"""
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 # 模块级单例

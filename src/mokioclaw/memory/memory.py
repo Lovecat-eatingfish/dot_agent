@@ -39,7 +39,9 @@ from mokioclaw.tools.file_tools import read_text_lossy
 logger = get_logger(__name__)
 
 # 历史摘要文件名
-HISTORY_SUMMARY_FILE = "HISTORY_SUMMARY.md"
+# Agent 内部工作文件：收进 .mokioclaw，避免污染用户项目根目录（旧版写在根目录，读取时回退兼容）
+HISTORY_SUMMARY_FILE = ".mokioclaw/HISTORY_SUMMARY.md"
+_LEGACY_HISTORY_SUMMARY_FILE = "HISTORY_SUMMARY.md"
 
 # 规则层配置：定义智能体的工作规则
 RULES_LAYER = {
@@ -188,13 +190,15 @@ def read_history_summary(state: RuntimeState) -> dict[str, Any]:
     Returns:
         包含历史摘要内容的字典
     """
-    try:
-        path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
-    except (ValueError, PathSecurityError) as exc:
-        logger.debug("history summary path error: %s", exc)
-        return {"ok": False, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": False}
+    # .mokioclaw 在工具黑名单内，内部读写直接走文件系统
+    path = state.workspace / HISTORY_SUMMARY_FILE
     if not path.exists():
-        return {"ok": True, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": False}
+        # 旧版兼容：历史摘要曾写在 workspace 根目录
+        legacy = state.workspace / _LEGACY_HISTORY_SUMMARY_FILE
+        if legacy.exists():
+            path = legacy
+        else:
+            return {"ok": True, "path": HISTORY_SUMMARY_FILE, "content": "", "exists": False}
     try:
         content = read_text_lossy(path)
     except OSError as exc:
@@ -214,17 +218,12 @@ def persist_history_summary(state: RuntimeState, summary: str) -> dict[str, Any]
     Returns:
         操作结果字典
     """
-    try:
-        path = state.assert_workspace_path(state.workspace / HISTORY_SUMMARY_FILE)
-    except (ValueError, PathSecurityError) as exc:
-        logger.debug("history summary path error: %s", exc)
-        return {"ok": False, "path": HISTORY_SUMMARY_FILE, "error": str(exc)}
+    path = state.workspace / HISTORY_SUMMARY_FILE
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         content = f"# MokioClaw History Summary\n\n_Updated: {timestamp}_\n\n{summary.strip()}\n"
-        path.write_text(content, encoding="utf-8")
-        state.record_read(path, complete=True)
+        path.write_text(content, encoding="utf-8", newline="\n")
     except OSError as exc:
         logger.debug("history summary write error: %s", exc)
         return {"ok": False, "path": HISTORY_SUMMARY_FILE, "error": str(exc)}
@@ -265,8 +264,7 @@ def _build_topic_index(runtime: RuntimeState) -> dict[str, Any]:
         主题索引字典
     """
     try:
-        project_dir = project_memory_dir()
-        store = TopicStore(runtime.workspace, project_dir=project_dir)
+        store = TopicStore(runtime.workspace)
         index_text = store.load_index()
         topics = store.list_topics()
     except Exception as exc:

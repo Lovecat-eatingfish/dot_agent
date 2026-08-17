@@ -274,3 +274,32 @@ def filter_unresolved_tool_uses(messages: list[Any]) -> list[Any]:
         logger.debug("filter_unresolved_tool_uses: injected placeholder for %s/%s", name, tid)
 
     return result
+
+
+def make_pairing_safe(messages: list[Any]) -> list[Any]:
+    """压缩/切片后修复 AIMessage(tool_calls) 与 ToolMessage 的配对（共享出口）
+
+    1. 丢弃孤儿 ToolMessage（父 AIMessage 被切掉、前文无对应 tool_call_id）
+    2. 用 filter_unresolved_tool_uses 为末尾悬空 tool_call 补占位 result
+
+    所有 messages[-keep_last:] 式切片的出口（reactive/force/dual-threshold 压缩、
+    agent_loop 应急兜底）都必须过这个函数——不修复配对直接发给 API 会返回 400
+    （tool message 必须紧跟对应 tool_calls）。
+    """
+    from langchain_core.messages import AIMessage, ToolMessage
+
+    seen_call_ids: set[str] = set()
+    cleaned: list[Any] = []
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            for tc in getattr(msg, "tool_calls", None) or []:
+                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if tc_id:
+                    seen_call_ids.add(str(tc_id))
+            cleaned.append(msg)
+        elif isinstance(msg, ToolMessage):
+            if str(getattr(msg, "tool_call_id", "") or "") in seen_call_ids:
+                cleaned.append(msg)
+        else:
+            cleaned.append(msg)
+    return filter_unresolved_tool_uses(cleaned)

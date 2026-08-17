@@ -46,10 +46,12 @@ DEFAULT_MAX_OUTPUT_CHARS = 6000    # 输出截断阈值（字符）
 # ========== 危险命令模式列表 ==========
 # 匹配到这些模式的命令会被阻止或要求人工审批
 DANGEROUS_PATTERNS = [
-    r"\brm\s+-rf\b",                                    # Unix 递归删除
+    r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b",  # Unix 递归强制删除（-rf/-fr/-rvf 等组合标志）
+    r"\brm\b(?=[^|;&]*\s-[a-zA-Z]*r)(?=[^|;&]*\s-[a-zA-Z]*f)",  # rm 分离标志 -r ... -f 任意顺序
+    r"\brm\b(?=[^|;&]*--recursive)(?=[^|;&]*--force)",   # rm --recursive ... --force 任意顺序
     r"\bRemove-Item\b.*\b-Recurse\b.*\b-Force\b",       # PowerShell 递归删除
-    r"\bdel\s+/[sq]\b",                                 # Windows 静默删除
-    r"\bformat\b",                                       # 格式化磁盘
+    r"\b(?:del|rmdir)\s+/[sq]\b",                       # Windows 静默删除（含 rmdir /s /q）
+    r"\bformat\s+(?:[a-zA-Z]:|/q)",                     # 格式化磁盘（需盘符或 /q，避免误伤 --pretty=format:）
     r"\bshutdown\b",                                     # 关机
     r"\breboot\b",                                       # 重启
     r"(?:^|[^0-9])>\s*(?:[A-Za-z]:\\|/(?!dev/null\b))", # 重定向到非 /dev/null
@@ -62,7 +64,7 @@ DANGEROUS_PATTERNS = [
     r"\biptables\b",                                     # 防火墙操作
     r"(?:^|[;&|])\s*eval\s",                             # eval 执行
     r"(?:^|[;&|])\s*exec\s",                             # exec 替换进程
-    r"\|\s*(ba)?sh\b",                                   # pipe 到 shell
+    r"\|\s*(?:ba|z|da|k)?sh\b",                          # pipe 到任意 shell（bash/zsh/dash/ksh）
 ]
 
 
@@ -198,6 +200,7 @@ def _normalize_command(command: str) -> str:
 
     Windows 平台会自动转换：
     - python3 → python
+    - mkdir -p → mkdir（cmd 的 mkdir 本身就递归创建父目录，保留 -p 会创建出名为 "-p" 的字面目录）
     - ls → dir
     - cat → type
     - 移除无效的 cd /workspace
@@ -209,6 +212,7 @@ def _normalize_command(command: str) -> str:
         规范化后的命令
     """
     if os.name == "nt":
+        command = re.sub(r"\bmkdir\s+(?:-p|--parents)(?=\s)", "mkdir", command, flags=re.IGNORECASE)
         normalized = re.sub(r"^\s*python3(\.exe)?\b", "python", command, count=1, flags=re.IGNORECASE)
         normalized = re.sub(
             r"^\s*cd\s+(?:/workspace|workspace|\.?/workspace|\.mokioclaw[\\/]+workspace)\s*(?:&&|&)\s*",
@@ -219,7 +223,8 @@ def _normalize_command(command: str) -> str:
         )
         normalized = re.sub(r"^\s*pwd\s*$", "cd", normalized, count=1, flags=re.IGNORECASE)
         normalized = re.sub(r"\bls\s+-la\b", "dir", normalized)
-        normalized = re.sub(r"\bls\b", "dir", normalized)
+        # lookahead 限定 ls 后跟空白/结尾：\b 会把 git ls-files 误改成 git dir-files
+        normalized = re.sub(r"\bls\b(?=\s|$)", "dir", normalized)
         normalized = re.sub(r"\bcat\s+([^\s|&<>]+)", r"type \1", normalized)
         return normalized
     return re.sub(
@@ -414,16 +419,27 @@ def run_bash(
     bash_cwd = _effective_cwd(state)
     if background:
         return _run_background(state, normalized_command, env, approval)
+    proc: subprocess.Popen | None = None
     try:
-        completed = subprocess.run(
+        proc = subprocess.Popen(
             normalized_command,
             cwd=bash_cwd,
             shell=True,
-            capture_output=True,
-            timeout=timeout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             env=env,
+            start_new_session=(os.name != "nt"),
         )
+        stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired as exc:
+        # 超时杀整棵进程树：subprocess.run 的超时只杀外壳（cmd.exe/sh），
+        # 其子进程（node/python/npm）会残留并持有文件锁
+        if proc is not None:
+            _kill_process_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:  # noqa: BLE001
+                pass
         return {
             "ok": False,
             "timed_out": True,
@@ -433,12 +449,12 @@ def run_bash(
             **(approval or {}),
         }
 
-    output = _format_captured_output(state, _decode_output(completed.stdout), _decode_output(completed.stderr), max_output_chars)
+    output = _format_captured_output(state, _decode_output(stdout_bytes), _decode_output(stderr_bytes), max_output_chars)
     return {
-        "ok": completed.returncode == 0,
+        "ok": proc.returncode == 0,
         "timed_out": False,
         "command": normalized_command,
-        "exit_code": completed.returncode,
+        "exit_code": proc.returncode,
         **output,
         "duration_ms": round((time.perf_counter() - started) * 1000),
         **(approval or {}),
@@ -512,13 +528,23 @@ def run_bash_read_only(
             "error": f"read-only mode: command '{cmd_base}' is not in the allowed list ({', '.join(sorted(READ_ONLY_ALLOWED))})",
         }
 
+    # 白名单只校验第一个 token，元字符（&& ; | > 等）可拼接任意后续命令——
+    # 只读保证必须整条命令无链式/重定向元字符
+    _meta = next((ch for ch in ("&&", "||", ";", "|", ">", "<", "`", "$(") if ch in normalized_command), None)
+    if _meta is not None:
+        return {
+            "ok": False,
+            "error": f"read-only mode: shell metacharacter '{_meta}' is not allowed; run a single read-only command without chaining or redirection",
+        }
+
     if timeout_seconds is None:
         timeout = _state_int(state, "bash_default_timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
     else:
         timeout = _coerce_timeout(timeout_seconds)
     max_timeout = _state_int(state, "bash_max_timeout_seconds", DEFAULT_MAX_TIMEOUT_SECONDS)
-    if timeout <= 0 or timeout > max_timeout:
-        timeout = min(timeout, max_timeout)
+    if timeout <= 0:
+        return {"ok": False, "error": f"timeout must be > 0 (got {timeout_seconds})"}
+    timeout = min(timeout, max_timeout)
 
     started = time.perf_counter()
     env, env_error = _build_env(state)
@@ -833,13 +859,33 @@ def _run_background(
     }
 
 
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """杀掉整个进程树（shell=True 时 terminate/kill 只杀外壳，孙进程会残留持有文件锁）"""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        else:
+            import signal as _signal
+
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+
+
 def cleanup_background_processes() -> int:
     """终止所有后台进程，返回清理数量"""
     killed = 0
     for proc in _background_processes:
         if proc.poll() is None:
             try:
-                proc.terminate()
+                _kill_process_tree(proc)
                 proc.wait(timeout=5)
                 killed += 1
             except (subprocess.TimeoutExpired, OSError):

@@ -1,6 +1,7 @@
 """从已启用插件加载 skills / commands / hooks"""
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,13 @@ def discover_plugin_skills(workspace: Path | None = None) -> list[Skill]:
     return skills
 
 
+# 命令名只允许安全字符：名字直接拼进路径，../x 之类可读到目录外的 .md
+_SAFE_COMMAND_NAME = re.compile(r"^[A-Za-z0-9_\-一-鿿]+$")
+
+
 def load_plugin_command(name: str, workspace: Path | None = None) -> str | None:
+    if not _SAFE_COMMAND_NAME.match(name or ""):
+        return None
     for root in enabled_plugin_paths(workspace):
         path = root / "commands" / f"{name}.md"
         if path.exists():

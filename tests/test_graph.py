@@ -264,7 +264,7 @@ def test_context_compressor_removes_old_messages_and_preserves_state(monkeypatch
     assert result["compression_events"][0]["after_tokens"] == 50
     assert result["compression_events"][0]["removed_messages"] == 1
     assert "compressed summary" in result["history_summary"]
-    assert "compressed summary" in (tmp_path / "HISTORY_SUMMARY.md").read_text(encoding="utf-8")
+    assert "compressed summary" in (tmp_path / ".mokioclaw" / "HISTORY_SUMMARY.md").read_text(encoding="utf-8")
     assert result["todos"][0]["content"] == "verify" if "todos" in result else state["todos"][0]["content"] == "verify"
     merged = add_messages(state["messages"], result["messages"])
     assert len(merged) == 1
@@ -293,7 +293,7 @@ def test_planner_generates_default_plan(monkeypatch, tmp_path: Path) -> None:
 
     assert result["todos"][0]["id"] == "todo-1"
     assert result["todos"][0]["status"] == "pending"
-    assert (tmp_path / "TODO.md").exists()
+    assert (tmp_path / ".mokioclaw" / "TODO.md").exists()
 
 
 def test_call_search_agent_tool_updates_state(monkeypatch, tmp_path: Path) -> None:

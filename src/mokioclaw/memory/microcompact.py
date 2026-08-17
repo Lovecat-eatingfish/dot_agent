@@ -145,7 +145,10 @@ def force_compact_messages(messages: list[Any], *, keep_last: int = 12) -> list[
             "Continue from recent turns. Re-read files if unsure."
         )
     )
-    return head + [summary] + list(tail)
+    # 切片尾部可能以孤儿 ToolMessage 开头（父 AIMessage 被切掉）→ 必须配对清洗，防 API 400
+    from mokioclaw.reliability.token_budget import make_pairing_safe
+
+    return make_pairing_safe(head + [summary] + list(tail))
 
 
 def _parse(content: Any) -> Any:

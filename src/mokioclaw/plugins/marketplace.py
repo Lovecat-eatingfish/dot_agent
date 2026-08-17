@@ -75,17 +75,29 @@ def list_catalog(workspace: Path | None = None) -> list[PluginInfo]:
     for info in _scan_builtin():
         by_name[info.name] = info
 
-    for catalog_path in (
-        _GLOBAL_ROOT / "marketplace" / "catalog.json",
-        *( [workspace / ".mokioclaw" / "marketplace" / "catalog.json"] if workspace else [] ),
+    for catalog_path, trusted in (
+        (_GLOBAL_ROOT / "marketplace" / "catalog.json", True),
+        *( [(workspace / ".mokioclaw" / "marketplace" / "catalog.json", False)] if workspace else [] ),
     ):
         for entry in _read_catalog_file(catalog_path):
+            entry_path = Path(entry["path"]).expanduser() if entry.get("path") else None
+            source = str(entry.get("source") or "")
+            if source.startswith("path:"):
+                entry_path = Path(source.split(":", 1)[1]).expanduser()
+            # 不受信 catalog（随仓库分发）不允许把安装/加载指向任意目录：
+            # 恶意仓库可借此把 ~/.ssh 拷进项目、或让其 markdown 进入 agent 提示词
+            if not trusted and not _is_allowed_plugin_source(entry_path, workspace):
+                logger.warning(
+                    "marketplace catalog entry '%s' points outside workspace (%s), ignored",
+                    entry.get("name", "?"), entry_path,
+                )
+                continue
             info = PluginInfo(
                 name=str(entry.get("name", "")),
                 version=str(entry.get("version", "0.0.0")),
                 description=str(entry.get("description", "")),
-                source=str(entry.get("source", "catalog")),
-                path=Path(entry["path"]).expanduser() if entry.get("path") else None,
+                source=source or "catalog",
+                path=entry_path,
                 meta=entry,
             )
             if info.name:
@@ -155,7 +167,7 @@ def install_plugin(
     if info is None:
         return {"ok": False, "error": f"unknown plugin: {name}", "available": sorted(catalog.keys())}
 
-    source_dir = _resolve_source_dir(info)
+    source_dir = _resolve_source_dir(info, workspace)
     if source_dir is None or not source_dir.exists():
         return {"ok": False, "error": f"plugin source not found for '{name}'"}
 
@@ -279,8 +291,8 @@ def _scan_builtin() -> list[PluginInfo]:
     return items
 
 
-def _resolve_source_dir(info: PluginInfo) -> Path | None:
-    if info.path and info.path.exists():
+def _resolve_source_dir(info: PluginInfo, workspace: Path | None = None) -> Path | None:
+    if info.path and info.path.exists() and _is_allowed_plugin_source(info.path, workspace):
         return info.path
     builtin = _BUILTIN_ROOT / info.name
     if builtin.exists():
@@ -289,8 +301,27 @@ def _resolve_source_dir(info: PluginInfo) -> Path | None:
     if source.startswith("builtin:"):
         return _BUILTIN_ROOT / source.split(":", 1)[1]
     if source.startswith("path:"):
-        return Path(source.split(":", 1)[1]).expanduser()
+        candidate = Path(source.split(":", 1)[1]).expanduser()
+        if not _is_allowed_plugin_source(candidate, workspace):
+            logger.warning("plugin source path outside allowed roots, ignored: %s", candidate)
+            return None
+        return candidate
     return None
+
+
+def _is_allowed_plugin_source(candidate: Path | None, workspace: Path | None) -> bool:
+    """插件源目录边界：只允许 workspace 内 / 全局 plugins / builtin 目录
+
+    全局 catalog（用户手写）的路径视为受信（history 上用户可能装在任意位置），
+    该函数只用于拦截 workspace 级不受信 catalog 与 path: source。
+    """
+    if candidate is None:
+        return True  # 无路径字段（纯 builtin 条目）
+    resolved = candidate.resolve()
+    allowed_roots = [(_GLOBAL_ROOT / "plugins").resolve(), _BUILTIN_ROOT.resolve()]
+    if workspace is not None:
+        allowed_roots.append(workspace.resolve())
+    return any(resolved == root or root in resolved.parents for root in allowed_roots)
 
 
 def _install_root(workspace: Path | None, *, scope: str) -> Path:

@@ -531,8 +531,13 @@ def test_local_file_cache_hit_and_miss(tmp_path: Path):
     # 不同 cache_key 不命中（防 filter 串答案）
     miss_key = cache.get("hello world", FakeEmbedder().embed_query("hello world"), cache_key="k2")
     assert miss_key is None
-    # 不相关 query 不命中
-    miss = cache.get("completely different topic xyz", FakeEmbedder().embed_query("completely different topic xyz"), cache_key="k1")
+    # 不相关 query 不命中（cache_key 按 make_cache_key 从 query 派生，query 不同 → key 不同）
+    from mokioclaw.rag.cache import make_cache_key
+    miss = cache.get(
+        "completely different topic xyz",
+        FakeEmbedder().embed_query("completely different topic xyz"),
+        cache_key=make_cache_key("completely different topic xyz"),
+    )
     assert miss is None
 
 

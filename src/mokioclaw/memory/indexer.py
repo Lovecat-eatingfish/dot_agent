@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 
-MEMORY_FILES = ("TODO.md", "HISTORY_SUMMARY.md", "RAW_HISTORY.md")
+MEMORY_FILES = (".mokioclaw/TODO.md", ".mokioclaw/HISTORY_SUMMARY.md", ".mokioclaw/RAW_HISTORY.md")
 MEMORY_INDEX_FILE = ".mokioclaw/memory_index.json"
 MAX_INDEX_CHARS_PER_FIELD = 500
 
@@ -92,12 +92,13 @@ def build_memory_index(workspace: Path) -> MemoryIndex:
             "total_chars": len(content),
         }
 
-        # 文件特定统计
-        if filename == "TODO.md":
+        # 文件特定统计（按文件名匹配，兼容 .mokioclaw/ 前缀路径）
+        base_name = Path(filename).name
+        if base_name == "TODO.md":
             file_info.update(_index_todo(content))
-        elif filename == "HISTORY_SUMMARY.md":
+        elif base_name == "HISTORY_SUMMARY.md":
             file_info["turn_range"] = _extract_turn_range(content)
-        elif filename == "RAW_HISTORY.md":
+        elif base_name == "RAW_HISTORY.md":
             file_info["message_count"] = content.count("## ")
 
         index.files[filename] = file_info

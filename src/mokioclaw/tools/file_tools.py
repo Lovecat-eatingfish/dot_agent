@@ -230,6 +230,15 @@ def read_file(
     state.record_read(path, complete=complete, content=raw)
 
     numbered = "\n".join(f"{offset_value + idx + 1}: {line}" for idx, line in enumerate(selected))
+    # 文件作用域规则注入（对齐 Claude Code rules globs）：命中 frontmatter globs 的规则
+    # 附加到读取结果尾部，只对该文件生效，不污染全局 custom_instructions
+    rules_block = ""
+    try:
+        from mokioclaw.config.loader import format_glob_rules_for_read, matching_glob_rules
+
+        rules_block = format_glob_rules_for_read(matching_glob_rules(state.workspace, path))
+    except Exception:
+        rules_block = ""
     return {
         "ok": True,
         "path": display_path(state, path),
@@ -237,7 +246,7 @@ def read_file(
         "offset": offset_value,
         "limit": limit_value,
         "complete": complete,
-        "content": numbered,
+        "content": numbered + (f"\n\n{rules_block}" if rules_block else ""),
     }
 
 
@@ -298,7 +307,7 @@ def write_file(state: RuntimeState, file_path: str, content: str) -> FileWriteRe
         original = ""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(content, encoding="utf-8")
+    path.write_text(content, encoding="utf-8", newline="\n")
     # 写后按磁盘字节建快照（避免 str→utf-8 与平台换行不一致）
     state.record_read(path, complete=True)
 
@@ -378,13 +387,19 @@ def edit_file(state: RuntimeState, file_path: str, old_text: str, new_text: str)
 
     original = read_text_lossy(path)
     count = original.count(old_text)
+    # Windows 兼容：磁盘 CRLF、LLM 提供的 old_text 是 LF 时精确匹配失败，
+    # 降级为按 LF 规范化后匹配（Claude Code 同款兜底）
+    normalized = original
+    if count == 0 and "\r\n" in original:
+        normalized = original.replace("\r\n", "\n")
+        count = normalized.count(old_text)
     if count == 0:
         return {"ok": False, "error": "old_text was not found"}
     if count > 1:
         return {"ok": False, "error": f"old_text matched {count} times. Provide a unique snippet."}
 
-    updated = original.replace(old_text, new_text, 1)
-    path.write_text(updated, encoding="utf-8")
+    updated = normalized.replace(old_text, new_text, 1)
+    path.write_text(updated, encoding="utf-8", newline="\n")
     state.record_read(path, complete=True)
 
     diff = "\n".join(

@@ -63,7 +63,7 @@ class SummaryChain:
     """
 
     summaries: list[dict[str, Any]] = field(default_factory=list)
-    raw_history_file: str = "RAW_HISTORY.md"  # 完整历史存档
+    raw_history_file: str = ".mokioclaw/RAW_HISTORY.md"  # 完整历史存档（.mokioclaw 内，不污染用户目录）
 
     def add_summary(self, turn_range: str, summary: str, turn_count: int) -> None:
         """添加新的摘要层
@@ -143,15 +143,8 @@ class DualThresholdCompressor:
         capacity = self.thresholds.max_context_tokens
         usage_ratio = current_tokens / capacity if capacity > 0 else 1.0
 
-        # 条件1：步数触发（工具调用超过5步）
-        if step_count >= 5:
-            stats = CompressionStats(
-                original_tokens=current_tokens,
-                strategy="step_triggered",
-            )
-            return True, f"step_count={step_count} >= 5", stats
-
-        # 条件2：硬阈值触发（必须立即压缩）
+        # 条件1：硬阈值触发（必须立即压缩，优先级最高——否则工具步数多的任务
+        # 永远命中 step_triggered 轻量路径，上下文持续超限无法全量压缩）
         if current_tokens >= capacity * self.thresholds.hard_threshold:
             stats = CompressionStats(
                 original_tokens=current_tokens,
@@ -161,6 +154,14 @@ class DualThresholdCompressor:
                 strategy="hard",
             )
             return True, f"hard_threshold={usage_ratio:.1%}", stats
+
+        # 条件2：步数触发（工具调用超过5步，增量压缩）
+        if step_count >= 5:
+            stats = CompressionStats(
+                original_tokens=current_tokens,
+                strategy="step_triggered",
+            )
+            return True, f"step_count={step_count} >= 5", stats
 
         # 条件3：软阈值触发（预生成摘要）
         if current_tokens >= capacity * self.thresholds.soft_threshold:
@@ -285,9 +286,11 @@ class DualThresholdCompressor:
             from langchain_core.messages import AIMessage
 
             summary_msg = AIMessage(content=f"[Previous Summary]\n{context_summary}")
-            # 摘要 + 新消息的最后 10 条
+            # 摘要 + 新消息的最后 10 条（切片尾部需配对清洗，孤儿 ToolMessage 会触发 API 400）
+            from mokioclaw.reliability.token_budget import make_pairing_safe
+
             recent_messages = messages[-10:] if len(messages) > 10 else messages
-            combined = [summary_msg] + recent_messages
+            combined = make_pairing_safe([summary_msg] + recent_messages)
         else:
             # 第一次压缩，正常分级压缩
             combined = messages

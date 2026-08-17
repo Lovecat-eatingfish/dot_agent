@@ -48,6 +48,21 @@ _TOPIC_PREFIXES = {
 # 主题名合法字符：字母/数字/下划线/连字符/中文
 _TOPIC_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_\-一-鿿]+$")
 
+# 模块级写锁（按 workspace 键控）：同一 workspace 的所有 TopicStore 实例共享，
+# 覆盖主线程显式写入 + 后台提取 + autodream 的全部并发路径
+_workspace_locks: dict[str, threading.Lock] = {}
+_workspace_locks_guard = threading.Lock()
+
+
+def _workspace_write_lock(workspace: Path) -> threading.Lock:
+    key = str(Path(workspace).resolve())
+    with _workspace_locks_guard:
+        lock = _workspace_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _workspace_locks[key] = lock
+        return lock
+
 
 def _safe_topic_name(name: str) -> str | None:
     """净化主题名，拒绝含路径遍历段的名字。"""
@@ -81,11 +96,15 @@ class TopicStore:
 
     管理 .mokioclaw/memory/ 目录下的主题记忆文件。
     单层存储，文件名带 type 前缀。
+
+    写锁是模块级、按 workspace 键控的：auto_memory 的主线程写入与后台提取/
+    autodream 线程会各自 new TopicStore 实例，实例级锁互不相见，
+    并发读-改-写 MEMORY.md 会丢索引条目。
     """
 
     def __init__(self, workspace: Path) -> None:
         self.memory_dir = workspace / ".mokioclaw" / "memory"
-        self._write_lock = threading.Lock()
+        self._write_lock = _workspace_write_lock(workspace)
 
     def ensure_dir(self) -> None:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
@@ -225,7 +244,8 @@ class TopicStore:
         updated = re.sub(r"\n{3,}", "\n\n", updated)
 
         try:
-            tmp_path = index_path.with_suffix(".md.tmp")
+            # tmp 名带 pid：多进程同时压缩时 os.replace 各自的临时文件，避免互相覆盖半截内容
+            tmp_path = index_path.with_suffix(f".md.{os.getpid()}.tmp")
             tmp_path.write_text(updated, encoding="utf-8")
             os.replace(tmp_path, index_path)
         except OSError as exc:

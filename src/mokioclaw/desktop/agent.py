@@ -99,6 +99,8 @@ class DesktopPetAgent:
         )
         self._on_hotkey: Callable[[], None] | None = None
         self._hotkey_listener: Any = None
+        # writer 线程的 per-generation 停止事件（stop→start 快速切换防线程泄漏）
+        self._writer_stop: threading.Event | None = None
 
     @property
     def status(self) -> StatusSnapshot:
@@ -124,6 +126,10 @@ class DesktopPetAgent:
     def stop(self) -> None:
         """停止后台服务"""
         self._running = False
+        # 唤醒 writer 线程使其退出（用 per-generation event，
+        # 避免 stop→start 快速切换时旧线程看到新 _running=True 而永不退出）
+        if self._writer_stop is not None:
+            self._writer_stop.set()
         if self._unsub is not None:
             self._unsub()
             self._unsub = None
@@ -157,8 +163,13 @@ class DesktopPetAgent:
         return self._status_file
 
     def _on_event(self, event: dict[str, Any]) -> None:
-        """处理 EventBus 事件"""
+        """处理 EventBus 事件
+
+        通知在锁外发送（notify 起子进程最长阻塞 5s，锁内执行会卡住
+        事件总线的其他订阅者和状态写入线程）。
+        """
         event_type = event.get("type", "")
+        pending_notify: tuple[str, str, str] | None = None
 
         with self._lock:
             if event_type == "intent_decision":
@@ -168,6 +179,15 @@ class DesktopPetAgent:
                 else:
                     self._status.agent_status = AgentStatus.THINKING.value
                 self._status.last_action = f"Intent routed: {route}"
+                self._status.last_action_time = _now_iso()
+
+            elif event_type == "session_turn_started":
+                # 记录当前任务描述（完成通知 / widget 任务行展示用）
+                task_text = str(event.get("task", "") or "").strip()
+                if task_text:
+                    self._status.current_task = task_text[:200]
+                self._status.agent_status = AgentStatus.THINKING.value
+                self._status.last_action = "Turn started"
                 self._status.last_action_time = _now_iso()
 
             elif event_type == "plan_snapshot":
@@ -192,10 +212,10 @@ class DesktopPetAgent:
                     self._status.error_count += 1
                     self._status.last_action = f"{node}: FAILED"
                     self._status.last_action_time = _now_iso()
-                    self.notify(
+                    pending_notify = (
                         f"dot_agent: {node} 工具执行失败",
                         str(result.get("error", "unknown error"))[:200],
-                        level="error",
+                        "error",
                     )
                 else:
                     self._status.agent_status = AgentStatus.THINKING.value
@@ -214,10 +234,10 @@ class DesktopPetAgent:
                 self._status.completed_tasks += 1
                 self._status.last_action = "Task completed"
                 self._status.last_action_time = _now_iso()
-                self.notify(
+                pending_notify = (
                     "dot_agent: 任务完成",
                     self._status.current_task[:100] or "Task finished",
-                    level="success",
+                    "success",
                 )
 
             elif event_type == "checkpoint_saved":
@@ -235,10 +255,16 @@ class DesktopPetAgent:
                 self._status.last_action = "Chat reply"
                 self._status.last_action_time = _now_iso()
 
+        if pending_notify is not None:
+            self.notify(pending_notify[0], pending_notify[1], level=pending_notify[2])
+
     def _start_status_writer(self) -> None:
-        """启动状态文件写入线程"""
+        """启动状态文件写入线程（每次 start 一个新 stop event，旧线程可靠退出）"""
+        self._writer_stop = threading.Event()
+        stop_event = self._writer_stop
+
         def _writer() -> None:
-            while self._running:
+            while self._running and not stop_event.is_set():
                 try:
                     status_file = self.get_status_file()
                     if status_file is not None:
@@ -252,16 +278,16 @@ class DesktopPetAgent:
                         )
                 except Exception as exc:
                     logger.debug("status writer error: %s", exc)
-                import time
-                time.sleep(1)
+                stop_event.wait(1)
 
         t = threading.Thread(target=_writer, daemon=True, name="pet-status-writer")
         t.start()
 
     def _start_hotkey_listener(self) -> None:
-        """启动全局热键监听"""
+        """启动全局热键监听（重复设置时先停旧监听器，避免热键重复注册）"""
         if self._on_hotkey is None:
             return
+        self._stop_hotkey_listener()
         self._hotkey_listener = _register_hotkey(self._on_hotkey)
 
     def _stop_hotkey_listener(self) -> None:
@@ -307,6 +333,16 @@ def _notify_windows(title: str, message: str) -> None:
         import base64
         import subprocess
 
+        # 构建 Toast XML（title/message 需 XML 转义）
+        from xml.sax.saxutils import escape as _xml_escape
+
+        toast_xml = (
+            '<toast><visual><binding template="ToastText02">'
+            f'<text id="1">{_xml_escape(title)}</text>'
+            f'<text id="2">{_xml_escape(message[:200])}</text>'
+            '</binding></visual></toast>'
+        )
+
         # 构建 PowerShell 脚本（使用 here-string 避免引号转义问题）
         ps_script = f'''
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
@@ -339,10 +375,23 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($template)
             logger.debug("win10toast fallback also failed: %s", fallback_exc)
 
 
+def _applescript_escape(value: str) -> str:
+    """AppleScript 字符串字面量转义（反斜杠 + 双引号）"""
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def _notify_macos(title: str, message: str) -> None:
-    """macOS 桌面通知"""
+    """macOS 桌面通知
+
+    title/message 来自工具错误文本等不受信内容，必须转义后才能拼进
+    AppleScript 字符串——一个裸引号即可逃逸执行任意 osascript。
+    """
     import subprocess
-    script = f'display notification "{message}" with title "{title}" sound name "default"'
+
+    script = (
+        f'display notification "{_applescript_escape(message)}" '
+        f'with title "{_applescript_escape(title)}" sound name "default"'
+    )
     subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
 
 

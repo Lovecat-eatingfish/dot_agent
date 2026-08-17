@@ -35,6 +35,9 @@ _SANDBOX_EXEMPT = re.compile(
 # 命令中引用绝对路径的模式（Windows 盘符 / POSIX 根路径）
 _ABS_PATH_PATTERN = re.compile(r"(?<![\w/.-])(?:[A-Za-z]:[\\/][^\s\"'|&;<>]*|/(?!/)[^\s\"'|&;<>]+)")
 
+# 相对路径穿越：../ 、..\ 、或独立成词的 ..（cd .. && ...）
+_RELATIVE_TRAVERSAL = re.compile(r"(?:\.\./|\.\.\\|(?:^|[\s\"'=&|;])\.\.(?:[\s\"'=&|;]|$))")
+
 
 def sandbox_enabled() -> bool:
     return os.getenv("MOKIO_SANDBOX", "1").strip().lower() not in {"0", "false", "no", "off"}
@@ -43,15 +46,32 @@ def sandbox_enabled() -> bool:
 def check_sandbox(state: "RuntimeState", command: str) -> str | None:
     """返回拒绝原因；None 表示放行。
 
-    规则：命令里出现的绝对路径必须落在 workspace 内（/dev/null、临时管道等除外）。
+    规则：
+    1. 命令里出现的绝对路径必须落在 workspace 内（/dev/null、临时管道等除外）
+    2. 相对路径穿越（../ / ..\\）超出 workspace 边界的同样拒绝——
+       只查绝对路径时 `del ..\\..\\x` 这类命令可以静默逃出工作区
     """
     if not sandbox_enabled():
         return None
     text = (command or "").strip()
-    if not text or _SANDBOX_EXEMPT.match(text):
+    if not text:
+        return None
+
+    # 相对路径穿越检查先于只读豁免：豁免正则只看命令名（type/cat 等），
+    # 不检查参数里的 ..，放后面会把 `type ..\..\config` 整条放行。
+    # 精确判断"穿越后是否真的出界"需要解析整条命令的 cwd 语义，正则层做不到，
+    # 教学版选择零信任：.. 一律拒绝，提示用 workspace 内的绝对路径。
+    if _RELATIVE_TRAVERSAL.search(text):
+        return (
+            "sandbox: relative path traversal (..) is not allowed; "
+            "use a path inside the workspace instead"
+        )
+
+    if _SANDBOX_EXEMPT.match(text):
         return None
 
     workspace = state.workspace.resolve()
+
     for match in _ABS_PATH_PATTERN.finditer(text):
         raw = match.group(0)
         # 常见无害目标

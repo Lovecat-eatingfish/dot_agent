@@ -78,6 +78,7 @@ from mokioclaw.prompts.agent_prompt import (
 from mokioclaw.prompts.builder import PromptBuilder, get_prompt_builder
 from mokioclaw.prompts.context_manager_prompt import CONTEXT_COMPRESSION_PROMPT  # noqa: F401 — used via builder
 from mokioclaw.providers.openai_provider import create_model
+from mokioclaw.reliability.cost import record_llm_usage
 from mokioclaw.tools import build_read_only_tools
 from mokioclaw.tools.todo_tool import persist_todos, write_todos
 
@@ -202,6 +203,7 @@ def chat_responder_node(state: MokioGraphState) -> dict[str, Any]:
                 HumanMessage(content=_chat_input(state)),
             ]
         )
+        record_llm_usage(response)  # /cost usage 统计
         text = str(getattr(response, "content", "") or "").strip()
     except Exception as exc:
         logger.warning("chat_responder failed: %s", exc, exc_info=True)
@@ -268,6 +270,7 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
                 HumanMessage(content=_planner_input(working_state, memory)),
             ]
         )
+        record_llm_usage(response)  # /cost usage 统计
     except Exception as exc:
         logger.error("planner invoke failed: %s", exc, exc_info=True)
         return {
@@ -421,6 +424,7 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
             logger.error("verifier invoke failed: %s", exc, exc_info=True)
             produced_messages.append(AIMessage(content=f"verifier invocation error: {exc}"))
             break
+        record_llm_usage(response)  # /cost usage 统计
         produced_messages.append(response)
         messages.append(response)
         tool_calls = getattr(response, "tool_calls", None) or []
@@ -684,6 +688,17 @@ def context_monitor_route(state: MokioGraphState) -> str:
     return state.get("context_next_node") or "verifier"
 
 
+def _make_pairing_safe(messages: list[Any]) -> list[Any]:
+    """压缩/切片后修复 AIMessage(tool_calls) 与 ToolMessage 的配对
+
+    实现已下沉到 reliability.token_budget.make_pairing_safe（memory/ 层压缩出口共用），
+    这里保留薄委托以兼容既有调用点。
+    """
+    from mokioclaw.reliability.token_budget import make_pairing_safe
+
+    return make_pairing_safe(messages)
+
+
 def context_compressor_node(state: MokioGraphState) -> dict[str, Any]:
     """上下文压缩器节点（增强版：双阈值 + 增量更新 + 完整历史存档）
 
@@ -767,22 +782,25 @@ def context_compressor_node(state: MokioGraphState) -> dict[str, Any]:
     # 3. 根据策略决定保留多少消息
     if is_incremental:
         # 增量压缩：保留旧摘要 + 更多最近消息
-        kept_messages = before_messages[-20:]  # 保留最近 20 条
+        kept_messages = _make_pairing_safe(before_messages[-20:])  # 保留最近 20 条
         remaining_messages = [summary_message] + kept_messages
     else:
         # 全量压缩（hard）：只保留摘要 + 最近 10 条
         remaining_messages = [summary_message]
         if len(before_messages) > 10:
-            remaining_messages.extend(before_messages[-10:])
+            remaining_messages.extend(_make_pairing_safe(before_messages[-10:]))
 
     # 4. 分级压缩（仅对硬阈值且消息很多时）
     if not is_incremental and len(before_messages) > 20:
-        context_summary = state.get("context_summary", "")
-        compressed_messages = compress_messages_by_tier(
-            before_messages,
-            context_summary=context_summary,
-        )
-        remaining_messages = [summary_message] + compressed_messages[:10]
+        try:
+            context_summary = state.get("context_summary", "")
+            compressed_messages = compress_messages_by_tier(
+                before_messages,
+                context_summary=context_summary,
+            )
+            remaining_messages = [summary_message] + _make_pairing_safe(compressed_messages[:10])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tiered compression failed, keeping slice fallback: %s", exc)
         tier_stats = estimate_tokens_for_tiered_compression(
             before_messages,
             context_summary,
@@ -883,7 +901,7 @@ def search_agent_node(state: MokioGraphState) -> dict[str, Any]:
         "search_agent_summary": result.get("summary", ""),
         "last_actor_summary": result.get("summary", ""),
         "messages": [AIMessage(content=f"[searchAgent] {result.get('summary', '')}")],
-        "context_next_node": "context_monitor",
+        "context_next_node": "verifier",
     }
 
 
@@ -924,7 +942,7 @@ def code_agent_node(state: MokioGraphState) -> dict[str, Any]:
         "last_actor_summary": code_agent_summary,
         "agent_handoffs": agent_handoffs,
         "messages": [AIMessage(content=f"[codeAgent] {code_agent_summary}")],
-        "context_next_node": "context_monitor",
+        "context_next_node": "verifier",
     }
 
 
@@ -1002,6 +1020,14 @@ def final_node(state: MokioGraphState) -> dict[str, Any]:
 
     生成更紧凑、可操作的最终结果摘要。
     """
+    runtime = state.get("runtime")
+    if runtime is not None and getattr(runtime, "agent_mode", "auto") == "plan":
+        # plan 模式：planner 产出计划即任务完成，保留其 final_answer
+        # （plan 流程不经过 verifier，passed 恒为 False，照常计算会被报成 FAILED）
+        return {
+            "final_answer": state.get("final_answer") or "Plan completed (agent_mode=plan).",
+            "passed": True,
+        }
     status = "PASSED" if state.get("passed") else "FAILED"
     verdict = _final_verdict_line(state, status)
     summary = _final_summary_block(state)
@@ -1181,6 +1207,7 @@ def _compress_context_with_model(state: MokioGraphState) -> dict[str, Any]:
     ]
     try:
         response = create_model().invoke(messages)
+        record_llm_usage(response)  # /cost usage 统计
         parsed = _extract_json(str(response.content))
         if parsed:
             return parsed
@@ -1634,7 +1661,7 @@ def _persist_raw_history(runtime: Any, messages: list[Any]) -> None:
         from datetime import datetime
 
         workspace = runtime.workspace
-        history_file = workspace / "RAW_HISTORY.md"
+        history_file = workspace / ".mokioclaw" / "RAW_HISTORY.md"
         history_file.parent.mkdir(parents=True, exist_ok=True)
 
         # 格式化消息
@@ -1649,10 +1676,9 @@ def _persist_raw_history(runtime: Any, messages: list[Any]) -> None:
             lines.append(content[:500])  # 截断避免文件过大
             lines.append("")
 
-        # 追加到文件（保留历史）
-        with open(history_file, "a", encoding="utf-8") as f:
-            f.write("\n".join(lines))
-            f.write("\n---\n\n")
+        # 幂等快照（覆盖写）：旧实现 append 全量消息，同一批消息在多次压缩时重复落盘、
+        # 审计文件无限膨胀；快照语义保留同样信息且不重复
+        history_file.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
 
     except Exception as exc:
         logger.warning("Failed to persist raw history: %s", exc)

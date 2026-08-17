@@ -138,16 +138,14 @@ def test_bash_accepts_string_timeout(tmp_path: Path) -> None:
 def test_bash_uses_runtime_default_timeout_when_omitted(monkeypatch, tmp_path: Path) -> None:
     calls = []
 
-    class FakeCompleted:
+    class FakeProc:
         returncode = 0
-        stdout = b"ok\n"
-        stderr = b""
 
-    def fake_run(command, **kwargs):
-        calls.append(kwargs)
-        return FakeCompleted()
+        def communicate(self, timeout=None):
+            calls.append({"timeout": timeout})
+            return (b"ok\n", b"")
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: FakeProc())
     state = RuntimeState(workspace=tmp_path, bash_default_timeout_seconds=77)
 
     result = run_bash(state, "echo ok")
@@ -319,16 +317,17 @@ def test_bash_high_risk_command_requires_approval_by_default(tmp_path: Path) -> 
 def test_bash_high_risk_command_auto_approval_executes(monkeypatch, tmp_path: Path) -> None:
     calls = []
 
-    class FakeCompleted:
+    class FakeProc:
         returncode = 0
-        stdout = b"installed\n"
-        stderr = b""
 
-    def fake_run(command, **kwargs):
-        calls.append((command, kwargs))
-        return FakeCompleted()
+        def communicate(self, timeout=None):
+            return (b"installed\n", b"")
 
-    monkeypatch.setattr("subprocess.run", fake_run)
+    def fake_popen(command, **kwargs):
+        calls.append(command)
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
     state = RuntimeState(workspace=tmp_path, approval_mode="auto")
 
     result = run_bash(state, "uv add fastapi", timeout_seconds=5)
@@ -337,7 +336,7 @@ def test_bash_high_risk_command_auto_approval_executes(monkeypatch, tmp_path: Pa
     assert result["requires_approval"] is True
     assert result["approved"] is True
     assert result["stdout"] == "installed\n"
-    assert calls[0][0] == "uv add fastapi"
+    assert calls[0] == "uv add fastapi"
 
 
 def test_bash_inline_approval_handler_can_approve(monkeypatch, tmp_path: Path) -> None:
@@ -476,7 +475,7 @@ def test_todo_markdown_persistence(tmp_path: Path) -> None:
 
     result = persist_todos(state, todos, ["page exists"], ["python --version"], "demo plan")
 
-    content = (tmp_path / "TODO.md").read_text(encoding="utf-8")
+    content = (tmp_path / ".mokioclaw" / "TODO.md").read_text(encoding="utf-8")
     assert result["ok"] is True
     assert "demo plan" in content
     assert "todo-1" in content

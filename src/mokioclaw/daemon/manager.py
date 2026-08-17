@@ -15,6 +15,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -150,9 +151,9 @@ class DaemonManager:
                 out_fh.close()
             raise RuntimeError(f"Failed to start daemon: {exc}") from exc
         finally:
-            # 启动成功后，文件句柄由子进程管理，这里可以关闭我们的引用
-            # 注意：在 Windows 上不能立即关闭，需要等待子进程启动完成
-            if out_fh and sys.platform != "win32":
+            # 子进程持有继承的句柄，父进程关闭自己的引用不影响其写入
+            # （原 win32 分支"永不关闭"会让父进程终生泄漏日志 fd）
+            if out_fh:
                 out_fh.close()
 
         # 写入 pidfile
@@ -207,8 +208,21 @@ class DaemonManager:
             logger.error("Permission error stopping daemon: %s", exc)
             return False
 
-        # 等待文件句柄释放（Windows 需要）
+        # 等待文件句柄释放 / 进程表更新（Windows 刚被杀的进程会短暂残留）
         time.sleep(0.3)
+
+        # 强杀后复检：杀不掉的 daemon 若照旧清 pidfile 会变成失管孤儿进程，
+        # 下次 start() 还会再起一个重复实例。保留 pidfile 让用户能再次尝试 stop。
+        if _is_process_alive(pid):
+            # 残留窗口重试一次（Windows taskkill 异步生效）
+            _kill_process(pid, force=True)
+            time.sleep(1.0)
+        if _is_process_alive(pid):
+            logger.error(
+                "Daemon pid=%d still alive after force kill; keeping pidfile for retry", pid
+            )
+            return False
+
         self._clear_pid()
         logger.info("Daemon stopped: pid=%d", pid)
         return True
@@ -248,7 +262,7 @@ class DaemonManager:
         if started_at:
             try:
                 started = datetime.fromisoformat(started_at)
-                uptime = (datetime.now(timezone.utc) - started).total_seconds()
+                uptime = (datetime.datetime.now(datetime.timezone.utc) - started).total_seconds()
             except Exception:
                 pass
 
@@ -324,6 +338,19 @@ def _kill_process(pid: int, force: bool = False) -> None:
         pid: 进程 ID
         force: 是否强制终止
     """
+    if sys.platform == "win32":
+        # os.kill 的 TerminateProcess 只杀目标进程本身，daemon 的子进程会残留；
+        # taskkill /T 杀整棵进程树（与 bash_tool._kill_process_tree 对齐）
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
+
     sig = _get_platform_signal(force)
     try:
         os.kill(pid, sig)
@@ -334,12 +361,34 @@ def _kill_process(pid: int, force: bool = False) -> None:
 def _is_process_alive(pid: int) -> bool:
     """检查进程是否存在
 
+    Windows 上不能用 os.kill(pid, 0)：实测（Py3.13/Win11）它对已退出的
+    进程也返回成功——TerminateProcess(handle, 0) 把信号值 0 当退出码写入，
+    只要 OpenProcess 拿到句柄就不抛异常 → 存活检查恒为 True。
+    改用 OpenProcess + GetExitCodeProcess == STILL_ACTIVE 判定。
+
     Args:
         pid: 进程 ID
 
     Returns:
         进程是否存在
     """
+    if sys.platform == "win32":
+        import ctypes
+
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            # 注：进程退出码恰好是 259 时会误判为存活（可接受的边缘情况）
+            return exit_code.value == STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
         return True

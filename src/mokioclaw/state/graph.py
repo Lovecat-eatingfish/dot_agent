@@ -240,6 +240,7 @@ class MokioGraphState(TypedDict, total=False):
     context_should_compress: bool
     context_next_node: str
     context_compression_strategy: str  # "hard" | "soft" | "step_triggered" | "none"
+    snip_tokens_freed: int  # 最近一次 snip 压缩释放的 token 数
     compression_events: list[CompressionEvent]
     memory_snapshot: LayeredMemory
     history_summary: str

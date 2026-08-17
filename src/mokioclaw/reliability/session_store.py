@@ -68,11 +68,19 @@ def _load_index(workspace: Path) -> dict[str, Any]:
         return {"sessions": [], "latest": None}
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """原子写：tmp 文件 + os.replace，避免并发写产生半截 JSON（损坏 index 会连锁清空全部索引）"""
+    import os
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(text, encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
 def _save_index(workspace: Path, index: dict[str, Any]) -> None:
     """保存 session 索引"""
-    path = session_index_path(workspace)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(index, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _atomic_write_text(session_index_path(workspace), json.dumps(index, ensure_ascii=False, indent=2) + "\n")
 
 
 def _update_index(workspace: Path, session_id: str, summary: dict[str, Any]) -> None:
@@ -567,9 +575,10 @@ def _git_dir(workspace: Path, session_id: str) -> Path:
 
 def _save_session_file(workspace: Path, session_id: str, session: dict[str, Any]) -> None:
     """保存 session.json 文件"""
-    path = _session_file_path(workspace, session_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(session, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+    _atomic_write_text(
+        _session_file_path(workspace, session_id),
+        json.dumps(session, ensure_ascii=False, indent=2, default=str) + "\n",
+    )
 
 
 def build_resume_context(session: dict[str, Any], *, max_chars: int = 5000) -> str:

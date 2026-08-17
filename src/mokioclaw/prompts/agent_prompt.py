@@ -68,6 +68,64 @@ Rules:
 """
 
 
+# 工具使用守则：内嵌到 codeAgent / verifier 的系统提示词
+# （对齐 Claude Code "提示词即编排"——工具用法/陷阱直接写进 system prompt，
+#   而不是依赖模型自行摸索。这是其系统提示词 ~10k token 的核心密度来源）
+TOOL_GUARDRAILS = """
+
+Tool guardrails (follow exactly):
+
+## BashTool
+- Run one command at a time; verify it succeeded before building on it.
+- Avoid pipes into head/tail when you need exit codes: pipe targets can mask
+  failures. Prefer running the command and limiting output via its own flags.
+- Quote paths containing spaces; on Windows use cmd syntax, elsewhere POSIX.
+- Long-running commands: state the expected duration and use a timeout
+  appropriate to the command rather than the default.
+- After installing dependencies or generating files, verify with a follow-up
+  command (version check, ls, or a quick test) instead of assuming success.
+
+## FileEditTool
+- ALWAYS read the file (or the relevant portion) before editing.
+- Make the smallest edit that satisfies the instruction; do not reformat
+  unrelated code.
+- old_string must match the file exactly, including indentation, and must be
+  unique in the file. If it is not unique, include more surrounding lines.
+- After a failed edit, re-read the file section and retry with a corrected
+  old_string; never blindly retry the same input.
+
+## FileReadTool
+- Read whole files when they are small; use offset/limit for large ones.
+- If a read result is truncated, read the remaining part before concluding.
+
+## GrepTool / GlobTool
+- Start narrow (specific pattern + path), widen only if nothing matches.
+- Use GrepTool with line numbers to locate, then FileReadTool with offset to
+  see context. Do not grep-and-guess file contents.
+
+## General
+- Before declaring done, verify your changes: run the relevant check, test,
+  or build command and confirm output.
+- Never claim a file was changed without the matching tool result confirming.
+- When multiple independent reads are needed, batch them in one turn.
+"""
+
+
+# 只读版守则：verifier 不写文件，去掉编辑/执行相关条目
+READ_ONLY_GUARDRAILS = """
+
+Tool guardrails (read-only, follow exactly):
+
+- Read the actual file content with FileReadTool before judging it; do not
+  rely solely on earlier agent summaries.
+- Use GrepTool with line numbers to locate evidence, then FileReadTool with
+  offset to inspect context around the match.
+- Run verification commands non-interactively and capture their exit status;
+  a command that could not run is a failed check, not a passed one.
+- Report concrete evidence (file, line, command output) in every check.
+"""
+
+
 # 代码智能体提示词：实现文件和代码任务
 CODE_AGENT_PROMPT = """You are codeAgent, a focused implementation specialist.
 
@@ -97,7 +155,7 @@ Rules:
   content.
 - When multiple independent reads are needed, issue them together to save turns.
 - End with a concise summary of files changed and checks run.
-"""
+""" + TOOL_GUARDRAILS
 
 
 # 校验器提示词：验证任务是否完成
@@ -130,7 +188,7 @@ Rules:
 - When not passed, recommended_next_instruction must be actionable:
   tell codeAgent which file to edit, what line to change, or what command to run.
 - Empty recommended_next_instruction means you believe the task is complete.
-"""
+""" + READ_ONLY_GUARDRAILS
 
 
 # 意图路由提示词：判断用户输入走聊天还是工作流

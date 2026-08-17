@@ -120,21 +120,25 @@ def validate_path_access(
 
 
 def _check_blacklisted(path: Path, workspace: Path, operation: str) -> None:
-    """检查路径是否在黑名单中"""
+    """检查路径是否在黑名单中
+
+    parts 比较统一小写：Windows 文件系统不区分大小写，
+    `.GIT`/`.Git` 若照原文比较会绕过黑名单。
+    """
     try:
         rel_path = path.relative_to(workspace)
     except ValueError:
         # 不在工作区内，前面已经检查过
         return
 
-    parts = set(rel_path.parts)
+    parts = {part.lower() for part in rel_path.parts}
     path_str = str(rel_path).lower()
 
     # 检查黑名单目录
-    blacklisted = DEFAULT_BLACKLISTED_DIRS & parts
+    blacklisted = {d for d in DEFAULT_BLACKLISTED_DIRS if d.lower() in parts}
     if blacklisted:
         raise PathAccessDeniedError(
-            f"Access denied: {operation} operation on blacklisted directory: {blacklisted.pop()}"
+            f"Access denied: {operation} operation on blacklisted directory: {sorted(blacklisted)[0]}"
         )
 
     # 检查敏感文件（使用 search 而不是 match，以匹配子目录中的文件）
@@ -146,25 +150,32 @@ def _check_blacklisted(path: Path, workspace: Path, operation: str) -> None:
 
 
 def _check_write_permission(path: Path, workspace: Path) -> None:
-    """检查写权限"""
+    """检查写权限
+
+    白名单只看顶层目录（rel_path.parts[0]）：任意层级命中会让
+    `evil/src/x` 这种攻击者自建 src 目录获得写权限。
+    workspace 根下的单文件（README.md 等）保持放行。
+    """
     try:
         rel_path = path.relative_to(workspace)
     except ValueError:
         return
 
-    # 检查是否在白名单目录
-    parts = set(rel_path.parts)
-    in_whitelist = bool(DEFAULT_ALLOWED_WRITE_DIRS & parts)
+    if not rel_path.parts:
+        return
 
-    # 如果不在白名单，检查是否是根目录下的文件（如 README.md）
-    if not in_whitelist and len(rel_path.parts) > 1:
-        # 检查第一级目录是否在白名单
-        top_dir = rel_path.parts[0]
-        if top_dir not in DEFAULT_ALLOWED_WRITE_DIRS and top_dir not in ALWAYS_ALLOWED_FILES:
-            raise PathAccessDeniedError(
-                f"Write access denied: {rel_path} is not in an allowed directory. "
-                f"Allowed directories: {', '.join(sorted(DEFAULT_ALLOWED_WRITE_DIRS))}"
-            )
+    # workspace 根下直接写文件（如 README.md / pyproject.toml）放行
+    if len(rel_path.parts) == 1:
+        return
+
+    top_dir = rel_path.parts[0].lower()
+    top_allowed = {d.lower() for d in DEFAULT_ALLOWED_WRITE_DIRS}
+    always_allowed = {f.lower() for f in ALWAYS_ALLOWED_FILES}
+    if top_dir not in top_allowed and top_dir not in always_allowed:
+        raise PathAccessDeniedError(
+            f"Write access denied: {rel_path} is not in an allowed directory. "
+            f"Allowed directories: {', '.join(sorted(DEFAULT_ALLOWED_WRITE_DIRS))}"
+        )
 
 
 def is_path_safe_for_read(path: Path, workspace: Path) -> bool:

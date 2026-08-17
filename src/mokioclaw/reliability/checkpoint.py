@@ -256,8 +256,9 @@ def load_strict_state(runtime: Any, *, max_attempts: int = 3) -> dict[str, Any]:
 def build_light_resume_inputs(runtime: Any, *, task: str | None = None, max_attempts: int = 3) -> dict[str, Any]:
     checkpoint = read_checkpoint(runtime.workspace)
     recovery = read_checkpoint_text(runtime.workspace, RECOVERY_FILE)
-    todo = read_workspace_text(runtime.workspace, "TODO.md")
-    history = read_workspace_text(runtime.workspace, "HISTORY_SUMMARY.md")
+    # 内部工作文件已收进 .mokioclaw/，读取时回退兼容旧版根目录文件
+    todo = read_workspace_text_any(runtime.workspace, ".mokioclaw/TODO.md", "TODO.md")
+    history = read_workspace_text_any(runtime.workspace, ".mokioclaw/HISTORY_SUMMARY.md", "HISTORY_SUMMARY.md")
 
     original_task = str(checkpoint.get("task") or "").strip()
     resume_task = normalize_resume_task(task.strip() if isinstance(task, str) and task.strip() else original_task)
@@ -342,6 +343,15 @@ def read_workspace_text(workspace: Path, name: str) -> str:
         return trim_text(path.read_text(encoding="utf-8", errors="replace"), 2400)
     except OSError:
         return ""
+
+
+def read_workspace_text_any(workspace: Path, *names: str) -> str:
+    """按优先级返回第一个非空内容（用于内部工作文件迁移：.mokioclaw/ 新路径 → 根目录旧路径）"""
+    for name in names:
+        text = read_workspace_text(workspace, name)
+        if text:
+            return text
+    return ""
 
 
 def serialize_state(state: dict[str, Any]) -> dict[str, Any]:

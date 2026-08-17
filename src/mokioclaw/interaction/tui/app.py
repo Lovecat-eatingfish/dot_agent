@@ -344,10 +344,10 @@ Agent全部执行完毕
             # 在 on_mount() 里如果不为 None，会自动调用 start_task() 执行，用户不用手动输入
             # 默认 None：只打开 TUI 不立即执行任务，等待用户手动输入
 
-            resume: Path | None = None,
+            resume: Path | str | None = None,
             # 从已有的 checkpoint 恢复之前的会话
-            # 来自 CLI 层的 --resume 选项：mokioclaw tui --resume ./workspaces/xxx
-            # 传递给 resolve_workspace() 作为 fallback，同时传给 stream_session_events() 作为 resume_workspace
+            # 来自 CLI 层的 --resume 选项：mokioclaw tui --resume ./workspaces/xxx 或 session-xxx
+            # 传递给 resolve_workspace() 作为 fallback，同时传给 stream_session_events() 作为 resume_workspace/resume_session_id
             # 恢复时会读取之前的 checkpoint 快照、上下文、会话历史，断点续跑
             # 默认 None：创建全新会话
 
@@ -402,6 +402,10 @@ Agent全部执行完毕
             # 关闭时不生成追踪文件，减少磁盘开销
             # 默认 on：方便调试，生产环境可以关
 
+            safe_mode: bool = False,
+            # 干净启动：禁用自定义配置、hooks、auto-memory
+            # 来自 CLI 层的 --safe-mode 选项，传给 stream_session_events → create_runtime
+
             # ========== 第四类：内部扩展参数 ==========
             stream_factory: StreamFactory = stream_session_events,
             # Agent 事件流的工厂函数
@@ -437,6 +441,7 @@ Agent全部执行完毕
         self.approval_mode = approval_mode
         self.checkpoint_mode = checkpoint_mode
         self.trace_mode = trace_mode
+        self.safe_mode = safe_mode
         self.resume = resume
         self.stream_factory = stream_factory
         self.running = False
@@ -757,6 +762,14 @@ Agent全部执行完毕
         status = "finished"
         try:
             approval_handler = self._approval_handler if self.approval_mode == "inline" else None
+            # resume 参数兼容三种形态：Path（workspace 路径）、"session-xxx"、None（续接当前 workspace 最新 session）
+            resume_arg = resume if resume is not None else self.resume
+            resume_ws = resume_arg if isinstance(resume_arg, Path) else None
+            resume_sid = resume_arg if isinstance(resume_arg, str) and resume_arg.startswith("session-") else None
+            # 多轮连续对话：未显式指定恢复目标时，续接当前 workspace 的最新 session，
+            # 而不是每轮新建 session（否则会话历史被碎片化）
+            if resume_ws is None and resume_sid is None:
+                resume_ws = self.session_workspace
             # 调用stream_session_events()拿到 agent 事件生成器；
             for event in self.stream_factory(
                     task,
@@ -765,8 +778,10 @@ Agent全部执行完毕
                     approval_mode=self.approval_mode,
                     approval_handler=approval_handler,
                     checkpoint_mode=self.checkpoint_mode,
-                    resume_workspace=resume,
+                    resume_workspace=resume_ws,
+                    resume_session_id=resume_sid,
                     trace_mode=self.trace_mode,
+                    safe_mode=self.safe_mode,
             ):
                 # 每拿到一个 event，通过消息投递给主线程；
                 self.call_from_thread(self.post_message, AgentEventMessage(event))

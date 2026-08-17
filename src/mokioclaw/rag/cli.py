@@ -44,7 +44,7 @@ def serve(
     import os
     import dotenv
     dotenv.load_dotenv()
-    token = os.getenv("RAG_API_TOKEN", "enquan").strip()
+    token = os.getenv("RAG_API_TOKEN", "").strip()
     if host not in {"127.0.0.1", "localhost", "::1"} and not token:
         typer.echo(
             "WARNING: binding non-loopback without RAG_API_TOKEN — "

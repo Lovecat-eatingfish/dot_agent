@@ -83,6 +83,10 @@ class MCPTransport(MCPTransportBase):
             env=env,
             cwd=self._cwd,
             text=True,
+            # MCP 规范要求 stdio 走 UTF-8；不指定时 Windows 按 locale（GBK）编解码，
+            # Node 系 server 的 UTF-8 输出会让读线程 UnicodeDecodeError 静默死亡
+            encoding="utf-8",
+            errors="replace",
             bufsize=1,  # 行缓冲
         )
         self._reader_thread = threading.Thread(target=self._read_stdout, daemon=True)

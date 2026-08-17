@@ -7,6 +7,7 @@ MCP Client
 from __future__ import annotations
 
 import re
+import threading
 import time
 from typing import Any
 
@@ -77,6 +78,9 @@ class MCPClient:
         self._capabilities: dict[str, Any] = {}
         self._server_info: dict[str, Any] = {}
         self._request_counter = 0
+        # 请求-响应周期互斥：并发调用同一 server 时，receive 循环会丢弃
+        # 不匹配 id 的响应（互相吞消息）且 _next_id 的 += 非原子 → 必须串行
+        self._call_lock = threading.Lock()
 
     @property
     def state(self) -> MCPServerState:
@@ -228,6 +232,11 @@ class MCPClient:
                     is_error=True,
                 )
 
+        with self._call_lock:
+            return self._call_tool_locked(tool_name, arguments)
+
+    def _call_tool_locked(self, tool_name: str, arguments: dict[str, Any]) -> MCPToolResult:
+        """实际调用（调用方持 _call_lock）"""
         # 2. 发送工具调用请求
         req_id = self._next_id()
         params = {
@@ -268,6 +277,10 @@ class MCPClient:
 
     def ping(self) -> bool:
         """检查 server 是否存活"""
+        with self._call_lock:
+            return self._ping_locked()
+
+    def _ping_locked(self) -> bool:
         req_id = self._next_id()
         self._transport.send(build_request("ping", {}, req_id))
 
@@ -413,6 +426,9 @@ def _looks_like_path(value: str) -> bool:
     # 以 / 开头（绝对路径）
     if value.startswith("/") or re.match(r'^[A-Za-z]:[/\\]', value):
         return True
+    # 版本号（3.13.1 / v2.1.0）不是路径
+    if re.fullmatch(r"v?\d+(\.\d+)+", value):
+        return False
     # 包含扩展名且看起来像文件名（避免误判版本号如 v2.0.1）
     if "." in value and len(value) < 100:
         # 检查是否像文件名：最后一个点后是常见扩展名

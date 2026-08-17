@@ -18,6 +18,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from mokioclaw.core.log import get_logger
 from mokioclaw.core.utils import execute_tool_calls, last_ai_content
+from mokioclaw.reliability.cost import record_llm_usage
 from mokioclaw.reliability.token_budget import (
     BudgetTracker,
     OutputTokenRecovery,
@@ -84,6 +85,9 @@ def run_agent_loop(
         if response is None:
             # 恢复失败，force_compact 已尽 → 跳出
             break
+
+        # ===== usage 记录（/cost 美元统计） =====
+        record_llm_usage(response)
 
         produced_messages.append(response)
         messages.append(response)
@@ -195,6 +199,8 @@ def _force_compact_messages(messages: list[Any], *, workspace: Any = None) -> li
         return force_compact_messages(messages, keep_last=10)
     except Exception as exc:
         logger.debug("force_compact failed, returning last 10 messages: %s", exc)
-        # 兜底：只留最后 10 条 + 第一条 system
+        # 兜底：只留最后 10 条 + 第一条 system（过配对清洗，孤儿 ToolMessage 会触发 API 400）
+        from mokioclaw.reliability.token_budget import make_pairing_safe
+
         head = [m for m in messages[:1] if m.__class__.__name__ == "SystemMessage"]
-        return head + list(messages[-10:])
+        return make_pairing_safe(head + list(messages[-10:]))

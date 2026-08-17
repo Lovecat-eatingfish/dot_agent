@@ -78,4 +78,7 @@ def reactive_compact_messages(messages: list[Any], *, keep_last: int = 8) -> lis
             "after repeated autocompact failures. Re-read files and continue."
         )
     )
-    return head + [marker] + list(messages[-keep_last:])
+    # 切片尾部可能以孤儿 ToolMessage 开头（父 AIMessage 被切掉）→ 必须配对清洗，防 API 400
+    from mokioclaw.reliability.token_budget import make_pairing_safe
+
+    return make_pairing_safe(head + [marker] + list(messages[-keep_last:]))

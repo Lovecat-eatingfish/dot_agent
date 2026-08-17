@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from mokioclaw.state.runtime import RuntimeState
+from mokioclaw.security.path_security import PathSecurityError
 from mokioclaw.tools.file_tools import display_path, read_text_lossy, resolve_workspace_path
 
 SKIP_DIRS = {".git", ".mokioclaw", ".venv", "__pycache__", ".pytest_cache", "node_modules", ".idea", ".workbuddy"}
@@ -112,7 +113,7 @@ def grep(
 
     try:
         root = resolve_workspace_path(state, path)
-    except ValueError as exc:
+    except (ValueError, PathSecurityError) as exc:
         return {"ok": False, "error": str(exc)}
     if not root.exists():
         return {"ok": False, "error": f"path does not exist: {display_path(state, root)}"}

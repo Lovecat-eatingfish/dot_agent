@@ -101,11 +101,17 @@ def create_app(
     )
 
     # 可选 API Token：设置 RAG_API_TOKEN 后，除 /health 外需 Header: X-RAG-Token
-    _api_token = os.getenv("RAG_API_TOKEN", "enquan").strip()
+    _api_token = os.getenv("RAG_API_TOKEN", "").strip()
 
     @app.middleware("http")
     async def _auth_middleware(request, call_next):  # type: ignore[no-untyped-def]
+        import secrets
+
         if not _api_token:
+            return await call_next(request)
+        # CORS 预检必须豁免：浏览器不带自定义 Header 发 OPTIONS，
+        # 401 会让带 token 的前端请求在预检阶段直接失败
+        if request.method == "OPTIONS":
             return await call_next(request)
         path = request.url.path or ""
         if path in {"/health", "/docs", "/openapi.json", "/redoc"} or path.startswith("/assets"):
@@ -114,7 +120,8 @@ def create_app(
         if request.method == "GET" and (path in {"/"} or path.startswith("/assets")):
             return await call_next(request)
         token = request.headers.get("X-RAG-Token") or request.headers.get("x-rag-token") or ""
-        if token != _api_token:
+        # compare_digest 防时序侧信道
+        if not secrets.compare_digest(token, _api_token):
             return JSONResponse(status_code=401, content={"ok": False, "error": "unauthorized"})
         return await call_next(request)
 
@@ -180,7 +187,11 @@ def create_app(
 
     @app.post("/ingest/text")
     def ingest_text(body: TextIngest) -> dict[str, Any]:
-        raw_id = body.doc_id or f"text:{hash(body.content) & 0xFFFFFFFF:08x}"
+        # hash() 受 PYTHONHASHSEED 随机化，重启后同一文本生成不同 doc_id → 重复摄取
+        import hashlib
+
+        digest = hashlib.sha256(body.content.encode("utf-8")).hexdigest()[:8]
+        raw_id = body.doc_id or f"text:{digest}"
         doc_id = sanitize_doc_id(raw_id)
         pages = load_text(body.content)
         count = _ingest_pages(pages, source=body.source, doc_id=doc_id)
@@ -250,7 +261,6 @@ def create_app(
         try:
             retriever = _get_retriever()
             store = _get_store()
-            retriever.top_k = body.k
 
             # 0. 语义缓存查（generate_answer 时才有答案可缓存）
             # filter 非空时禁用缓存，避免串答案；cache_key 纳入 k/开关
@@ -311,7 +321,7 @@ def create_app(
             all_parents: list[ParentChunk] = []
             seen_pids: set[str] = set()
             for q in queries:
-                parents = retriever.retrieve(q, where=where)
+                parents = retriever.retrieve(q, where=where, k=body.k)
                 for p in parents:
                     if p.parent_id not in seen_pids:
                         seen_pids.add(p.parent_id)

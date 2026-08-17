@@ -187,6 +187,8 @@ def _make_command_handler(
                 input=stdin_data,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 shell=True,
                 cwd=cwd,
                 timeout=timeout,

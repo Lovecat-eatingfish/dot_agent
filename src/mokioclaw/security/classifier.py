@@ -93,7 +93,9 @@ def fast_path_decision(tool_name: str, tool_args: dict[str, Any]) -> ClassifierD
         return ClassifierDecision.DENY
     if any(p.search(command) for p in _HARD_DENY_PATTERNS):
         return ClassifierDecision.DENY
-    if any(p.search(command) for p in _SAFE_COMMAND_PATTERNS):
+    # fast-path 只对"单条"命令放行：含 ; & | ` 等元字符可能拼接危险后续命令（如 cd src && rm -rf lib），
+    # 交给完整分类流程评估
+    if any(p.search(command) for p in _SAFE_COMMAND_PATTERNS) and not re.search(r"[;&|`]", command):
         return ClassifierDecision.ALLOW
     return None
 

@@ -27,6 +27,24 @@ DEFAULT_MAX_RETRIES = 3
 _validated_env: dict[str, str] | None = None
 _env_lock = threading.Lock()
 
+# 运行时模型覆盖（/model <name> 切换，对齐 Claude Code modelSwitch）
+# 进程级：create_runtime 每 turn 从 .mokioclaw/model_override 读取并刷新
+_active_model_override: str | None = None
+_override_lock = threading.Lock()
+
+
+def set_active_model(name: str | None) -> None:
+    """设置进程内模型覆盖；空字符串/None 清除覆盖（回落 env 默认）"""
+    global _active_model_override
+    with _override_lock:
+        _active_model_override = (name or "").strip() or None
+
+
+def get_active_model() -> str | None:
+    """读取当前覆盖的模型名（None=未覆盖，用 env 默认）"""
+    with _override_lock:
+        return _active_model_override
+
 
 def validate_env() -> dict[str, str]:
     """校验并返回必需的环境变量，只在首次调用时执行
@@ -99,10 +117,13 @@ def create_model(
     timeout = request_timeout or _env_int("MOKIO_REQUEST_TIMEOUT", DEFAULT_REQUEST_TIMEOUT)
     retries = max_retries if max_retries is not None else _env_int("MOKIO_MAX_RETRIES", DEFAULT_MAX_RETRIES)
 
+    # 模型优先级：显式参数（降级回退用）> /model 运行时覆盖 > env 默认
+    resolved_model = model or get_active_model() or env["model"]
+
     return ChatOpenAI(
         api_key=env["api_key"],
         openai_api_key=env["api_key"],
-        model=model or env["model"],
+        model=resolved_model,
         base_url=env["base_url"],
         temperature=0,
         request_timeout=timeout,

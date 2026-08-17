@@ -25,23 +25,25 @@ class ApprovalDecision:
     reason: str = ""
 
 
+# 前缀分隔符：命令起始 / 换行 / && / || / ; / 单管道 |
+# （原实现漏掉 | 和换行——"echo x | curl ..." 与多行命令第二行的 pip install 免审批）
 RISK_PATTERNS = [
-    (r"(?:^|&&|\|\||;)\s*(?:python\s+-m\s+)?pip\s+install\b", "Python package installation"),
-    (r"(?:^|&&|\|\||;)\s*uv\s+add\b", "Project dependency change with uv add"),
-    (r"(?:^|&&|\|\||;)\s*uv\s+sync\b", "Dependency synchronization with uv sync"),
-    (r"(?:^|&&|\|\||;)\s*uv\s+pip\s+install\b", "Python package installation with uv pip"),
-    (r"(?:^|&&|\|\||;)\s*npm\s+install\b", "Node package installation"),
-    (r"(?:^|&&|\|\||;)\s*pnpm\s+install\b", "Node package installation"),
-    (r"(?:^|&&|\|\||;)\s*yarn\s+(?:install\b|add\b)", "Node package installation"),
-    (r"(?:^|&&|\|\||;)\s*(?:curl|wget)\b", "Network download command"),
-    (r"(?:^|&&|\|\||;)\s*uvicorn\b", "Long-running development server"),
-    (r"(?:^|&&|\|\||;)\s*python\s+-m\s+http\.server\b", "Long-running development server"),
-    (r"(?:^|&&|\|\||;)\s*git\s+push\b", "Git push to remote"),
-    (r"(?:^|&&|\|\||;)\s*git\s+reset\s+--hard\b", "Git hard reset (destructive)"),
-    (r"(?:^|&&|\|\||;)\s*docker\s+(?:run|exec)\b", "Docker container execution"),
-    (r"(?:^|&&|\|\||;)\s*ssh\b", "Remote shell access"),
-    (r"(?:^|&&|\|\||;)\s*scp\b", "Remote file copy"),
-    (r"(?:^|&&|\|\||;)\s*rsync\b", "Remote file sync"),
+    (r"(?:^|[\n;&|])\s*(?:python\s+-m\s+)?pip3?\s+install\b", "Python package installation"),
+    (r"(?:^|[\n;&|])\s*uv\s+add\b", "Project dependency change with uv add"),
+    (r"(?:^|[\n;&|])\s*uv\s+sync\b", "Dependency synchronization with uv sync"),
+    (r"(?:^|[\n;&|])\s*uv\s+pip\s+install\b", "Python package installation with uv pip"),
+    (r"(?:^|[\n;&|])\s*npm\s+(?:install|i)\b", "Node package installation"),
+    (r"(?:^|[\n;&|])\s*pnpm\s+(?:install|i)\b", "Node package installation"),
+    (r"(?:^|[\n;&|])\s*yarn\s+(?:install\b|add\b)", "Node package installation"),
+    (r"(?:^|[\n;&|])\s*(?:curl|wget)\b", "Network download command"),
+    (r"(?:^|[\n;&|])\s*uvicorn\b", "Long-running development server"),
+    (r"(?:^|[\n;&|])\s*python\s+-m\s+http\.server\b", "Long-running development server"),
+    (r"(?:^|[\n;&|])\s*git\s+push\b", "Git push to remote"),
+    (r"(?:^|[\n;&|])\s*git\s+reset\s+--hard\b", "Git hard reset (destructive)"),
+    (r"(?:^|[\n;&|])\s*docker\s+(?:run|exec)\b", "Docker container execution"),
+    (r"(?:^|[\n;&|])\s*ssh\b", "Remote shell access"),
+    (r"(?:^|[\n;&|])\s*scp\b", "Remote file copy"),
+    (r"(?:^|[\n;&|])\s*rsync\b", "Remote file sync"),
 ]
 
 

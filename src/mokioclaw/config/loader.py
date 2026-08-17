@@ -71,6 +71,10 @@ class UserConfig:
     # --- 自定义指令（markdown 正文，注入到所有 agent prompt） ---
     custom_instructions: str = ""
 
+    # --- 文件作用域规则（rules/*.md 带 globs frontmatter，读取匹配文件时注入） ---
+    # 每条：{"name": 文件名, "globs": ["**/*.py", ...], "body": 规则正文}
+    glob_rules: list[dict[str, Any]] = field(default_factory=list)
+
     # --- 元数据 ---
     config_sources: list[str] = field(default_factory=list)
 
@@ -99,20 +103,22 @@ def load_user_config(
     config = UserConfig()
     sources: list[str] = []
 
-    # 1. 加载全局配置（仅当显式 override 提供时；默认情况下不读全局）
-    if global_override is not None and global_override.exists():
+    # 1. 加载全局配置（默认 ~/.mokioclaw/CLAUDE.md；显式 override 可强制指定路径或传 Path("") 禁用）
+    global_path = global_override if global_override is not None else Path.home() / ".mokioclaw" / "CLAUDE.md"
+    if str(global_path) and global_path.exists():
         try:
-            frontmatter, body = _parse_markdown_with_frontmatter(global_override)
+            frontmatter, body = _parse_markdown_with_frontmatter(global_path)
             _apply_frontmatter(config, frontmatter)
             if body.strip():
                 config.custom_instructions = _merge_instructions(config.custom_instructions, body)
-            sources.append(f"global:{global_override}")
+            sources.append(f"global:{global_path}")
         except Exception as exc:
-            logger.debug("global config load skipped (%s): %s", global_override, exc)
+            logger.debug("global config load skipped (%s): %s", global_path, exc)
 
     # 2. 加载项目级配置（递归 CLAUDE.md / CLAUDE.local.md / .mokioclaw/config.md）
+    # 应用顺序：父目录 → 子目录（后应用者覆盖先应用者），越靠近 workspace 优先级越高（对齐 Claude Code）
     project_root = workspace or Path.cwd()
-    project_sources = _discover_project_config_sources(project_root, override=project_override)
+    project_sources = list(reversed(_discover_project_config_sources(project_root, override=project_override)))
     for source_path in project_sources:
         try:
             frontmatter, body = _parse_markdown_with_frontmatter(source_path)
@@ -124,19 +130,17 @@ def load_user_config(
             logger.debug("project config load skipped (%s): %s", source_path, exc)
 
     # 2b. 加载模块化规则文件（.claude/rules/*.md 或 .mokioclaw/rules/*.md）
+    # globs frontmatter（对齐 Claude Code）：带 globs 的规则只在读取匹配文件时注入
+    #（file_tools.read_file 调用 matching_glob_rules），不带 globs 的仍无条件合并
     rule_files = _discover_rules_dir(project_root)
     for rule_path in rule_files:
         try:
             frontmatter, body = _parse_markdown_with_frontmatter(rule_path)
-            # globs frontmatter: if present, store for file-pattern scoping
-            globs = frontmatter.get("globs") if isinstance(frontmatter, dict) else None
             if body.strip():
+                globs_raw = frontmatter.get("globs") if isinstance(frontmatter, dict) else None
+                globs = _coerce_string_list(globs_raw) if globs_raw else []
                 if globs:
-                    globs_str = ", ".join(globs) if isinstance(globs, list) else str(globs)
-                    config.custom_instructions = _merge_instructions(
-                        config.custom_instructions,
-                        f"<!-- rules:{rule_path.name} globs:{globs_str} -->\n{body}"
-                    )
+                    config.glob_rules.append({"name": rule_path.name, "globs": globs, "body": body.strip()})
                 else:
                     config.custom_instructions = _merge_instructions(config.custom_instructions, body)
             sources.append(f"rules:{rule_path}")
@@ -407,3 +411,80 @@ def get_user_config_paths() -> dict[str, Path | None]:
     }
 
 
+
+
+def _glob_match(path: Path, pattern: str) -> bool:
+    """单条 glob 匹配：依次尝试相对路径 / 绝对路径 / 文件名
+
+    PurePath.full_match（Python 3.13+）支持 ** 跨目录语义；
+    老模式（如 *.py 只匹配文件名）用 fnmatch 兜底。
+    """
+    import fnmatch
+    from pathlib import PurePath
+
+    pattern = pattern.strip().replace("\\", "/")
+    if not pattern:
+        return False
+    rel = path.as_posix()
+    name = path.name
+    candidates = (rel, str(path), name)
+    try:
+        return any(PurePath(candidate).full_match(pattern) for candidate in candidates)
+    except (AttributeError, ValueError):
+        # full_match 不可用（<3.13）或模式非法时退化为 fnmatch
+        return any(fnmatch.fnmatch(candidate, pattern) for candidate in candidates)
+
+
+def matching_glob_rules(workspace: Path | None, path: Path) -> list[dict[str, Any]]:
+    """返回 globs 命中给定文件路径的规则列表（读取文件时注入用）
+
+    Args:
+        workspace: 工作区（定位 rules 目录）
+        path: 被读取文件的绝对路径
+
+    Returns:
+        [{"name": ..., "globs": [...], "body": ...}, ...]
+    """
+    config = _glob_rules_config(workspace)
+    # 相对化路径，让 **/*.py 也能命中 src/pkg/mod.py 这类嵌套路径
+    try:
+        rel = path.resolve().relative_to(workspace.resolve()) if workspace else path
+    except (ValueError, OSError):
+        rel = path
+    matched = [rule for rule in config.glob_rules if any(_glob_match(rel, g) for g in rule.get("globs", []))]
+    return matched
+
+
+# glob_rules 缓存（key=workspace）：FileRead 高频调用，避免每次全量解析配置；
+# 按 (文件名, mtime) 组合签名失效，会话中增删改 rules 文件后无需重启
+_glob_rules_cache: dict[str, tuple[tuple[tuple[str, float], ...], list[dict[str, Any]]]] = {}
+
+
+def _glob_rules_config(workspace: Path | None) -> UserConfig:
+    """读取并缓存 glob_rules，返回仅携带该字段的轻量 UserConfig"""
+    key = str(workspace.resolve()) if workspace is not None else ""
+    rule_files = _discover_rules_dir(workspace) if workspace is not None else []
+    try:
+        signature = tuple((p.name, p.stat().st_mtime) for p in rule_files)
+    except OSError:
+        signature = ()
+    cached = _glob_rules_cache.get(key)
+    if cached is not None and cached[0] == signature:
+        return UserConfig(glob_rules=cached[1])
+    try:
+        rules = list(load_user_config(workspace).glob_rules)
+    except Exception:
+        rules = []
+    _glob_rules_cache[key] = (signature, rules)
+    return UserConfig(glob_rules=rules)
+
+
+def format_glob_rules_for_read(rules: list[dict[str, Any]]) -> str:
+    """把命中的规则格式化为附加到 FileRead 结果尾部的说明块"""
+    if not rules:
+        return ""
+    blocks = [
+        f'<file-rules source="{rule.get("name", "rules")}">\n{rule.get("body", "")}\n</file-rules>'
+        for rule in rules
+    ]
+    return "\n".join(blocks)

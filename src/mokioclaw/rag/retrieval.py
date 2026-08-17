@@ -80,17 +80,24 @@ class HybridRetriever:
         self,
         query: str,
         where: dict[str, Any] | None = None,
+        *,
+        k: int | None = None,
     ) -> list[ParentChunk]:
         """混合检索，返回去重后的父块（完整上下文）
+
+        Args:
+            k: 本次检索的 top_k（默认用实例配置）。retriever 是应用级单例，
+               请求方不要直接改 self.top_k（FastAPI sync 路由跑线程池，并发请求互相覆盖）。
 
         Returns: 父块列表（按 RRF 融合分数降序，去重 parent_id）
         """
         if not query.strip():
             return []
+        top_k = k or self.top_k
 
         # 1. 向量召回（多取一些给 RRF 融合）
         vector_hits = self.backend.query_children(
-            query, k=self.top_k * 3, where=where,
+            query, k=top_k * 3, where=where,
         )
 
         # 2. BM25 召回
@@ -103,7 +110,7 @@ class HybridRetriever:
                 bm25_hits = []
 
         # 3. RRF 融合
-        fused = rrf_fuse(vector_hits, bm25_hits, top_n=self.top_k * 2)
+        fused = rrf_fuse(vector_hits, bm25_hits, top_n=top_k * 2)
 
         # 4. 取 parent（去重 parent_id）
         seen: set[str] = set()
@@ -116,7 +123,7 @@ class HybridRetriever:
                 continue
             seen.add(child.parent_id)
             parents.append(parent)
-            if len(parents) >= self.top_k:
+            if len(parents) >= top_k:
                 break
         return parents
 

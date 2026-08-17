@@ -135,7 +135,7 @@ def _is_bash_failure(tool_call: dict[str, Any], result: Any) -> bool:
     content = getattr(result, "content", None)
     if content is None and isinstance(result, tuple) and result:
         content = getattr(result[0], "content", None)
-    if isinstance(content, str) and '"ok": false' in content.lower().replace(" ", ""):
+    if isinstance(content, str) and '"ok":false' in content.lower().replace(" ", ""):
         return True
     if isinstance(content, dict) and content.get("ok") is False:
         return True

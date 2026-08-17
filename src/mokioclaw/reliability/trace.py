@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from mokioclaw.core.utils import json_safe, truncate, utc_now, write_json
+from mokioclaw.reliability.cost import active_model_name, estimate_cost_usd, usage_collector
 
 
 VALID_TRACE_MODES = {"on", "off"}
@@ -52,6 +53,10 @@ class TraceRecorder:
         self.timeline_head: list[str] = []
         self.timeline_tail: list[str] = []
         self.timeline_omitted = 0
+        # usage 基线：start() 时记进程级累计，end() 取差分得到本 trace 用量（/cost 美元统计）
+        self.usage_baseline: dict[str, Any] | None = None
+        self.model_name = ""
+        self.cost_usd = 0.0
         if self.enabled:
             setattr(runtime, "trace_id", self.trace_id)
             self.root.mkdir(parents=True, exist_ok=True)
@@ -63,6 +68,8 @@ class TraceRecorder:
     def start(self, inputs: dict[str, Any], *, resumed: bool = False, resume_event: dict[str, Any] | None = None) -> None:
         if not self.enabled:
             return
+        self.usage_baseline = usage_collector().snapshot()
+        self.model_name = active_model_name()
         self.record(
             "run_start",
             {
@@ -72,6 +79,7 @@ class TraceRecorder:
                 "resume": resume_event or {},
                 "max_attempts": inputs.get("max_attempts"),
                 "checkpoint_mode": getattr(self.runtime, "checkpoint_mode", ""),
+                "model": self.model_name,
             },
         )
 
@@ -82,6 +90,14 @@ class TraceRecorder:
         self.completion_tokens += completion_tokens
         self.total_tokens = self.prompt_tokens + self.completion_tokens
         self.record("token_usage", {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": self.total_tokens})
+
+    def _collect_usage_delta(self) -> dict[str, Any]:
+        """取进程级 UsageCollector 相对基线的差分（/cost 数据源）"""
+        try:
+            return usage_collector().delta_since(self.usage_baseline)
+        except Exception as exc:
+            self.errors.append(f"usage collect failed: {type(exc).__name__}: {exc}")
+            return {}
 
     def record_custom_event(self, event: dict[str, Any]) -> None:
         if not self.enabled:
@@ -138,6 +154,15 @@ class TraceRecorder:
         if not self.enabled:
             return None
         self.status = status
+        # /cost：用 UsageCollector 差分覆盖（零值时保留 record_token_usage 的直接记录）
+        delta = self._collect_usage_delta()
+        if delta.get("prompt_tokens") or delta.get("completion_tokens"):
+            self.prompt_tokens = int(delta.get("prompt_tokens", 0) or 0)
+            self.completion_tokens = int(delta.get("completion_tokens", 0) or 0)
+            self.total_tokens = self.prompt_tokens + self.completion_tokens
+        self.cost_usd = float(delta.get("cost_usd", 0) or 0) or estimate_cost_usd(
+            self.model_name or active_model_name(), self.prompt_tokens, self.completion_tokens
+        )
         payload = {
             "status": status,
             "latest_node": latest_node,
@@ -206,6 +231,8 @@ class TraceRecorder:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "total_tokens": self.total_tokens,
+            "model": self.model_name or active_model_name(),
+            "cost_usd": self.cost_usd,
             "approval_count": self.approval_count,
             "checkpoint_count": self.checkpoint_count,
             "handoff_count": self.handoff_count,
@@ -295,6 +322,8 @@ def build_timeline_markdown(summary: dict[str, Any], timeline: list[str]) -> str
         f"- failed_tool_calls: {summary.get('failed_tool_calls', 0)}",
         f"- approvals: {summary.get('approval_count', 0)}",
         f"- checkpoints: {summary.get('checkpoint_count', 0)}",
+        f"- tokens: {summary.get('total_tokens', 0)} (prompt {summary.get('prompt_tokens', 0)} / completion {summary.get('completion_tokens', 0)})",
+        f"- cost_usd: {summary.get('cost_usd', 0)}",
         f"- final_status: {summary.get('final_status', '')}",
         "",
         "## Final State",

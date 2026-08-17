@@ -107,6 +107,12 @@ class MCPBridge:
                 return True
             else:
                 logger.error("MCP server '%s' connection failed", name)
+                # connect 失败也要释放 transport：Popen 的子进程和读线程已启动，
+                # 不 disconnect 会永久残留（重试注册不断累积进程）
+                try:
+                    client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
                 return False
 
     def disconnect(self, name: str) -> None:

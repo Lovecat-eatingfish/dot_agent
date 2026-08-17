@@ -85,7 +85,17 @@ class MokioClawGroup(TyperGroup):
     """
 
     def parse_args(self, ctx, args):  # type: ignore[no-untyped-def]
+        # 裸 --resume/--continue（后面无值）规范化为 =true，让"无参=恢复最新 session"可用
+        args = [
+            f"{arg}=true"
+            if arg in ("--resume", "--continue")
+            and (i + 1 >= len(args) or args[i + 1].startswith("-"))
+            else arg
+            for i, arg in enumerate(args)
+        ]
         commands = set(self.commands)
+        # 无值布尔标志：不能吞掉紧跟其后的任务字符串（否则 -p "task" 丢任务）
+        _BOOL_FLAGS = {"-p", "--print", "--safe-mode", "--worktree", "--list-sessions"}
         remaining: list[str] = []
         task_parts: list[str] = []
         index = 0
@@ -98,8 +108,14 @@ class MokioClawGroup(TyperGroup):
             # 选项（-开头），收集到 remaining
             if arg.startswith("-"):
                 remaining.append(arg)
-                # --key value 形式：下一个参数也属于这个选项
-                if "=" not in arg and index + 1 < len(args) and not args[index + 1].startswith("-"):
+                # --key value 形式：下一个参数也属于这个选项（布尔标志除外）
+                if (
+                    "=" not in arg
+                    and arg not in _BOOL_FLAGS
+                    and not arg.startswith("--no-")
+                    and index + 1 < len(args)
+                    and not args[index + 1].startswith("-")
+                ):
                     remaining.append(args[index + 1])
                     index += 2
                     continue
@@ -165,6 +181,88 @@ def _install_signal_handlers() -> None:
     signal.signal(signal.SIGTERM, _handle_sigterm)
 
 
+def _find_workspace_for_resume(resume_value: str) -> Path | None:
+    """--resume/--list-sessions/--rollback 未显式指定 -w 时定位已有 workspace
+
+    默认 workspace 目录名带 uuid 后缀、每次运行都新建，直接在它下面查 session 永远为空。
+    按 mtime 从新到旧扫描 workspaces 根目录：
+    - resume_value 形如 session-xxx → 返回拥有该 session 的 workspace
+    - resume_value 为空/"true"/None → 返回最近一个有 session 的 workspace
+    - 其他（workspace 路径）→ 返回 None，交给调用方的路径分支处理
+    """
+    if resume_value and not resume_value.startswith("session-") and resume_value not in ("", "true"):
+        return None
+    from mokioclaw.core.paths import default_workspace_root
+    from mokioclaw.reliability.session_store import get_latest_session, load_session
+
+    root = default_workspace_root()
+    if not root.exists():
+        return None
+    try:
+        candidates = sorted(
+            (p for p in root.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    if resume_value.startswith("session-"):
+        for ws in candidates:
+            if load_session(ws, resume_value):
+                return ws
+        return None
+    for ws in candidates:
+        if get_latest_session(ws):
+            return ws
+    return None
+
+
+def _format_resume_card(session: dict) -> str:
+    """--resume 恢复前打印的 session 概要卡片（单行紧凑格式，配合 safe_secho 输出）"""
+    task = str(session.get("task") or "").strip().replace("\n", " ")
+    if len(task) > 60:
+        task = task[:57] + "..."
+    return (
+        f"Resuming session {session.get('session_id', 'unknown')} | "
+        f"turns: {session.get('turn_index', 0)} | "
+        f"status: {session.get('status', 'unknown')} | "
+        f"updated: {session.get('updated_at', '')} | "
+        f"task: {task or '(none)'}"
+    )
+
+
+def _format_resume_context(event: dict) -> str:
+    """session_resumed 自定义事件的终端展示文本（来自 stream_agent_events 的 custom_event）"""
+    resume_context = str(event.get("resume_context") or "").strip()
+    if len(resume_context) > 400:
+        resume_context = resume_context[:397] + "..."
+    lines = [
+        f"Session resumed: {event.get('session_id', 'unknown')} "
+        f"(turn {event.get('turn_index', 0)})",
+    ]
+    if resume_context:
+        lines.append(f"Context: {resume_context}")
+    return "\n".join(lines)
+
+
+def _final_answer_from_graph_event(event: dict) -> str:
+    """从 graph_event 提取最终答案（headless -p 输出用）
+
+    两条路径：workflow 的 final 节点 final_answer；entry workflow 的
+    chat_responder 节点 final_answer / chat_response（chat 路由提前返回）。
+    """
+    payload = event.get("event")
+    if not isinstance(payload, dict):
+        return ""
+    for node in ("final", "chat_responder"):
+        update = payload.get(node)
+        if isinstance(update, dict):
+            answer = str(update.get("final_answer") or update.get("chat_response") or "")
+            if answer:
+                return answer
+    return ""
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
@@ -216,6 +314,14 @@ def main(
         int | None,
         typer.Option("--rollback", help="Rollback to turn N in current session."),
     ] = None,
+    print_mode: Annotated[
+        bool,
+        typer.Option("--print", "-p", help="Headless mode: run the task, print the result, exit. No interactive UI."),
+    ] = False,
+    output_format: Annotated[
+        Literal["text", "json"],
+        typer.Option("--output-format", help="Output format for -p headless mode: text or json."),
+    ] = "text",
 ) -> None:
     """
     Rich 默认模式入口： @app.callback(invoke_without_command=True)：
@@ -247,8 +353,16 @@ def main(
     utc_stamp = _utc_now().replace(":", "-").replace("+", "").replace("T", "-")[:19]
 
     # 确定工作区
-    from mokioclaw.core.paths import default_workspace, new_task_workspace
+    from mokioclaw.core.paths import default_workspace
+    # --continue 是 --resume 的别名
+    resume_value = resume if resume is not None else continue_session
+    resume_requested = resume_value is not None
     workspace_path = workspace or default_workspace()
+    if workspace is None and (resume_requested or list_sessions or rollback is not None):
+        # 未显式指定 -w：定位已有 workspace，否则每次都是新 uuid 目录，查不到任何 session
+        located = _find_workspace_for_resume(resume_value or "")
+        if located is not None:
+            workspace_path = located
     workspace_path.mkdir(parents=True, exist_ok=True)
 
     # --list-sessions：列出所有 session
@@ -293,7 +407,7 @@ def main(
     if continue_session is not None and resume is None:
         resume = continue_session
 
-    if worktree:
+    if worktree and not resume_requested:
         import subprocess as sp
         try:
             result = sp.run(
@@ -310,18 +424,23 @@ def main(
         task = ctx.obj.get("task_arg")
 
     # 如果既没有任务，也没有--resume恢复旧会话，打印帮助信息退出。
-    if not task and resume is None:
+    if not task and not resume_requested:
         safe_echo(ctx.get_help())
         raise typer.Exit()
 
-    safe_secho("mokioclaw stage 5: MultiAgent + context/harness engineering", fg=typer.colors.MAGENTA)
+    # --output-format 只在 -p headless 模式下有意义，误用时提前提醒
+    if output_format != "text" and not print_mode:
+        safe_secho(f"--output-format is only used with -p (headless mode); ignoring {output_format}.", fg=typer.colors.YELLOW, err=True)
+
+    if not print_mode:
+        safe_secho("mokioclaw stage 5: MultiAgent + context/harness engineering", fg=typer.colors.MAGENTA)
     # inline 模式：危险命令时在终端弹出确认提示
     approval_handler = _inline_approval_handler if approval_mode == "inline" else None
 
-    # --resume 处理：无参数恢复最新 session，有参数恢复指定 session
+    # --resume 处理：无参数恢复最新 session，有参数恢复指定 session / workspace 路径
     resume_session_id = None
-    if resume is not None:
-        if resume == "" or resume == "true":
+    if resume_requested:
+        if resume_value in ("", "true"):
             from mokioclaw.reliability.session_store import get_latest_session
             latest = get_latest_session(workspace_path)
             if latest:
@@ -330,12 +449,72 @@ def main(
             else:
                 safe_secho("No session to resume.", fg=typer.colors.YELLOW)
                 raise typer.Exit()
-        elif resume.startswith("session-"):
-            resume_session_id = resume
+        elif resume_value.startswith("session-"):
+            resume_session_id = resume_value
         else:
-            workspace_path = Path(resume).expanduser()
+            workspace_path = Path(resume_value).expanduser()
+            workspace_path.mkdir(parents=True, exist_ok=True)
 
     # stream_agent_events 是生成器，逐个 yield 事件字典
+    # -p headless 模式（对齐 Claude Code -p / SDK）：只输出最终结果，无交互 UI
+    if print_mode:
+        final_answer = ""
+        trace_summary: dict[str, Any] = {}
+        session_id = ""
+        try:
+            for event in stream_agent_events(
+                task,
+                workspace=workspace_path,
+                max_attempts=max_attempts,
+                approval_mode=approval_mode,
+                agent_mode=agent_mode,
+                approval_handler=None,  # headless 无法人工审批
+                checkpoint_mode=checkpoint_mode,
+                resume_workspace=workspace_path if resume_requested else None,
+                resume_session_id=resume_session_id,
+                trace_mode=trace_mode,
+                safe_mode=safe_mode,
+            ):
+                if event.get("type") == "graph_event":
+                    final = _final_answer_from_graph_event(event)
+                    if final:
+                        final_answer = final
+                elif event.get("type") == "custom_event" and isinstance(event.get("event"), dict):
+                    evt = event["event"]
+                    if evt.get("type") == "trace_summary":
+                        trace_summary = dict(evt)
+                    elif evt.get("type") == "session_finished":
+                        session_id = str(evt.get("session_id", ""))
+        except KeyboardInterrupt:
+            safe_secho("Interrupted.", fg=typer.colors.YELLOW, err=True)
+            raise typer.Exit(130)
+        except Exception as exc:
+            logger.error("headless run failed: %s", exc, exc_info=True)
+            if output_format == "json":
+                sys.stdout.write(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False) + "\n")
+            else:
+                safe_secho(f"Error: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(1)
+        if output_format == "json":
+            payload = {
+                "ok": True,
+                "final_answer": final_answer,
+                "session_id": session_id,
+                "trace_id": trace_summary.get("trace_id", ""),
+                "prompt_tokens": trace_summary.get("prompt_tokens", 0),
+                "completion_tokens": trace_summary.get("completion_tokens", 0),
+                "total_tokens": trace_summary.get("total_tokens", 0),
+                "cost_usd": trace_summary.get("cost_usd", 0),
+                "tool_calls": trace_summary.get("tool_calls", 0),
+            }
+            sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        else:
+            if final_answer:
+                safe_echo(final_answer)
+            else:
+                safe_secho("(no final answer produced)", fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit()
+
     try:
         for event in stream_agent_events(
             task,
@@ -345,10 +524,11 @@ def main(
             agent_mode=agent_mode,
             approval_handler=approval_handler,
             checkpoint_mode=checkpoint_mode,
-            resume_workspace=workspace_path if resume else None,
+            resume_workspace=workspace_path if resume_requested else None,
+            resume_session_id=resume_session_id,
             trace_mode=trace_mode,
-        safe_mode=safe_mode,
-    ):
+            safe_mode=safe_mode,
+        ):
             # print_event(event)就是把事件美化打印到终端。
             if event.get("type") == "custom_event" and isinstance(event.get("event"), dict) and event["event"].get("type") == "session_resumed":
                 safe_secho(_format_resume_context(event["event"]), fg=typer.colors.CYAN)
@@ -413,7 +593,12 @@ def tui(
     """
     configure_console()
     _install_signal_handlers()
-    utc_stamp = _utc_now().replace(":", "-").replace("+", "").replace("T", "-")[:19]
+    utc_stamp = _utc_now().replace(":", "-").replace("+", "-").replace("T", "-")[:19]
+    # --continue 是 --resume 的别名
+    if continue_session is not None and resume is None:
+        resume = continue_session
+    if worktree:
+        safe_secho("--worktree is not supported in TUI mode yet, ignored.", fg=typer.colors.YELLOW)
     try:
         # 延迟导入 MokioClawTuiApp：只有跑 tui 子命令才导入 textual 相关代码；
         from mokioclaw.interaction.tui import MokioClawTuiApp
@@ -425,6 +610,7 @@ def tui(
             checkpoint_mode=checkpoint_mode,
             trace_mode=trace_mode,
             resume=resume,
+            safe_mode=safe_mode,
         ).run()
     except KeyboardInterrupt:
         safe_secho("\nTUI exited by user.", fg=typer.colors.YELLOW)
@@ -489,6 +675,29 @@ def daemon_status(
         typer.echo(f"Uptime: {_format_uptime(info.uptime_seconds)}")
     if info.status == "stopped":
         typer.echo("Daemon is not running.")
+
+
+@app.command("serve")
+def serve(
+    workspace: Annotated[
+        Path | None,
+        typer.Option("--workspace", "-w", help="Workspace directory."),
+    ] = None,
+) -> None:
+    """daemon 后台进程入口：运行定时任务调度循环（由 daemon-start 拉起）"""
+    import time as _time
+
+    ws = workspace or Path.cwd()
+    scheduler = CronScheduler(tasks_dir=ws / ".mokioclaw" / "tasks")
+    scheduler.start()
+    typer.echo(f"mokioclaw daemon serving {ws} (pid {__import__('os').getpid()})")
+    try:
+        while True:
+            _time.sleep(3600)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        scheduler.stop()
 
 
 @app.command("daemon-start")

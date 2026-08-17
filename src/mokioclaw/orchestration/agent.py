@@ -44,6 +44,19 @@ def _load_model_override(workspace: Path) -> str:
     return ""
 
 
+def _apply_model_override(runtime: RuntimeState) -> None:
+    """应用 /model 覆盖到 runtime 与 provider（对齐 Claude Code modelSwitch）
+
+    每 turn 的 create_runtime 都会刷新：有覆盖文件 → set_active_model 生效下一轮；
+    无覆盖文件 → 清除进程内覆盖，回落 env 默认（/model reset 后恢复）。
+    """
+    from mokioclaw.providers.openai_provider import set_active_model
+
+    override = _load_model_override(runtime.workspace)
+    set_active_model(override or None)
+    runtime.model_name = override or os.getenv("MODEL", "")
+
+
 def create_runtime(
     workspace: Path | None = None,
     *,
@@ -76,12 +89,11 @@ def create_runtime(
         logger.debug("output cleanup skipped: %s", exc)
 
     # auto-memory: 注入学到的偏好到 session context（safe-mode 下跳过）
+    auto_memory_ctx = ""
     if not safe_mode:
         try:
             from mokioclaw.memory.auto_memory import auto_memory_summary
-            summary = auto_memory_summary(selected)
-            if summary:
-                runtime.session_context_injection = (runtime.session_context_injection or "") + "\n" + summary
+            auto_memory_ctx = auto_memory_summary(selected) or ""
         except Exception as exc:
             logger.debug("auto-memory load skipped: %s", exc)
 
@@ -113,6 +125,11 @@ def create_runtime(
         resume_from=resume_from,
         trace_mode=normalize_trace_mode(trace_mode or os.getenv("MOKIO_TRACE_MODE", "on")),
     )
+    if auto_memory_ctx:
+        runtime.session_context_injection = (runtime.session_context_injection or "") + "\n" + auto_memory_ctx
+
+    # /model 运行时覆盖：刷新 provider active model + runtime.model_name
+    _apply_model_override(runtime)
 
     # 加载用户/项目 hooks.json，并触发 SessionStart（safe-mode 下跳过）
     if not safe_mode:
@@ -127,9 +144,9 @@ def create_runtime(
             HookEvent.SessionStart,
             workspace=str(selected),
         )
-        # SessionStart stdout 注入上下文（对齐 Claude Code）
+        # SessionStart stdout 注入上下文（对齐 Claude Code，追加而非覆盖 auto-memory）
         if result.context_injection:
-            runtime.session_context_injection = result.context_injection
+            runtime.session_context_injection = ((runtime.session_context_injection or "") + "\n" + result.context_injection).strip()
 
     return runtime
 
@@ -147,7 +164,7 @@ def _fire_session_start_once(runtime: RuntimeState) -> None:
             workspace=str(runtime.workspace),
         )
         if result.context_injection:
-            runtime.session_context_injection = result.context_injection
+            runtime.session_context_injection = ((runtime.session_context_injection or "") + "\n" + result.context_injection).strip()
     except Exception as exc:  # noqa: BLE001
         logger.debug("SessionStart hook fire skipped: %s", exc)
 
@@ -163,7 +180,9 @@ def stream_agent_events(
     approval_handler=None,
     checkpoint_mode: str | None = None,
     resume_workspace: Path | None = None,
+    resume_session_id: str | None = None,
     trace_mode: str | None = None,
+    safe_mode: bool = False,
 ) -> Iterator[dict[str, Any]]:
     cleaned_task, thinking_instruction = apply_thinking_mode(task or "")
     task = cleaned_task or task
@@ -221,6 +240,7 @@ def stream_agent_events(
                     checkpoint_mode=checkpoint_mode,
                     trace_mode=trace_mode,
                     fire_session_start=False,
+                    safe_mode=safe_mode,
                 )
                 _fire_session_start_once(_chat_runtime)
                 # chat 场景的 SessionEnd 也应配对触发
@@ -239,6 +259,7 @@ def stream_agent_events(
         resume_from=resume_path,
         trace_mode=trace_mode,
         fire_session_start=False,
+        safe_mode=safe_mode,
     )
     if thinking_instruction:
         state.thinking_instruction = thinking_instruction
@@ -259,14 +280,16 @@ def stream_agent_events(
     resumed = False
     resume_event: dict[str, Any] | None = None
 
-    if resume_path is not None:
-        # 恢复模式：加载最新 session 或指定 session
-        # resume_path 可能是 session_id 或 workspace 路径
-        resume_str = str(resume_path)
-        if resume_str.startswith("session-"):
-            session_data = load_session(workspace_path, resume_str)
+    if resume_path is not None or resume_session_id:
+        # 恢复模式：加载指定 session 或最新 session
+        if resume_session_id:
+            session_data = load_session(workspace_path, resume_session_id)
         else:
-            session_data = get_latest_session(workspace_path)
+            resume_str = str(resume_path)
+            if resume_str.startswith("session-"):
+                session_data = load_session(workspace_path, resume_str)
+            else:
+                session_data = get_latest_session(workspace_path)
 
         if session_data:
             session_id = session_data["session_id"]
@@ -388,6 +411,7 @@ def stream_session_events(
     resume_workspace: Path | None = None,
     resume_session_id: str | None = None,
     trace_mode: str | None = None,
+    safe_mode: bool = False,
 ) -> Iterator[dict[str, Any]]:
     workspace = (session_workspace or default_workspace()).expanduser()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -517,6 +541,7 @@ def stream_session_events(
         checkpoint_mode=checkpoint_mode,
         resume_workspace=resume_workspace,
         trace_mode=trace_mode,
+        safe_mode=safe_mode,
         session_data=session_data,
         turn=turn,
         thinking_instruction=thinking_instruction,
@@ -558,6 +583,7 @@ def _stream_complex_workflow(
     checkpoint_mode: str | None,
     resume_workspace: Path | None,
     trace_mode: str | None,
+    safe_mode: bool = False,
     session_data: dict[str, Any] | None = None,
     turn: int | None = None,
     thinking_instruction: str = "",
@@ -572,6 +598,7 @@ def _stream_complex_workflow(
         resume_from=resume_path,
         trace_mode=trace_mode,
         fire_session_start=False,
+        safe_mode=safe_mode,
     )
     if thinking_instruction:
         state.thinking_instruction = thinking_instruction

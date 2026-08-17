@@ -16,7 +16,7 @@ import hashlib
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from mokioclaw.core.hooks import HookRunner
 from mokioclaw.core.tool_result_budget import ToolResultBudget

@@ -6,3 +6,8 @@ __pycache__/
 .agent-sync/
 .agent-sync-store/
 docs/
+.mokioclaw
+.claude
+.tmp
+.tmp_sched
+.workbuddy

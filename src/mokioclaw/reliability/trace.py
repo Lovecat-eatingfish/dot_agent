@@ -13,7 +13,7 @@ from mokioclaw.reliability.cost import active_model_name, estimate_cost_usd, usa
 
 
 VALID_TRACE_MODES = {"on", "off"}
-TRACE_ROOT = Path(".mokioclaw") / "traces"
+EXECUTIONS_ROOT = Path(".mokioclaw") / "executions"
 EVENTS_FILE = "events.jsonl"
 SUMMARY_FILE = "summary.json"
 TIMELINE_FILE = "timeline.md"
@@ -34,7 +34,7 @@ class TraceRecorder:
         self.mode = normalize_trace_mode(getattr(runtime, "trace_mode", "on"))
         self.trace_id = getattr(runtime, "trace_id", None) or _new_trace_id()
         self.task = task
-        self.root = self.workspace / TRACE_ROOT / self.trace_id
+        self.root = self.workspace / EXECUTIONS_ROOT / self.trace_id
         self.started_at = time.perf_counter()
         self.started_at_iso = utc_now()
         self.sequence = 0
@@ -57,6 +57,10 @@ class TraceRecorder:
         self.usage_baseline: dict[str, Any] | None = None
         self.model_name = ""
         self.cost_usd = 0.0
+        # 层级化链路追踪
+        self._span_stack: list[str] = []  # span_id 栈
+        self._span_counter = 0
+        self.spans: list[dict[str, Any]] = []  # 所有 span 元数据
         if self.enabled:
             setattr(runtime, "trace_id", self.trace_id)
             self.root.mkdir(parents=True, exist_ok=True)
@@ -90,6 +94,48 @@ class TraceRecorder:
         self.completion_tokens += completion_tokens
         self.total_tokens = self.prompt_tokens + self.completion_tokens
         self.record("token_usage", {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": self.total_tokens})
+
+    def start_span(self, node: str, *, span_type: str = "node") -> str:
+        """开始一个层级化 span，返回 span_id"""
+        if not self.enabled:
+            return ""
+        self._span_counter += 1
+        span_id = f"span-{self._span_counter:04d}"
+        parent_id = self._span_stack[-1] if self._span_stack else None
+        self._span_stack.append(span_id)
+        span_meta = {
+            "span_id": span_id,
+            "parent_span_id": parent_id,
+            "node": node,
+            "span_type": span_type,
+            "started_at": utc_now(),
+            "start_elapsed_ms": self.elapsed_ms(),
+        }
+        self.spans.append(span_meta)
+        self.record("span_start", {
+            "span_id": span_id,
+            "parent_span_id": parent_id,
+            "node": node,
+            "span_type": span_type,
+        })
+        return span_id
+
+    def end_span(self, node: str) -> None:
+        """结束当前活跃的 span"""
+        if not self.enabled or not self._span_stack:
+            return
+        span_id = self._span_stack.pop()
+        # 更新 span 元数据
+        for span in self.spans:
+            if span.get("span_id") == span_id:
+                span["ended_at"] = utc_now()
+                span["duration_ms"] = self.elapsed_ms() - span.get("start_elapsed_ms", 0)
+                break
+        self.record("span_end", {
+            "span_id": span_id,
+            "node": node,
+            "duration_ms": self.elapsed_ms(),
+        })
 
     def _collect_usage_delta(self) -> dict[str, Any]:
         """取进程级 UsageCollector 相对基线的差分（/cost 数据源）"""
@@ -142,6 +188,12 @@ class TraceRecorder:
                 update = event.get(node)
                 if isinstance(update, dict):
                     self.final_status = "passed" if "PASSED" in str(update.get("final_answer", "")) else "failed"
+
+        # 层级化追踪：为每个 graph node 自动 start/end span
+        for node in nodes:
+            if node != "final":
+                self.start_span(node, span_type="graph_node")
+
         self.record(
             "graph_update",
             {
@@ -149,6 +201,10 @@ class TraceRecorder:
                 "payload": compact_payload(event),
             },
         )
+
+        for node in nodes:
+            if node != "final":
+                self.end_span(node)
 
     def end(self, *, status: str, latest_node: str = "", final_state: dict[str, Any] | None = None) -> dict[str, Any] | None:
         if not self.enabled:
@@ -239,6 +295,7 @@ class TraceRecorder:
             "final_state": final_state,
             "errors": list(self.errors),
             "timeline_omitted": self.timeline_omitted,
+            "spans": self.spans,
         }
 
     def _build_summary_text(self, final_state: dict[str, Any] | None = None) -> str:

@@ -18,6 +18,9 @@ from mokioclaw.reliability.session_store import (
     interrupt_session,
     save_session,
     build_resume_context,
+    append_messages_to_session,
+    load_session_messages,
+    load_turns_up_to,
 )
 from mokioclaw.core.hook_loader import load_hooks_into_runner
 from mokioclaw.core.hooks import HookEvent, HookPayload, HookRunner, fire_session_hook, fire_stop_hook
@@ -294,6 +297,9 @@ def stream_agent_events(
         if session_data:
             session_id = session_data["session_id"]
             resumed = True
+            # 加载历史 messages 到 global_messages
+            history_messages = load_session_messages(workspace_path, session_id)
+            state.global_messages = history_messages
             resume_context = build_resume_context(session_data)
             yield {"type": "custom_event", "event": {
                 "type": "session_resumed",
@@ -376,6 +382,14 @@ def stream_agent_events(
         return
 
     cleanup_background_processes()
+    # 处理渐进式披露标记：从 AI 回复中提取 [NEED_MCP: xxx] / [NEED_SKILL: xxx]
+    if final_answer:
+        try:
+            from mokioclaw.core.progressive_disclosure import process_markers
+            final_answer = process_markers(final_answer, state, workspace_path)
+        except Exception as exc:
+            logger.debug("progressive disclosure processing skipped: %s", exc)
+
     # Stop hook
     fire_stop_hook(
         state.hook_runner,
@@ -386,6 +400,18 @@ def stream_agent_events(
 
     # 添加 assistant 轮次并标记 session 完成
     append_assistant_turn(workspace_path, session_data, current_turn, final_answer, state_summary=current_state)
+
+    # 持久化本轮 messages：append 到 session.json 的 messages[]，同时更新 turn 文件
+    turn_messages = current_state.get("messages", [])
+    if turn_messages:
+        append_messages_to_session(workspace_path, session_data, turn_messages)
+        # 重新加载最新的 session 数据（append_messages_to_session 已保存）
+        session_data = load_session(workspace_path, session_id)
+        save_turn_checkpoint(
+            workspace_path, session_data, current_turn,
+            task or "", state=current_state, turn_messages=turn_messages,
+        )
+
     finish_session(workspace_path, session_id)
 
     trace_event = trace.end(status="finished", latest_node="", final_state=current_state)
@@ -416,14 +442,17 @@ def stream_session_events(
     workspace = (session_workspace or default_workspace()).expanduser()
     workspace.mkdir(parents=True, exist_ok=True)
 
-    # Session 管理：恢复或创建
+    # Session 管理：恢复或创建： 决定本次运行是新建会话还是恢复已有会话。
     resumed = False
+    # 情况 A：明确指定了 session ID  类似于/rewind
     if resume_session_id:
+        # 恢复上下文会话
         session_data = load_session(workspace, resume_session_id)
         if session_data:
             resumed = True
         else:
             session_data = create_session(workspace, task or "")
+    # 类似于 --resume
     elif resume_workspace:
         session_data = get_latest_session(workspace)
         if session_data:
@@ -447,15 +476,18 @@ def stream_session_events(
     if not task:
         return
 
+    # todo： 思考模式 使用配置配置， 不要猜测用户的意图
     cleaned_task, thinking_instruction = apply_thinking_mode(task)
     task = cleaned_task or task
 
     # UserPromptSubmit hook
     _prompt_hook_runner = HookRunner()
     try:
+        # 给HookRunner注册hook
         load_hooks_into_runner(_prompt_hook_runner, workspace)
     except Exception as exc:
         logger.debug("hook load for UserPromptSubmit skipped: %s", exc)
+        # 执行事件是 UserPromptSubmit 用户输入提示词的hook
     _prompt_result = _prompt_hook_runner.run(
         HookEvent.UserPromptSubmit,
         HookPayload(
@@ -477,18 +509,19 @@ def stream_session_events(
     if _prompt_result.context_injection:
         task = f"{_prompt_result.context_injection}\n\n{task}"
 
-    # 显式记忆写入
-    try:
-        from mokioclaw.memory.auto_memory import maybe_write_explicit_memory, trigger_autodream_if_needed
-        mem_result = maybe_write_explicit_memory(workspace, task)
-        if mem_result and mem_result.get("ok"):
-            yield {
-                "type": "custom_event",
-                "event": {"type": "memory_write", "path": mem_result.get("path"), "name": mem_result.get("name")},
-            }
-        trigger_autodream_if_needed(workspace)
-    except Exception as exc:
-        logger.debug("auto memory hook skipped: %s", exc)
+    # # todo： 显式记忆写入： 待修改： 做梦功能和 feedback功能写入
+    # try:
+    #     from mokioclaw.memory.auto_memory import maybe_write_explicit_memory, trigger_autodream_if_needed
+    #     # todo 待完善
+    #     mem_result = maybe_write_explicit_memory(workspace, task)
+    #     if mem_result and mem_result.get("ok"):
+    #         yield {
+    #             "type": "custom_event",
+    #             "event": {"type": "memory_write", "path": mem_result.get("path"), "name": mem_result.get("name")},
+    #         }
+    #     trigger_autodream_if_needed(workspace)
+    # except Exception as exc:
+    #     logger.debug("auto memory hook skipped: %s", exc)
 
     # 添加用户轮次并保存检查点
     turn = append_user_turn(workspace, session_data, task)
@@ -547,9 +580,24 @@ def stream_session_events(
         thinking_instruction=thinking_instruction,
     )
     final_answer = ""
+    turn_messages: list[Any] = []
     for event in workflow_events:
         final_answer = _final_answer_from_event(event) or final_answer
+        # 捕获本轮 messages 用于持久化
+        ev = event.get("event") if isinstance(event, dict) else None
+        if isinstance(ev, dict) and ev.get("type") == "turn_messages":
+            turn_messages = ev.get("messages", [])
+            continue
         yield event
+
+    # 持久化 messages
+    if turn_messages:
+        append_messages_to_session(workspace, session_data, turn_messages)
+        session_data = load_session(workspace, session_id)
+        save_turn_checkpoint(
+            workspace, session_data, turn,
+            task, turn_messages=turn_messages,
+        )
 
     # 添加 assistant 轮次
     append_assistant_turn(workspace, session_data, turn, final_answer)
@@ -676,6 +724,15 @@ def _stream_complex_workflow(
     trace_event = trace.end(status="finished", final_state=current_state)
     if trace_event:
         yield {"type": "custom_event", "event": trace_event}
+
+    # 输出本轮 messages 供上层持久化
+    from mokioclaw.reliability.checkpoint import serialize_message as _ser_msg
+    _msgs = current_state.get("messages", [])
+    if _msgs:
+        yield {"type": "custom_event", "event": {
+            "type": "turn_messages",
+            "messages": [_ser_msg(m) for m in _msgs],
+        }}
 
 
 def end_persistent_session_hooks(workspace: Path | None) -> None:

@@ -152,6 +152,45 @@ class LayeredMemory(TypedDict, total=False):
     history_summary_store: dict[str, Any]
 
 
+class PersistedState(TypedDict, total=False):
+    """跨轮持久化状态：从 MokioGraphState 映射，仅含恢复所需字段
+
+    对应 session.json 中 assistant turn 的 state_summary 字段。
+    一轮 workflow 结束后，从 MokioGraphState 提取这些字段落盘；
+    下一轮 resume 时，通过 build_resume_context() 注入 session_context。
+
+    分层说明：
+    - 任务核心：task, plan_summary, todos, acceptance_criteria, verification_commands
+    - 验证状态：passed, attempts, verifier_summary, repair_instruction, last_error
+    - 上下文压缩：context_summary, history_summary, compression_events
+    - 智能体交互：research_notes, sources, agent_handoffs, code_agent_summary,
+                  search_agent_summary, last_actor_summary
+    - 校验结果：verification_results, verification_checks
+    """
+
+    task: str
+    plan_summary: str
+    todos: list[TodoItem]
+    acceptance_criteria: list[str]
+    verification_commands: list[str]
+    passed: bool | None
+    attempts: int
+    verifier_summary: str
+    repair_instruction: str
+    last_error: str
+    context_summary: str
+    history_summary: str
+    research_notes: str
+    sources: list[SourceItem]
+    agent_handoffs: str
+    code_agent_summary: str
+    search_agent_summary: str
+    last_actor_summary: str
+    verification_results: list[VerificationResult]
+    verification_checks: list[VerificationCheck]
+    compression_events: list[CompressionEvent]
+
+
 class MokioGraphState(TypedDict, total=False):
     """LangGraph 工作流的全局状态
 

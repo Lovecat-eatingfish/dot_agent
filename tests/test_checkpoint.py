@@ -7,13 +7,13 @@ from pathlib import Path
 from langchain_core.messages import AIMessage
 
 from mokioclaw.reliability.checkpoint import (
-    CHECKPOINT_ROOT,
     CheckpointManager,
+    EXECUTIONS_ROOT,
     build_light_resume_inputs,
-    list_checkpoints,
+    list_executions,
     load_resume_inputs,
     normalize_resume_task,
-    rollback_to_checkpoint,
+    rollback_to_execution,
     serialize_state,
     deserialize_state,
     workspace_manifest,
@@ -43,12 +43,13 @@ def test_light_checkpoint_writes_recovery_and_checkpoint(tmp_path: Path) -> None
     runtime = RuntimeState(workspace=tmp_path, checkpoint_mode="light")
     (tmp_path / "TODO.md").write_text("todo content", encoding="utf-8")
 
-    event = CheckpointManager(runtime, task="build demo").save(sample_state(runtime), status="running", latest_node="planner")
+    manager = CheckpointManager(runtime, task="build demo")
+    event = manager.save(sample_state(runtime), status="running", latest_node="planner")
 
-    root = tmp_path / CHECKPOINT_ROOT
+    root = manager.root
     assert event is not None
     assert event["type"] == "checkpoint_saved"
-    assert (root / "checkpoint.json").exists()
+    assert (root / "execution.json").exists()
     assert (root / "RECOVERY.md").exists()
     recovery = (root / "RECOVERY.md").read_text(encoding="utf-8")
     assert "demo plan" in recovery
@@ -62,7 +63,7 @@ def test_strict_checkpoint_writes_state_and_events(tmp_path: Path) -> None:
 
     manager.save(sample_state(runtime), status="running", latest_node="planner", event={"mode": "custom", "payload": {"type": "x"}})
 
-    root = tmp_path / CHECKPOINT_ROOT
+    root = manager.root
     assert (root / "state.json").exists()
     assert (root / "events.jsonl").exists()
     state = json.loads((root / "state.json").read_text(encoding="utf-8"))
@@ -81,11 +82,11 @@ def test_state_serialization_restores_messages_and_runtime(tmp_path: Path) -> No
     assert restored["plan_summary"] == "demo plan"
 
 
-def test_workspace_manifest_excludes_checkpoint_directory(tmp_path: Path) -> None:
+def test_workspace_manifest_excludes_execution_directory(tmp_path: Path) -> None:
     (tmp_path / "app.py").write_text("print('hi')", encoding="utf-8")
-    checkpoint_file = tmp_path / CHECKPOINT_ROOT / "checkpoint.json"
-    checkpoint_file.parent.mkdir(parents=True)
-    checkpoint_file.write_text("{}", encoding="utf-8")
+    execution_dir = tmp_path / EXECUTIONS_ROOT / "exec-test" / "execution.json"
+    execution_dir.parent.mkdir(parents=True)
+    execution_dir.write_text("{}", encoding="utf-8")
 
     manifest = workspace_manifest(tmp_path)
 
@@ -160,7 +161,7 @@ def test_strict_resume_falls_back_to_light_when_state_missing(tmp_path: Path) ->
     assert "resume todo" in inputs["context_summary"]
 
 
-def test_list_checkpoints_returns_metadata(tmp_path: Path) -> None:
+def test_list_executions_returns_metadata(tmp_path: Path) -> None:
     runtime = RuntimeState(workspace=tmp_path, checkpoint_mode="light")
     manager = CheckpointManager(runtime, task="demo task")
     event1 = manager.save(
@@ -168,7 +169,7 @@ def test_list_checkpoints_returns_metadata(tmp_path: Path) -> None:
         status="running",
         latest_node="planner",
     )
-    # Update state for second checkpoint
+    # Each save creates a new execution directory
     state2 = sample_state(runtime)
     state2["attempts"] = 2
     event2 = manager.save(
@@ -177,38 +178,37 @@ def test_list_checkpoints_returns_metadata(tmp_path: Path) -> None:
         latest_node="verifier",
     )
 
-    checkpoints = list_checkpoints(tmp_path)
+    executions = list_executions(tmp_path)
 
-    # Each save overwrites the same checkpoint.json, so we get 1 checkpoint
-    # with the latest state. This is expected behavior for light mode.
-    assert len(checkpoints) >= 1
-    latest = checkpoints[0].to_dict()
+    # Each save creates a new execution dir, so we get 2 executions
+    assert len(executions) >= 1
+    latest = executions[0].to_dict()
     assert latest["status"] == "interrupted"
     assert latest["latest_node"] == "verifier"
     assert latest["attempts"] == 2
 
 
-def test_rollback_restores_checkpoint_payload(tmp_path: Path) -> None:
+def test_rollback_restores_execution_payload(tmp_path: Path) -> None:
     runtime = RuntimeState(workspace=tmp_path, checkpoint_mode="light")
     manager = CheckpointManager(runtime, task="rollback demo")
     state = sample_state(runtime)
     state["task"] = "rollback demo"  # match manager task
     manager.save(state, status="interrupted", latest_node="verifier")
 
-    checkpoints = list_checkpoints(tmp_path)
-    assert len(checkpoints) == 1
-    checkpoint_id = checkpoints[0].checkpoint_id
+    executions = list_executions(tmp_path)
+    assert len(executions) >= 1
+    execution_id = executions[0].checkpoint_id
 
-    payload = rollback_to_checkpoint(tmp_path, checkpoint_id, restore_workspace_files=False)
+    payload = rollback_to_execution(tmp_path, execution_id, restore_workspace_files=False)
 
     assert payload["status"] == "interrupted"
     assert payload["latest_node"] == "verifier"
     assert payload["task"] == "rollback demo"
 
 
-def test_rollback_raises_for_missing_checkpoint(tmp_path: Path) -> None:
+def test_rollback_raises_for_missing_execution(tmp_path: Path) -> None:
     try:
-        rollback_to_checkpoint(tmp_path, "checkpoint-nonexistent", restore_workspace_files=False)
+        rollback_to_execution(tmp_path, "exec-nonexistent", restore_workspace_files=False)
     except FileNotFoundError:
         pass
     else:

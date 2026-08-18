@@ -40,6 +40,7 @@ call_from_thread：专门给工作线程用，把消息安全投递到 UI 事件
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Iterable, Literal
@@ -601,9 +602,7 @@ Agent全部执行完毕
         return True
 
     # 用户按 Enter 时触发：
-    # 获取输入内容
-    # 如果是 /new → 创建新会话
-    # 否则 → 启动新任务
+    # 用户点击提交 的方法
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """
         4. 用户交互回调
@@ -630,6 +629,7 @@ Agent全部执行完毕
 
         from mokioclaw.interaction.commands import CommandKind, dispatch_slash_command, is_slash_command
 
+        # 判断是不是 / 开头的
         if is_slash_command(task):
             ws = Path(self.latest_workspace) if self.latest_workspace else self.workspace
             result = dispatch_slash_command(task, workspace=ws)
@@ -669,7 +669,10 @@ Agent全部执行完毕
                 return
             # FALLTHROUGH：当作普通消息
             task = result.inject_message or task
+            logging.info("没有匹配到命令")
+            return
 
+        # 如果不是/ 开头的就是 query
         self.start_task(task, None)
 
     def _append_system_note(self, text: str) -> None:
@@ -721,13 +724,7 @@ Agent全部执行完毕
         self.query_one("#events", VerticalScroll).remove_children()
         self._write_welcome()
 
-    # 启动一个新任务：
-    # 检查是否已在运行
-    # 更新状态（running = True）
-    # 清空待办列表
-    # 禁用输入框
-    # 在事件流中写入"任务开始"
-    # 在后台线程中运行 _run_stream()
+    # core
     def start_task(self, task: str, resume: Path | None = None) -> None:
         if self.running:
             self.notify("MokioClaw is already running a task.", severity="warning")
@@ -794,7 +791,6 @@ Agent全部执行完毕
             self.call_from_thread(self.post_message, AgentEventMessage(error_event))
         finally:
             self.call_from_thread(self.post_message, RunFinishedMessage(status))
-
 
     def _approval_handler(self, request: ApprovalRequest) -> ApprovalDecision:
         """

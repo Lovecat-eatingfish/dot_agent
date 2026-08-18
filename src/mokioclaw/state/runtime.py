@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from langchain_core.messages import BaseMessage
 from mokioclaw.core.hooks import HookRunner
 from mokioclaw.core.tool_result_budget import ToolResultBudget
 from mokioclaw.security.agent_mode import normalize_agent_mode
@@ -127,6 +128,10 @@ class RuntimeState:
 
     # 追踪 ID，用于关联同一任务的所有事件
     trace_id: str | None = None
+
+    # 全局消息列表：跨轮对话的完整消息历史（含 HumanMessage, AIMessage, ToolMessage）
+    # 每轮新增 messages 会 append 到这里；rewind 时清空重载；resume 时一次性加载
+    global_messages: list[BaseMessage] = field(default_factory=list)
 
     # 模型名称/提供方/会话标识等状态信息
     model_name: str = ""

@@ -500,7 +500,7 @@ def _memory_command(workspace: Path | None) -> CommandResult:
     topics = store.list_topics()
     latest_session = get_latest_session(workspace)
     sessions = list_sessions(workspace)
-    trace_root = workspace / ".mokioclaw" / "traces"
+    trace_root = workspace / ".mokioclaw" / "executions"
     traces = []
     if trace_root.exists():
         for path in sorted(trace_root.iterdir(), reverse=True):
@@ -756,7 +756,7 @@ def _cost_command(workspace: Path | None) -> CommandResult:
     import json
     if workspace is None:
         return CommandResult(kind=CommandKind.SYSTEM, name="cost", ui_message=_card("Cost", ["No workspace available."]), action="none")
-    trace_root = workspace / ".mokioclaw" / "traces"
+    trace_root = workspace / ".mokioclaw" / "executions"
     total_prompt = 0
     total_completion = 0
     total_tokens = 0
@@ -973,7 +973,7 @@ def _status_command(workspace: Path | None) -> CommandResult:
     sessions = list_sessions(ws)
     config = load_user_config(workspace=ws)
     latest_trace = None
-    trace_root = ws / ".mokioclaw" / "traces"
+    trace_root = ws / ".mokioclaw" / "executions"
     if trace_root.exists():
         for path in sorted(trace_root.iterdir(), reverse=True):
             if (path / "summary.json").exists():

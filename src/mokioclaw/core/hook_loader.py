@@ -45,6 +45,7 @@ _PROJECT_HOOKS = Path(".mokioclaw") / "hooks.json"
 _DEFAULT_TIMEOUT = 30
 
 
+# 给HookRunner 执行引擎 注册所有的hook
 def load_hooks_into_runner(
     runner: HookRunner,
     workspace: Path | None = None,

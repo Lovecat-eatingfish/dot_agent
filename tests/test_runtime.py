@@ -194,7 +194,7 @@ def test_stream_agent_events_writes_trace_summary_on_finish(monkeypatch, tmp_pat
     assert trace_events
     assert trace_events[-1]["status"] == "finished"
     assert trace_events[-1]["tool_calls"] == 1
-    assert (tmp_path / ".mokioclaw" / "traces").exists()
+    assert (tmp_path / ".mokioclaw" / "executions").exists()
 
 
 def test_stream_agent_events_checkpoints_only_at_safety_points(monkeypatch, tmp_path: Path) -> None:
@@ -285,7 +285,7 @@ def test_stream_agent_events_trace_off_creates_no_trace_dir(monkeypatch, tmp_pat
     )
 
     assert not any(event.get("type") == "custom_event" and event["event"].get("type") == "trace_summary" for event in events)
-    assert not (tmp_path / ".mokioclaw" / "traces").exists()
+    assert not (tmp_path / ".mokioclaw" / "executions").exists()
 
 
 def test_stream_agent_events_trace_records_resume(monkeypatch, tmp_path: Path) -> None:

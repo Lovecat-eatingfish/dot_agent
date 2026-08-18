@@ -71,7 +71,7 @@ def test_trace_recorder_off_mode_does_not_create_files(tmp_path: Path) -> None:
     event = trace.end(status="finished")
 
     assert event is None
-    assert not (tmp_path / ".mokioclaw" / "traces").exists()
+    assert not (tmp_path / ".mokioclaw" / "executions").exists()
 
 
 def test_trace_recorder_write_errors_do_not_raise(tmp_path: Path, monkeypatch) -> None:

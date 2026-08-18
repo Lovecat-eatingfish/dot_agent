@@ -8,6 +8,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from langchain_core.messages import BaseMessage, messages_from_dict, message_to_dict
 
@@ -17,12 +18,14 @@ from mokioclaw.core.utils import json_safe, truncate_json, utc_now, write_json
 logger = get_logger(__name__)
 
 VALID_CHECKPOINT_MODES = {"light", "strict", "off"}
-CHECKPOINT_ROOT = Path(".mokioclaw") / "checkpoints"
-CHECKPOINT_FILE = "checkpoint.json"
+EXECUTIONS_ROOT = Path(".mokioclaw") / "executions"
+EXECUTION_FILE = "execution.json"
 EVENTS_FILE = "events.jsonl"
 STATE_FILE = "state.json"
 RECOVERY_FILE = "RECOVERY.md"
-GIT_DIR = "git"
+SNAPSHOTS_DIR = Path(".mokioclaw") / "snapshots"
+GIT_SHARED_REPO = "shared.git"
+GIT_COMMIT_PREFIX = "checkpoint"
 MAX_RECOVERY_TEXT = 6000
 MAX_MANIFEST_ITEMS = 160
 
@@ -38,8 +41,26 @@ def normalize_checkpoint_mode(mode: str | None) -> str:
     return normalized if normalized in VALID_CHECKPOINT_MODES else "light"
 
 
-def checkpoint_dir(workspace: Path) -> Path:
-    return workspace / CHECKPOINT_ROOT
+def execution_dir(runtime: Any) -> Path:
+    """返回该 workflow 执行的目录路径（exec-{timestamp}-{short_id}）"""
+    exec_id = f"exec-{datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')}-{uuid4().hex[:6]}"
+    return runtime.workspace / EXECUTIONS_ROOT / exec_id
+
+
+def snapshots_dir(workspace: Path) -> Path:
+    """返回该 workspace 的共享 git 快照仓库路径"""
+    return workspace / SNAPSHOTS_DIR / GIT_SHARED_REPO
+
+
+def _latest_execution_dir(workspace: Path) -> Path | None:
+    """返回最新的 execution 目录（按修改时间排序），不存在返回 None"""
+    root = workspace / EXECUTIONS_ROOT
+    if not root.exists():
+        return None
+    dirs = [d for d in root.iterdir() if d.is_dir() and d.name.startswith("exec-")]
+    if not dirs:
+        return None
+    return max(dirs, key=lambda d: d.stat().st_mtime)
 
 
 class CheckpointManager:
@@ -48,7 +69,7 @@ class CheckpointManager:
         self.workspace = runtime.workspace
         self.mode = normalize_checkpoint_mode(getattr(runtime, "checkpoint_mode", "light"))
         self.task = task
-        self.root = checkpoint_dir(self.workspace)
+        self.root = execution_dir(self.runtime)
 
     @property
     def enabled(self) -> bool:
@@ -73,9 +94,9 @@ class CheckpointManager:
             _write_json(self.root / STATE_FILE, serialize_state(state))
 
         manifest = workspace_manifest(self.workspace)
-        git_commit, git_error = snapshot_workspace_git(self.workspace, self.root)
+        git_commit, git_error = snapshot_workspace_git(self.workspace, snapshots_dir(self.workspace).parent)
         payload = self._payload(state, status=status, latest_node=latest_node, manifest=manifest, git_commit=git_commit, git_error=git_error)
-        _write_json(self.root / CHECKPOINT_FILE, payload)
+        _write_json(self.root / EXECUTION_FILE, payload)
         (self.root / RECOVERY_FILE).write_text(build_recovery_markdown(payload), encoding="utf-8")
 
         # 保存成功后清理旧 checkpoint（异步安全，失败不影响主流程）
@@ -87,7 +108,7 @@ class CheckpointManager:
         return checkpoint_saved_event(payload)
 
     def cleanup_old_checkpoints(self, *, max_dirs: int = MAX_CHECKPOINT_DIRS) -> int:
-        """清理旧的 checkpoint 目录，只保留最近的 max_dirs 个
+        """清理旧的 execution 目录，只保留最近的 max_dirs 个
 
         Returns:
             删除的目录数量
@@ -96,9 +117,9 @@ class CheckpointManager:
         if not parent.exists():
             return 0
 
-        # 收集所有 checkpoint-* 目录
+        # 收集所有 exec-* 目录
         dirs = sorted(
-            [d for d in parent.iterdir() if d.is_dir() and d.name.startswith("checkpoint-")],
+            [d for d in parent.iterdir() if d.is_dir() and d.name.startswith("exec-")],
             key=lambda d: d.stat().st_mtime,
             reverse=True,
         )
@@ -141,8 +162,8 @@ class CheckpointManager:
             "mode": self.mode,
             "status": status,
             "workspace": str(self.workspace),
-            "checkpoint_dir": str(self.root),
-            "checkpoint_file": str(self.root / CHECKPOINT_FILE),
+            "execution_dir": str(self.root),
+            "execution_file": str(self.root / EXECUTION_FILE),
             "recovery_file": str(self.root / RECOVERY_FILE),
             "state_file": str(self.root / STATE_FILE) if self.mode == "strict" else "",
             "events_file": str(self.root / EVENTS_FILE) if self.mode == "strict" else "",
@@ -154,7 +175,7 @@ class CheckpointManager:
             "summary": summary,
             "workspace_manifest": manifest,
             "git": {
-                "dir": str(self.root / GIT_DIR),
+                "dir": str(snapshots_dir(self.workspace)),
                 "commit": git_commit,
                 "error": git_error,
             },
@@ -169,8 +190,8 @@ def checkpoint_saved_event(payload: dict[str, Any]) -> dict[str, Any]:
         "mode": payload.get("mode", ""),
         "status": payload.get("status", ""),
         "workspace": payload.get("workspace", ""),
-        "path": payload.get("checkpoint_dir", ""),
-        "checkpoint_file": payload.get("checkpoint_file", ""),
+        "path": payload.get("execution_dir", ""),
+        "execution_file": payload.get("execution_file", ""),
         "recovery_file": payload.get("recovery_file", ""),
         "git_commit": git_info.get("commit"),
         "git_error": git_info.get("error"),
@@ -186,12 +207,12 @@ def checkpoint_resumed_event(
     fallback: bool = False,
     reason: str = "",
 ) -> dict[str, Any]:
-    root = checkpoint_dir(workspace)
+    exec_root = EXECUTIONS_ROOT  # 路径信息已在 source 参数中传递
     return {
         "type": "checkpoint_resumed",
         "mode": mode,
         "workspace": str(workspace),
-        "path": str(root),
+        "path": str(workspace / exec_root),
         "source": source,
         "fallback": fallback,
         "reason": reason,
@@ -210,32 +231,41 @@ def load_resume_inputs(
             state = load_strict_state(runtime, max_attempts=max_attempts)
         except Exception as exc:
             inputs = build_light_resume_inputs(runtime, task=task, max_attempts=max_attempts)
+            latest = _latest_execution_dir(runtime.workspace)
+            source = str(latest / RECOVERY_FILE) if latest else ""
             event = checkpoint_resumed_event(
                 workspace=runtime.workspace,
                 mode="light",
-                source=str(checkpoint_dir(runtime.workspace) / RECOVERY_FILE),
+                source=source,
                 fallback=True,
                 reason=f"strict resume unavailable: {type(exc).__name__}: {exc}",
             )
             return inputs, event
+        latest = _latest_execution_dir(runtime.workspace)
+        source = str(latest / STATE_FILE) if latest else ""
         event = checkpoint_resumed_event(
             workspace=runtime.workspace,
             mode="strict",
-            source=str(checkpoint_dir(runtime.workspace) / STATE_FILE),
+            source=source,
         )
         return state, event
 
     inputs = build_light_resume_inputs(runtime, task=task, max_attempts=max_attempts)
+    latest = _latest_execution_dir(runtime.workspace)
+    source = str(latest / RECOVERY_FILE) if latest else ""
     event = checkpoint_resumed_event(
         workspace=runtime.workspace,
         mode="light",
-        source=str(checkpoint_dir(runtime.workspace) / RECOVERY_FILE),
+        source=source,
     )
     return inputs, event
 
 
 def load_strict_state(runtime: Any, *, max_attempts: int = 3) -> dict[str, Any]:
-    state_path = checkpoint_dir(runtime.workspace) / STATE_FILE
+    latest = _latest_execution_dir(runtime.workspace)
+    if latest is None:
+        raise FileNotFoundError("no execution directory found")
+    state_path = latest / STATE_FILE
     raw = json.loads(state_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("state.json is not an object")
@@ -298,7 +328,10 @@ def build_light_resume_inputs(runtime: Any, *, task: str | None = None, max_atte
 
 
 def read_checkpoint(workspace: Path) -> dict[str, Any]:
-    path = checkpoint_dir(workspace) / CHECKPOINT_FILE
+    latest = _latest_execution_dir(workspace)
+    if latest is None:
+        return {}
+    path = latest / EXECUTION_FILE
     if not path.exists():
         return {}
     try:
@@ -326,7 +359,10 @@ def normalize_resume_task(task: str) -> str:
 
 
 def read_checkpoint_text(workspace: Path, name: str) -> str:
-    path = checkpoint_dir(workspace) / name
+    latest = _latest_execution_dir(workspace)
+    if latest is None:
+        return ""
+    path = latest / name
     if not path.exists():
         return ""
     try:
@@ -496,25 +532,31 @@ def snapshot_workspace_git(workspace: Path, root: Path) -> tuple[str | None, str
 
     workspace = workspace.resolve()
     root = root.resolve()
-    git_dir = root / GIT_DIR
-    git_dir.mkdir(parents=True, exist_ok=True)
+    shared_git_dir = root / GIT_SHARED_REPO
+    shared_git_dir.mkdir(parents=True, exist_ok=True)
     try:
-        _git(workspace, git_dir, ["init", "-q"])
-        _git(workspace, git_dir, ["config", "user.name", "MokioClaw Checkpoint"])
-        _git(workspace, git_dir, ["config", "user.email", "mokioclaw-checkpoint@example.local"])
-        _ensure_git_excludes(git_dir)
-        _git(workspace, git_dir, ["add", "-A", "--", "."])
-        status = _git(workspace, git_dir, ["status", "--porcelain"]).stdout.strip()
-        head = git_head(workspace, git_dir)
+        _init_shared_git(shared_git_dir)
+        _ensure_git_excludes(shared_git_dir)
+        _git(workspace, shared_git_dir, ["add", "-A", "--", "."])
+        status = _git(workspace, shared_git_dir, ["status", "--porcelain"]).stdout.strip()
+        head = git_head(workspace, shared_git_dir)
         if not status and head:
             return head, None
-        args = ["commit", "-q", "-m", f"checkpoint {utc_now()}"]
+        args = ["commit", "-q", "-m", f"{GIT_COMMIT_PREFIX} {utc_now()}"]
         if not status:
             args.append("--allow-empty")
-        _git(workspace, git_dir, args)
-        return git_head(workspace, git_dir), None
+        _git(workspace, shared_git_dir, args)
+        return git_head(workspace, shared_git_dir), None
     except Exception as exc:
-        return git_head(workspace, git_dir), f"{type(exc).__name__}: {exc}"
+        return git_head(workspace, shared_git_dir), f"{type(exc).__name__}: {exc}"
+
+
+def _init_shared_git(git_dir: Path) -> None:
+    """初始化/验证共享 git 仓库（幂等）"""
+    if not (git_dir / "HEAD").exists():
+        _git_direct(git_dir, ["init", "-q", "--bare"])
+    _git_direct(git_dir, ["config", "user.name", "MokioClaw Checkpoint"])
+    _git_direct(git_dir, ["config", "user.email", "mokioclaw-checkpoint@example.local"])
 
 
 def git_head(workspace: Path, git_dir: Path) -> str | None:
@@ -537,7 +579,7 @@ def trim_text(value: Any, limit: int) -> str:
 
 def should_skip_workspace_path(rel: Path) -> bool:
     parts = rel.parts
-    if len(parts) >= 2 and parts[0] == ".mokioclaw" and parts[1] == "checkpoints":
+    if len(parts) >= 2 and parts[0] == ".mokioclaw" and parts[1] == "executions":
         return True
     skip_names = {".git", ".venv", "venv", "node_modules", "__pycache__", ".pytest_cache"}
     return any(part in skip_names for part in parts)
@@ -572,7 +614,7 @@ class CheckpointMeta:
     def __init__(self, path: Path, payload: dict[str, Any]) -> None:
         self.path = path
         self.dir = path.parent
-        self.checkpoint_id = path.name.replace(CHECKPOINT_FILE, "").rstrip("/")
+        self.checkpoint_id = self.dir.name
         self.mode = payload.get("mode", "light")
         self.status = payload.get("status", "")
         self.updated_at = payload.get("updated_at", "")
@@ -586,8 +628,8 @@ class CheckpointMeta:
         self.has_state = bool(payload.get("state_file"))
 
     @property
-    def checkpoint_file(self) -> Path:
-        return self.dir / CHECKPOINT_FILE
+    def execution_file(self) -> Path:
+        return self.dir / EXECUTION_FILE
 
     @property
     def state_file(self) -> Path:
@@ -614,72 +656,79 @@ class CheckpointMeta:
         }
 
 
-def list_checkpoints(workspace: Path) -> list[CheckpointMeta]:
-    """列出 workspace 中所有可用的检查点
+def list_executions(workspace: Path) -> list[CheckpointMeta]:
+    """列出 workspace 中所有可用的执行记录
 
     Args:
         workspace: 工作区路径
 
     Returns:
-        检查点元数据列表，按更新时间降序
+        执行元数据列表，按更新时间降序
     """
-    root = checkpoint_dir(workspace)
+    root = workspace / EXECUTIONS_ROOT
     if not root.exists():
         return []
 
-    checkpoints: list[CheckpointMeta] = []
-    for path in sorted(root.glob(f"*{CHECKPOINT_FILE}")):
+    executions: list[CheckpointMeta] = []
+    for exec_dir in sorted(root.iterdir()):
+        if not exec_dir.is_dir() or not exec_dir.name.startswith("exec-"):
+            continue
+        path = exec_dir / EXECUTION_FILE
+        if not path.exists():
+            continue
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
-                checkpoints.append(CheckpointMeta(path, payload))
+                executions.append(CheckpointMeta(path, payload))
         except (OSError, json.JSONDecodeError):
             continue
 
-    checkpoints.sort(key=lambda c: c.updated_at, reverse=True)
-    return checkpoints
+    executions.sort(key=lambda e: e.updated_at, reverse=True)
+    return executions
 
 
-def rollback_to_checkpoint(
+def rollback_to_execution(
     workspace: Path,
-    checkpoint_id: str,
+    execution_id: str,
     *,
     restore_workspace_files: bool = True,
 ) -> dict[str, Any]:
-    """回滚到指定的检查点
+    """回滚到指定的执行记录
 
     Args:
         workspace: 工作区路径
-        checkpoint_id: 检查点 ID（checkpoint.json 的目录名）
+        execution_id: 执行 ID（execution.json 的目录名，如 exec-20260818-103000-ab12cd）
         restore_workspace_files: 是否从 git snapshot 恢复工作区文件
 
     Returns:
-        检查点 payload（strict 模式下包含 _restored_state）
+        执行 payload（strict 模式下包含 _restored_state）
 
     Raises:
-        FileNotFoundError: 检查点不存在
-        ValueError: 检查点数据无效
+        FileNotFoundError: 执行记录不存在
+        ValueError: 执行数据无效
     """
-    root = checkpoint_dir(workspace)
-    checkpoint_file = root / checkpoint_id / CHECKPOINT_FILE
-    if not checkpoint_file.exists():
-        raise FileNotFoundError(f"checkpoint not found: {checkpoint_file}")
+    root = workspace / EXECUTIONS_ROOT
+    execution_file = root / execution_id / EXECUTION_FILE
+    if not execution_file.exists():
+        raise FileNotFoundError(f"execution not found: {execution_file}")
 
-    payload = json.loads(checkpoint_file.read_text(encoding="utf-8"))
+    payload = json.loads(execution_file.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"invalid checkpoint payload: {checkpoint_file}")
+        raise ValueError(f"invalid execution payload: {execution_file}")
 
-    # 恢复工作区文件（从 git snapshot）
+    # 恢复工作区文件（从共享 git 快照，使用该 execution 的 commit）
     if restore_workspace_files:
-        git_dir = root / checkpoint_id / GIT_DIR
-        if git_dir.exists():
+        shared_git_dir = snapshots_dir(workspace)
+        git_info = payload.get("git") or {}
+        commit = git_info.get("commit")
+        if commit and shared_git_dir.exists():
             try:
-                _git(workspace, git_dir, ["checkout", "-f", "HEAD", "--", "."])
+                _git(workspace, shared_git_dir, ["checkout", "-f", commit, "--", "."])
             except Exception as exc:
                 logger.warning("workspace restore from checkpoint failed: %s", exc)
 
     # 恢复 state.json（strict 模式）
-    state_path = root / checkpoint_id / STATE_FILE
+    state_path = root / execution_id / STATE_FILE
     if state_path.exists():
         try:
             state_data = json.loads(state_path.read_text(encoding="utf-8"))
@@ -700,13 +749,24 @@ def _git(workspace: Path, git_dir: Path, args: list[str]) -> subprocess.Complete
     )
 
 
-# 给快照内部独立 Git 仓库配置忽略清单，自动跳过虚拟环境、缓存、快照自身目录等体积巨大且不需要备份的文件，减少快照占用磁盘空间、加快 Git add/commit 速度。
+def _git_direct(git_dir: Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+    """执行 git 命令（不需要 work-tree，用于 bare 仓库初始化）"""
+    return subprocess.run(
+        ["git", f"--git-dir={git_dir}", *args],
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+
+
+# 给共享快照 Git 仓库配置忽略清单
 def _ensure_git_excludes(git_dir: Path) -> None:
     exclude_path = git_dir / "info" / "exclude"
     exclude_path.parent.mkdir(parents=True, exist_ok=True)
     existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
     patterns = [
-        ".mokioclaw/checkpoints/",
+        ".mokioclaw/executions/",
+        ".mokioclaw/snapshots/",
         ".venv/",
         "venv/",
         "node_modules/",

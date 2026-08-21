@@ -133,6 +133,9 @@ class RuntimeState:
     # 每轮新增 messages 会 append 到这里；rewind 时清空重载；resume 时一次性加载
     global_messages: list[BaseMessage] = field(default_factory=list)
 
+    # 当前会话 ID（agent 运行期间不变，/new 时才更换）
+    session_id: str = ""
+
     # 模型名称/提供方/会话标识等状态信息
     model_name: str = ""
     model_provider: str = ""

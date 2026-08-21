@@ -283,37 +283,45 @@ def stream_agent_events(
     resumed = False
     resume_event: dict[str, Any] | None = None
 
-    if resume_path is not None or resume_session_id:
-        # 恢复模式：加载指定 session 或最新 session
-        if resume_session_id:
-            session_data = load_session(workspace_path, resume_session_id)
-        else:
-            resume_str = str(resume_path)
-            if resume_str.startswith("session-"):
-                session_data = load_session(workspace_path, resume_str)
-            else:
-                session_data = get_latest_session(workspace_path)
-
+    if resume_session_id:
+        # 明确指定了 session ID：恢复该 session
+        session_data = load_session(workspace_path, resume_session_id)
         if session_data:
-            session_id = session_data["session_id"]
             resumed = True
-            # 加载历史 messages 到 global_messages
-            history_messages = load_session_messages(workspace_path, session_id)
-            state.global_messages = history_messages
-            resume_context = build_resume_context(session_data)
-            yield {"type": "custom_event", "event": {
-                "type": "session_resumed",
-                "session_id": session_id,
-                "turn_index": session_data.get("turn_index", 0),
-                "resume_context": resume_context,
-            }}
+    elif resume_path is not None:
+        resume_str = str(resume_path)
+        if resume_str.startswith("session-"):
+            session_data = load_session(workspace_path, resume_str)
+            if session_data:
+                resumed = True
         else:
-            session_data = create_session(workspace_path, task or "")
-            session_id = session_data["session_id"]
+            session_data = get_latest_session(workspace_path)
+            if session_data:
+                resumed = True
     else:
-        # 新建 session
+        # 无任何恢复参数：自动恢复最新 session（如果有）
+        session_data = get_latest_session(workspace_path)
+        if session_data:
+            resumed = True
+
+    if resumed and session_data:
+        session_id = session_data["session_id"]
+        # 加载历史 messages 到 global_messages
+        history_messages = load_session_messages(workspace_path, session_id)
+        state.global_messages = history_messages
+        state.session_id = session_id
+        resume_context = build_resume_context(session_data)
+        yield {"type": "custom_event", "event": {
+            "type": "session_resumed",
+            "session_id": session_id,
+            "turn_index": session_data.get("turn_index", 0),
+            "resume_context": resume_context,
+        }}
+    else:
+        # 新建 session（无历史可恢复，或用户主动 /new）
         session_data = create_session(workspace_path, task or "")
         session_id = session_data["session_id"]
+        state.session_id = session_id
 
     # 添加用户轮次
     current_turn = append_user_turn(workspace_path, session_data, task or "")
@@ -327,11 +335,14 @@ def stream_agent_events(
         inputs, resume_event = load_resume_inputs(state, task=task, max_attempts=max_attempts)
         if resume_event:
             yield {"type": "custom_event", "event": resume_event}
+        # 将全局消息注入 workflow 输入，作为对话上下文
+        if state.global_messages:
+            inputs["messages"] = list(state.global_messages)
     else:
         inputs = {
             "task": task or "",
             "runtime": state,
-            "messages": [],
+            "messages": list(state.global_messages),
             "attempts": 0,
             "max_attempts": max_attempts,
         }
@@ -367,18 +378,14 @@ def stream_agent_events(
         cleanup_background_processes()
         fire_session_hook(state.hook_runner, HookEvent.SessionEnd, workspace=str(state.workspace))
         interrupt_session(workspace_path, session_id)
-        trace_event = trace.end(status="interrupted", latest_node="", final_state=current_state)
-        if trace_event:
-            yield {"type": "custom_event", "event": trace_event}
+        trace.end(status="interrupted", latest_node="", final_state=current_state)
         return
     except Exception as exc:
         cleanup_background_processes()
         fire_session_hook(state.hook_runner, HookEvent.SessionEnd, workspace=str(state.workspace))
         logger.error("workflow failed: %s", exc, exc_info=True)
         interrupt_session(workspace_path, session_id)
-        trace_event = trace.end(status="failed", latest_node="", final_state=current_state)
-        if trace_event:
-            yield {"type": "custom_event", "event": trace_event}
+        trace.end(status="failed", latest_node="", final_state=current_state)
         return
 
     cleanup_background_processes()
@@ -401,10 +408,10 @@ def stream_agent_events(
     # 添加 assistant 轮次并标记 session 完成
     append_assistant_turn(workspace_path, session_data, current_turn, final_answer, state_summary=current_state)
 
-    # 持久化本轮 messages：append 到 session.json 的 messages[]，同时更新 turn 文件
+    # 持久化本轮 messages：append 到 session-{id}.json 的 messages[]，同时更新 turn 文件
     turn_messages = current_state.get("messages", [])
     if turn_messages:
-        append_messages_to_session(workspace_path, session_data, turn_messages)
+        append_messages_to_session(workspace_path, session_data, turn_messages, turn=current_turn)
         # 重新加载最新的 session 数据（append_messages_to_session 已保存）
         session_data = load_session(workspace_path, session_id)
         save_turn_checkpoint(
@@ -442,25 +449,37 @@ def stream_session_events(
     workspace = (session_workspace or default_workspace()).expanduser()
     workspace.mkdir(parents=True, exist_ok=True)
 
-    # Session 管理：恢复或创建： 决定本次运行是新建会话还是恢复已有会话。
+    # Session 管理：优先恢复已有 session，避免每次新建
     resumed = False
-    # 情况 A：明确指定了 session ID  类似于/rewind
     if resume_session_id:
-        # 恢复上下文会话
+        # 明确指定了 session ID
         session_data = load_session(workspace, resume_session_id)
         if session_data:
             resumed = True
         else:
             session_data = create_session(workspace, task or "")
-    # 类似于 --resume
     elif resume_workspace:
+        # workspace 路径：可能是 session-xxx 或普通路径
+        resume_str = str(resume_workspace)
+        if resume_str.startswith("session-"):
+            session_data = load_session(workspace, resume_str)
+            if session_data:
+                resumed = True
+            else:
+                session_data = create_session(workspace, task or "")
+        else:
+            session_data = get_latest_session(workspace)
+            if session_data:
+                resumed = True
+            else:
+                session_data = create_session(workspace, task or "")
+    else:
+        # 无恢复参数：自动恢复最新 session（除非调用方显式传了空 session_id 表示 /new）
         session_data = get_latest_session(workspace)
         if session_data:
             resumed = True
         else:
             session_data = create_session(workspace, task or "")
-    else:
-        session_data = create_session(workspace, task or "")
 
     session_id = session_data["session_id"]
 
@@ -538,7 +557,7 @@ def stream_session_events(
     route = "workflow"
     entry_state: dict[str, Any] = {
         "task": task or "",
-        "messages": [],
+        "messages": session_data['turns'],
         "session_id": session_id,
         "session_turn": turn,
     }
@@ -578,6 +597,7 @@ def stream_session_events(
         session_data=session_data,
         turn=turn,
         thinking_instruction=thinking_instruction,
+        resumed=resumed,
     )
     final_answer = ""
     turn_messages: list[Any] = []
@@ -592,7 +612,7 @@ def stream_session_events(
 
     # 持久化 messages
     if turn_messages:
-        append_messages_to_session(workspace, session_data, turn_messages)
+        append_messages_to_session(workspace, session_data, turn_messages, turn=turn)
         session_data = load_session(workspace, session_id)
         save_turn_checkpoint(
             workspace, session_data, turn,
@@ -635,6 +655,7 @@ def _stream_complex_workflow(
     session_data: dict[str, Any] | None = None,
     turn: int | None = None,
     thinking_instruction: str = "",
+    resumed: bool = False,
 ) -> Iterator[dict[str, Any]]:
     resume_path = resume_workspace.expanduser() if resume_workspace is not None else None
     # TUI 多轮：每 turn 重建 runtime，但不重复 SessionStart
@@ -664,15 +685,21 @@ def _stream_complex_workflow(
         session_data["_session_hooks_started"] = True
         session_data.pop("_session_ended", None)
 
+    # 恢复模式：加载历史消息到 global_messages
+    if resumed and session_data:
+        history_messages = load_session_messages(workspace, session_id)
+        state.global_messages = history_messages
+        state.session_id = session_id
+
     # 每个新任务重置 PromptBuilder，确保使用当前 workspace 的配置
     reset_prompt_builder()
     workflow = build_complex_workflow()
 
-    resumed = resume_path is not None
+    # 准备 workflow 输入
     inputs: dict[str, Any] = {
         "task": task or "",
         "runtime": state,
-        "messages": [],
+        "messages": list(state.global_messages),
         "attempts": 0,
         "max_attempts": max_attempts,
     }
@@ -701,18 +728,14 @@ def _stream_complex_workflow(
         cleanup_background_processes()
         if session_data:
             interrupt_session(workspace, session_id)
-        trace_event = trace.end(status="interrupted", final_state=current_state)
-        if trace_event:
-            yield {"type": "custom_event", "event": trace_event}
+        trace.end(status="interrupted", final_state=current_state)
         return
     except Exception as exc:
         cleanup_background_processes()
         logger.error("workflow failed: %s", exc, exc_info=True)
         if session_data:
             interrupt_session(workspace, session_id)
-        trace_event = trace.end(status="failed", final_state=current_state)
-        if trace_event:
-            yield {"type": "custom_event", "event": trace_event}
+        trace.end(status="failed", final_state=current_state)
         return
 
     cleanup_background_processes()
@@ -725,14 +748,19 @@ def _stream_complex_workflow(
     if trace_event:
         yield {"type": "custom_event", "event": trace_event}
 
-    # 输出本轮 messages 供上层持久化
+    # 持久化本轮 messages 到 session（内层直接写，不再依赖外层处理 turn_messages 事件）
     from mokioclaw.reliability.checkpoint import serialize_message as _ser_msg
     _msgs = current_state.get("messages", [])
-    if _msgs:
-        yield {"type": "custom_event", "event": {
-            "type": "turn_messages",
-            "messages": [_ser_msg(m) for m in _msgs],
-        }}
+    if _msgs and session_data and session_id:
+        try:
+            append_messages_to_session(workspace, session_data, _msgs, turn=turn or 0)
+            session_data = load_session(workspace, session_id)
+            save_turn_checkpoint(
+                workspace, session_data, turn or 0,
+                task or "", state=current_state, turn_messages=_msgs,
+            )
+        except Exception as exc:
+            logger.debug("session message persist skipped: %s", exc)
 
 
 def end_persistent_session_hooks(workspace: Path | None) -> None:

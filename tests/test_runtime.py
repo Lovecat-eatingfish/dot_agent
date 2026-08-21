@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from mokioclaw.orchestration.agent import create_runtime
@@ -190,11 +191,16 @@ def test_stream_agent_events_writes_trace_summary_on_finish(monkeypatch, tmp_pat
         )
     )
 
-    trace_events = [event["event"] for event in events if event.get("type") == "custom_event" and event["event"].get("type") == "trace_summary"]
-    assert trace_events
-    assert trace_events[-1]["status"] == "finished"
-    assert trace_events[-1]["tool_calls"] == 1
-    assert (tmp_path / ".mokioclaw" / "executions").exists()
+    # trace 不再通过流返回，而是写入 events.jsonl
+    exec_dir = tmp_path / ".mokioclaw" / "executions"
+    assert exec_dir.exists()
+    events_files = list(exec_dir.glob("*/events.jsonl"))
+    assert events_files
+    lines = events_files[0].read_text(encoding="utf-8").strip().splitlines()
+    run_end = next((json.loads(l) for l in lines if json.loads(l).get("type") == "run_end"), None)
+    assert run_end is not None
+    assert run_end["payload"]["status"] == "finished"
+    assert run_end["payload"]["tool_calls"] == 1
 
 
 def test_stream_agent_events_checkpoints_only_at_safety_points(monkeypatch, tmp_path: Path) -> None:
@@ -258,10 +264,16 @@ def test_stream_agent_events_writes_trace_summary_on_keyboard_interrupt(monkeypa
         )
     )
 
-    trace_events = [event["event"] for event in events if event.get("type") == "custom_event" and event["event"].get("type") == "trace_summary"]
-    assert trace_events
-    assert trace_events[-1]["status"] == "interrupted"
-    assert trace_events[-1]["node_visits"] == {"planner": 1}
+    # trace 写入 events.jsonl
+    exec_dir = tmp_path / ".mokioclaw" / "executions"
+    assert exec_dir.exists()
+    events_files = list(exec_dir.glob("*/events.jsonl"))
+    assert events_files
+    lines = events_files[0].read_text(encoding="utf-8").strip().splitlines()
+    run_end = next((json.loads(l) for l in lines if json.loads(l).get("type") == "run_end"), None)
+    assert run_end is not None
+    assert run_end["payload"]["status"] == "interrupted"
+    assert run_end["payload"]["node_visits"] == {"planner": 1}
 
 
 def test_stream_agent_events_trace_off_creates_no_trace_dir(monkeypatch, tmp_path: Path) -> None:
@@ -343,7 +355,7 @@ def test_stream_agent_events_resume_skips_entry_router(monkeypatch, tmp_path: Pa
     assert any(e.get("type") == "session_resumed" for e in custom_events)
 
 
-def test_stream_session_events_chat_writes_session_without_harness(monkeypatch, tmp_path: Path) -> None:
+def test_stream_session_events_chat_writes_session_without_harness(monkeypatch) -> None:
     from mokioclaw.orchestration.agent import stream_session_events
     from mokioclaw.reliability.session_store import get_latest_session
 
@@ -361,7 +373,8 @@ def test_stream_session_events_chat_writes_session_without_harness(monkeypatch, 
     monkeypatch.setattr("mokioclaw.orchestration.agent.build_entry_workflow", lambda: FakeEntryWorkflow())
     monkeypatch.setattr("mokioclaw.orchestration.agent.build_complex_workflow", fail_complex_workflow)
 
-    events = list(stream_session_events("你好", session_workspace=tmp_path, checkpoint_mode="light", trace_mode="on", approval_mode="deny"))
+    tmp_path = Path(r'D:\桌面\test\test\test_01')
+    events = list(stream_session_events("你是谁", session_workspace=tmp_path, checkpoint_mode="light", trace_mode="on", approval_mode="deny"))
 
     custom_types = [event["event"]["type"] for event in events if event.get("type") == "custom_event"]
     assert "session_started" in custom_types

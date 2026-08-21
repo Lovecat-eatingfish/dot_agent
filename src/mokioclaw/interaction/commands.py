@@ -770,34 +770,43 @@ def _cost_command(workspace: Path | None) -> CommandResult:
     if trace_root.exists():
         trace_dirs = sorted(trace_root.iterdir(), reverse=True)
         for idx, trace_dir in enumerate(trace_dirs):
-            summary_path = trace_dir / "summary.json"
-            if not summary_path.exists():
+            events_path = trace_dir / "events.jsonl"
+            if not events_path.exists():
                 continue
             try:
-                data = json.loads(summary_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    trace_count += 1
-                    p = int(data.get("prompt_tokens", 0))
-                    c = int(data.get("completion_tokens", 0))
-                    total_prompt += p
-                    total_completion += c
-                    total_tokens += int(data.get("total_tokens", 0)) or (p + c)
-                    tool_calls += int(data.get("tool_calls", 0))
-                    # 新 summary 直接有 cost_usd；旧 summary 按 token 估算
-                    cost = float(data.get("cost_usd", 0) or 0)
-                    if cost <= 0 and (p or c):
-                        from mokioclaw.reliability.cost import estimate_cost_usd
-                        cost = estimate_cost_usd(str(data.get("model", "")), p, c)
-                    total_cost += cost
-                    if idx == 0:
-                        latest_cost = cost
-                        latest_tokens = int(data.get("total_tokens", 0)) or (p + c)
-                        latest_name = str(data.get("model", ""))
-                    model = str(data.get("model", "") or "(unknown)")
-                    entry = per_model.setdefault(model, {"prompt": 0, "completion": 0, "cost": 0.0})
-                    entry["prompt"] += p
-                    entry["completion"] += c
-                    entry["cost"] += cost
+                events = [json.loads(line) for line in events_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+                if not events:
+                    continue
+                trace_count += 1
+                p, c = 0, 0
+                model_name = ""
+                for ev in events:
+                    evt = ev.get("type", "")
+                    payload = ev.get("payload", {}) if isinstance(ev.get("payload"), dict) else {}
+                    if evt == "token_usage":
+                        p += int(payload.get("prompt_tokens", 0) or 0)
+                        c += int(payload.get("completion_tokens", 0) or 0)
+                    elif evt == "run_start":
+                        model_name = str(payload.get("model", "") or "")
+                total_prompt += p
+                total_completion += c
+                total_tokens += p + c
+                tc = sum(1 for ev in events if ev.get("type", "").startswith("custom:tool_call"))
+                tool_calls += tc
+                cost = 0.0
+                if p or c:
+                    from mokioclaw.reliability.cost import estimate_cost_usd
+                    cost = estimate_cost_usd(model_name or active_model_name(), p, c)
+                total_cost += cost
+                if idx == 0:
+                    latest_cost = cost
+                    latest_tokens = p + c
+                    latest_name = model_name
+                model = model_name or "(unknown)"
+                entry = per_model.setdefault(model, {"prompt": 0, "completion": 0, "cost": 0.0})
+                entry["prompt"] += p
+                entry["completion"] += c
+                entry["cost"] += cost
             except Exception:
                 continue
     lines = [

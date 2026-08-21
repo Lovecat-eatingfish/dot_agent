@@ -108,6 +108,7 @@ def run_code_agent(
 
     messages = [
         SystemMessage(content=builder.build("code_agent")),
+        *state.get("messages", []),
         HumanMessage(content=_code_agent_input(state, instruction, memory)),
     ]
     produced_messages: list[Any] = []

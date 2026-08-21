@@ -5,6 +5,15 @@
 - 保存轮次检查点
 - 按轮次回溯
 - 按 session 恢复
+
+目录结构：
+  sessions/
+  ├── index.json                      # 所有 session 的索引列表
+  ├── session-{id}.json               # 单会话 messages[]（全量累积）
+  └── session-{id}/
+      ├── turn-001.json               # 轮次 state_summary + git_commit_id
+      ├── turn-002.json
+      └── ...
 """
 
 from __future__ import annotations
@@ -15,6 +24,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from mokioclaw.core.log import get_logger
 from mokioclaw.core.utils import truncate, utc_now
 from mokioclaw.reliability.checkpoint import serialize_message, deserialize_messages, snapshot_workspace_git, snapshots_dir
@@ -25,12 +35,14 @@ logger = get_logger(__name__)
 # 存储路径常量
 SESSIONS_ROOT = Path(".mokioclaw") / "sessions"
 SESSION_INDEX_FILE = "index.json"
-SESSION_FILE = "session.json"
-TURNS_DIR = "turns"
 
 # 默认限制（可配置）
 DEFAULT_MAX_SESSIONS = 100
 DEFAULT_MAX_TURNS = 200
+
+# session ID 生成：同一秒内创建多个 session 时用计数器避免冲突
+_session_id_counter: int = 0
+_session_id_second: str = ""
 
 
 def sessions_dir(workspace: Path) -> Path:
@@ -44,8 +56,20 @@ def session_index_path(workspace: Path) -> Path:
 
 
 def generate_session_id() -> str:
-    """生成 session ID"""
-    return f"session-{uuid4().hex[:8]}"
+    """生成基于时间戳的 session ID（按时间排序，方便识别）
+
+    同一秒内创建多个 session 时追加计数器避免冲突。
+    """
+    global _session_id_counter, _session_id_second
+    from datetime import datetime, timezone
+    now_str = datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')
+    if now_str != _session_id_second:
+        _session_id_second = now_str
+        _session_id_counter = 0
+    _session_id_counter += 1
+    if _session_id_counter > 1:
+        return f"session-{now_str}-{_session_id_counter}"
+    return f"session-{now_str}"
 
 
 def generate_turn_id(turn: int) -> str:
@@ -69,7 +93,7 @@ def _load_index(workspace: Path) -> dict[str, Any]:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """原子写：tmp 文件 + os.replace，避免并发写产生半截 JSON（损坏 index 会连锁清空全部索引）"""
+    """原子写：tmp 文件 + os.replace，避免并发写产生半截 JSON"""
     import os
 
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -88,7 +112,6 @@ def _update_index(workspace: Path, session_id: str, summary: dict[str, Any]) -> 
     index = _load_index(workspace)
     sessions = index.get("sessions", [])
 
-    # 查找并更新，或新增
     found = False
     for i, s in enumerate(sessions):
         if s.get("session_id") == session_id:
@@ -99,7 +122,6 @@ def _update_index(workspace: Path, session_id: str, summary: dict[str, Any]) -> 
     if not found:
         sessions.append(summary)
 
-    # 按 updated_at 降序排列
     sessions.sort(key=lambda s: s.get("updated_at", ""), reverse=True)
 
     index["sessions"] = sessions
@@ -126,23 +148,12 @@ def create_session(workspace: Path, task: str = "", session_id: str | None = Non
 
     session = {
         "session_id": sid,
-        "workspace": str(workspace),
-        "created_at": now,
-        "updated_at": now,
-        "turn_index": 0,
         "task": task,
+        "turn_index": 0,
         "messages": [],
-        "turns": [],
-        "latest_checkpoint": None,
-        "status": "running",
     }
 
-    # 创建 session 目录
-    session_path = _session_dir(workspace, sid)
-    session_path.mkdir(parents=True, exist_ok=True)
-    (session_path / TURNS_DIR).mkdir(exist_ok=True)
-
-    # 保存 session.json
+    # 保存 session 文件（sessions/session-{id}.json）
     _save_session_file(workspace, sid, session)
 
     # 更新索引
@@ -180,18 +191,10 @@ def load_session(workspace: Path, session_id: str) -> dict[str, Any] | None:
 
 
 def get_latest_session(workspace: Path) -> dict[str, Any] | None:
-    """获取最新 session
-
-    Args:
-        workspace: 工作区路径
-
-    Returns:
-        最新的 session 数据字典，无 session 返回 None
-    """
+    """获取最新 session"""
     index = _load_index(workspace)
     latest_id = index.get("latest")
     if not latest_id:
-        # 尝试从 sessions 列表获取
         sessions = index.get("sessions", [])
         if sessions:
             latest_id = sessions[0].get("session_id")
@@ -203,27 +206,14 @@ def get_latest_session(workspace: Path) -> dict[str, Any] | None:
 
 
 def list_sessions(workspace: Path, limit: int = 50) -> list[dict[str, Any]]:
-    """列出所有 session
-
-    Args:
-        workspace: 工作区路径
-        limit: 最大返回数量
-
-    Returns:
-        session 摘要列表，按更新时间降序
-    """
+    """列出所有 session"""
     index = _load_index(workspace)
     sessions = index.get("sessions", [])
     return sessions[:limit]
 
 
 def save_session(workspace: Path, session: dict[str, Any]) -> None:
-    """保存 session 数据
-
-    Args:
-        workspace: 工作区路径
-        session: session 数据字典
-    """
+    """保存 session 数据"""
     session_id = session.get("session_id")
     if not session_id:
         return
@@ -231,7 +221,6 @@ def save_session(workspace: Path, session: dict[str, Any]) -> None:
     session["updated_at"] = utc_now()
     _save_session_file(workspace, session_id, session)
 
-    # 更新索引
     _update_index(workspace, session_id, {
         "session_id": session_id,
         "task": session.get("task", "")[:200],
@@ -246,19 +235,10 @@ def save_session(workspace: Path, session: dict[str, Any]) -> None:
 
 
 def append_user_turn(workspace: Path, session: dict[str, Any], content: str) -> int:
-    """添加用户轮次
-
-    Args:
-        workspace: 工作区路径
-        session: session 数据字典
-        content: 用户输入内容
-
-    Returns:
-        轮次号
-    """
+    """添加用户轮次"""
     turn = int(session.get("turn_index", 0)) + 1
     session["turn_index"] = turn
-    session["task"] = content[:500]  # 更新当前任务
+    session["task"] = content[:500]
 
     turn_data = {
         "turn": turn,
@@ -284,23 +264,14 @@ def append_assistant_turn(
     summary: str = "",
     state_summary: PersistedState | None = None,
 ) -> None:
-    """添加 assistant 轮次
-
-    Args:
-        workspace: 工作区路径
-        session: session 数据字典
-        turn: 轮次号
-        content: assistant 回复内容
-        tool_calls: 工具调用列表
-        summary: 摘要
-    """
+    """添加 assistant 轮次"""
     turn_data = {
         "turn": turn,
         "role": "assistant",
         "content": content,
         "tool_calls": tool_calls or [],
         "summary": summary or content[:500],
-        "state_summary": _build_state_summary(state_summary or {}) if state_summary else {},
+        "state_summary": _build_state_summary(state_summary) if state_summary else {},
         "timestamp": utc_now(),
     }
 
@@ -326,16 +297,8 @@ def save_turn_checkpoint(
 ) -> dict[str, Any]:
     """保存轮次检查点
 
-    Args:
-        workspace: 工作区路径
-        session: session 数据字典
-        turn: 轮次号
-        task: 本轮任务
-        state: 可选的状态快照
-        turn_messages: 本轮的 messages 列表（用于 rewind）
-
-    Returns:
-        检查点数据
+    turn 文件仅存 state_summary + git_commit_id，不存 messages。
+    messages 单独存放在 session-{id}.json 中。
     """
     session_id = session.get("session_id")
     turn_id = generate_turn_id(turn)
@@ -344,10 +307,7 @@ def save_turn_checkpoint(
     # 先 Git commit 用户项目代码，获取 commit hash
     git_commit = _snapshot_git(workspace, session_id)
 
-    # 序列化本轮 messages
-    serialized_messages = [serialize_message(m) for m in (turn_messages or [])]
-
-    # 构建检查点数据
+    # 构建检查点数据（不包含 messages）
     checkpoint = {
         "turn": turn,
         "turn_id": turn_id,
@@ -355,12 +315,11 @@ def save_turn_checkpoint(
         "session_id": session_id,
         "task": task,
         "git_commit_id": git_commit,
-        "trace_id": getattr(state.get("runtime") if state else None, "trace_id", None) if state else None,
-        "state_summary": _build_state_summary(state) if state else None,
-        "messages": serialized_messages,
+        "trace_id": getattr((state or {}).get("runtime"), "trace_id", None) if state else None,
+        "state_summary": _build_state_summary(state or {}),
     }
 
-    # 保存检查点文件
+    # 保存检查点文件到 sessions/session-{id}/turn-00N.json
     checkpoint_path = _turn_file_path(workspace, session_id, turn_id)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     checkpoint_path.write_text(
@@ -381,16 +340,7 @@ def load_turn_checkpoint(
     session_id: str,
     turn: int,
 ) -> dict[str, Any] | None:
-    """加载轮次检查点
-
-    Args:
-        workspace: 工作区路径
-        session_id: session ID
-        turn: 轮次号
-
-    Returns:
-        检查点数据，不存在返回 None
-    """
+    """加载轮次检查点"""
     turn_id = generate_turn_id(turn)
     path = _turn_file_path(workspace, session_id, turn_id)
     if not path.exists():
@@ -403,21 +353,13 @@ def load_turn_checkpoint(
 
 
 def list_turn_checkpoints(workspace: Path, session_id: str) -> list[dict[str, Any]]:
-    """列出 session 的所有轮次检查点
-
-    Args:
-        workspace: 工作区路径
-        session_id: session ID
-
-    Returns:
-        检查点列表，按轮次号升序
-    """
-    checkpoints_dir = _turns_dir(workspace, session_id)
-    if not checkpoints_dir.exists():
+    """列出 session 的所有轮次检查点"""
+    session_dir = _session_dir(workspace, session_id)
+    if not session_dir.exists():
         return []
 
     checkpoints = []
-    for path in sorted(checkpoints_dir.glob("turn-*.json")):
+    for path in sorted(session_dir.glob("turn-*.json")):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(data, dict):
@@ -435,17 +377,7 @@ def rollback_to_turn(
     turn: int,
     restore_files: bool = True,
 ) -> dict[str, Any] | None:
-    """回滚到指定轮次
-
-    Args:
-        workspace: 工作区路径
-        session_id: session ID
-        turn: 目标轮次号
-        restore_files: 是否恢复工作区文件
-
-    Returns:
-        目标轮次的检查点数据，失败返回 None
-    """
+    """回滚到指定轮次"""
     checkpoint = load_turn_checkpoint(workspace, session_id, turn)
     if not checkpoint:
         logger.error("checkpoint not found for session %s turn %d", session_id, turn)
@@ -459,13 +391,11 @@ def rollback_to_turn(
             if not success:
                 logger.warning("git restore failed for session %s", session_id)
 
-    # 更新 session：删除目标轮次之后的所有轮次
+    # 截断 session 的 messages 到目标轮次
     session = load_session(workspace, session_id)
     if session:
-        turns = session.get("turns", [])
-        session["turns"] = [t for t in turns if t.get("turn", 0) <= turn]
-        # 截断 messages 到目标轮次：重新加载 0→turn 的 messages
-        session["messages"] = _serialize_message_list(load_turns_up_to(workspace, session_id, turn))
+        messages = session.get("messages", [])
+        session["messages"] = [m for m in messages if m.get("turn", 0) <= turn]
         session["turn_index"] = turn
         session["latest_checkpoint"] = generate_turn_id(turn)
         save_session(workspace, session)
@@ -481,64 +411,67 @@ def append_messages_to_session(
     workspace: Path,
     session: dict[str, Any],
     messages: list[Any],
+    turn: int = 0,
 ) -> None:
-    """将本轮新增 messages append 到 session.json 的 messages[] 中
+    """将本轮新增 messages append 到 session-{id}.json 的 messages[] 中
+
+    每个序列化后的 message 会附加 "turn" 字段，以便 rewind 时按轮次过滤。
 
     Args:
         workspace: 工作区路径
         session: session 数据字典
         messages: 本轮新增的消息列表（BaseMessage 对象）
+        turn: 当前轮次号
     """
     existing = session.get("messages", [])
-    serialized = existing + [serialize_message(m) for m in messages]
+    serialized = existing + [
+        {**serialize_message(m), "turn": turn}
+        for m in messages
+    ]
     session["messages"] = serialized
     save_session(workspace, session)
 
 
 def load_turns_up_to(workspace: Path, session_id: str, target_turn: int) -> list[BaseMessage]:
-    """加载 turn-0 到 target_turn 的所有 messages，返回完整 message list
-
-    用于 rewind：按顺序加载每个 turn 的 messages，拼回全局 message list。
-
-    Args:
-        workspace: 工作区路径
-        session_id: session ID
-        target_turn: 目标轮次号
-
-    Returns:
-        累积的 BaseMessage 列表
-    """
-    all_messages: list[BaseMessage] = []
-    for n in range(1, target_turn + 1):
-        turn_id = generate_turn_id(n)
-        turn_file = _turn_file_path(workspace, session_id, turn_id)
-        if not turn_file.exists():
-            continue
-        try:
-            data = json.loads(turn_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                raw_msgs = data.get("messages", [])
-                all_messages.extend(deserialize_messages(raw_msgs))
-        except (OSError, json.JSONDecodeError):
-            continue
-    return all_messages
-
-
-def load_session_messages(workspace: Path, session_id: str) -> list[BaseMessage]:
-    """加载 session 的完整 messages[] 用于 resume
-
-    Args:
-        workspace: 工作区路径
-        session_id: session ID
-
-    Returns:
-        完整的 BaseMessage 列表
-    """
+    """加载 turn <= target_turn 的所有消息（测试用 messages[]，实际用 turns[]）"""
     session = load_session(workspace, session_id)
     if not session:
         return []
     raw = session.get("messages", [])
-    return deserialize_messages(raw)
+    if raw:
+        filtered = [m for m in raw if m.get("turn", 0) <= target_turn]
+        return deserialize_messages(filtered)
+    turns = session.get("turns", [])
+    filtered = [_turn_to_message(t) for t in turns if t.get("turn", 0) <= target_turn]
+    return [m for m in filtered if m is not None]
+
+
+def load_session_messages(workspace: Path, session_id: str) -> list[BaseMessage]:
+    """加载 session 的完整消息列表用于 resume（测试用 messages[]，实际用 turns[]）"""
+    session = load_session(workspace, session_id)
+    if not session:
+        return []
+    raw = session.get("messages", [])
+    if raw:
+        return deserialize_messages(raw)
+    turns = session.get("turns", [])
+    messages = [_turn_to_message(t) for t in turns]
+    return [m for m in messages if m is not None]
+
+
+def _turn_to_message(turn: dict[str, Any]) -> BaseMessage | None:
+    """将 turns[] 中的一条记录转为 LangChain BaseMessage"""
+    role = str(turn.get("role", ""))
+    content = str(turn.get("content", ""))
+    if not role or content is None:
+        return None
+    if role == "user":
+        return HumanMessage(content=content)
+    if role == "assistant":
+        return AIMessage(content=content)
+    if role == "tool":
+        return ToolMessage(content=content, tool_call_id=str(turn.get("tool_call_id", "")))
+    return None
 
 
 def _serialize_message_list(messages: list[BaseMessage]) -> list[dict[str, Any]]:
@@ -566,19 +499,7 @@ def interrupt_session(workspace: Path, session_id: str) -> None:
 
 
 def fork_session(workspace: Path, source_session_id: str, *, task: str = "") -> dict[str, Any] | None:
-    """从已有 session 创建分支
-
-    复制源 session 的 turns 和 checkpoint，生成新的 session ID。
-    新 session 状态为 running，可以独立继续。
-
-    Args:
-        workspace: 工作区路径
-        source_session_id: 源 session ID
-        task: 可选的新任务描述，默认继承源 session
-
-    Returns:
-        新 session 数据字典，源不存在返回 None
-    """
+    """从已有 session 创建分支"""
     source = load_session(workspace, source_session_id)
     if not source:
         logger.error("fork source session not found: %s", source_session_id)
@@ -590,11 +511,8 @@ def fork_session(workspace: Path, source_session_id: str, *, task: str = "") -> 
 
     forked = {
         "session_id": new_sid,
-        "workspace": str(workspace),
-        "created_at": now,
-        "updated_at": now,
-        "turn_index": source.get("turn_index", 0),
         "task": inherited_task,
+        "turn_index": source.get("turn_index", 0),
         "messages": list(source.get("messages", [])),
         "turns": list(source.get("turns", [])),
         "latest_checkpoint": source.get("latest_checkpoint"),
@@ -602,18 +520,16 @@ def fork_session(workspace: Path, source_session_id: str, *, task: str = "") -> 
         "forked_from": source_session_id,
     }
 
-    session_path = _session_dir(workspace, new_sid)
-    session_path.mkdir(parents=True, exist_ok=True)
-    (session_path / TURNS_DIR).mkdir(exist_ok=True)
-
-    source_turns_dir = _turns_dir(workspace, source_session_id)
-    if source_turns_dir.exists():
-        import shutil
-        target_turns_dir = _turns_dir(workspace, new_sid)
-        for ckpt_file in source_turns_dir.glob("*.json"):
-            shutil.copy2(ckpt_file, target_turns_dir / ckpt_file.name)
-
+    # 保存新 session 文件
     _save_session_file(workspace, new_sid, forked)
+
+    # 复制 turn 目录
+    source_dir = _session_dir(workspace, source_session_id)
+    target_dir = _session_dir(workspace, new_sid)
+    if source_dir.exists():
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for ckpt_file in source_dir.glob("*.json"):
+            shutil.copy2(ckpt_file, target_dir / ckpt_file.name)
 
     _update_index(workspace, new_sid, {
         "session_id": new_sid,
@@ -632,27 +548,22 @@ def fork_session(workspace: Path, source_session_id: str, *, task: str = "") -> 
 
 
 def _session_dir(workspace: Path, session_id: str) -> Path:
-    """获取 session 目录路径"""
+    """返回 session 的 turn 目录路径: sessions/session-{id}/"""
     return sessions_dir(workspace) / session_id
 
 
 def _session_file_path(workspace: Path, session_id: str) -> Path:
-    """获取 session.json 文件路径"""
-    return _session_dir(workspace, session_id) / SESSION_FILE
-
-
-def _turns_dir(workspace: Path, session_id: str) -> Path:
-    """获取轮次目录路径"""
-    return _session_dir(workspace, session_id) / TURNS_DIR
+    """返回 session-{id}.json 文件路径（存 messages[]）"""
+    return sessions_dir(workspace) / f"{session_id}.json"
 
 
 def _turn_file_path(workspace: Path, session_id: str, turn_id: str) -> Path:
-    """获取轮次检查点文件路径"""
-    return _turns_dir(workspace, session_id) / f"{turn_id}.json"
+    """返回 turn 文件路径: sessions/session-{id}/turn-{id}.json（存 state_summary + git_commit_id）"""
+    return _session_dir(workspace, session_id) / f"{turn_id}.json"
 
 
 def _save_session_file(workspace: Path, session_id: str, session: dict[str, Any]) -> None:
-    """保存 session.json 文件"""
+    """保存 session-{id}.json 文件"""
     _atomic_write_text(
         _session_file_path(workspace, session_id),
         json.dumps(session, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -726,40 +637,17 @@ def _continuation_hint(session: dict[str, Any], last_state: dict[str, Any]) -> s
 
 
 def _build_state_summary(state: dict[str, Any]) -> PersistedState:
-    """构建状态摘要（PersistedState：仅含跨轮恢复所需的字段）"""
-    checks = state.get("verification_checks", []) or []
-    compression = state.get("compression_events", []) or []
-    handoffs = state.get("agent_handoffs", []) or []
-    handoff_str = "; ".join(
-        f"{h.get('from_agent','')}->{h.get('to_agent','')}: {truncate(str(h.get('instruction','')), 120)}"
-        for h in handoffs[:5]
-    ) if isinstance(handoffs, list) else str(handoffs)
+    """构建状态摘要（PersistedState：仅含跨轮恢复所需的最简字段）
 
+    其余信息从 messages[] 中重建。
+    """
     return {
-        "plan_summary": truncate(str(state.get("plan_summary", "")), 1000),
-        "todos": state.get("todos", [])[:20],
-        "acceptance_criteria": state.get("acceptance_criteria", [])[:20],
-        "verification_commands": state.get("verification_commands", [])[:20],
-        "verification_checks": checks[:20],
+        "task": truncate(str(state.get("task", "")), 1000),
         "passed": state.get("passed"),
         "attempts": state.get("attempts", 0),
-        "verifier_summary": truncate(str(state.get("verifier_summary", "")), 1000),
         "repair_instruction": truncate(str(state.get("repair_instruction", "")), 1000),
         "last_error": truncate(str(state.get("last_error", "")), 1000),
-        "trace_id": getattr(state.get("runtime"), "trace_id", None) if state.get("runtime") is not None else state.get("trace_id"),
-        "messages_count": len(state.get("messages", [])),
-        # 新增：上下文压缩
-        "context_summary": truncate(str(state.get("context_summary", "")), 1000),
-        "history_summary": truncate(str(state.get("history_summary", "")), 1000),
-        "compression_events": compression[:10],
-        # 新增：智能体交互
-        "research_notes": truncate(str(state.get("research_notes", "")), 1000),
-        "sources": state.get("sources", [])[:10],
-        "agent_handoffs": handoff_str,
-        "code_agent_summary": truncate(str(state.get("code_agent_summary", "") or state.get("last_actor_summary", "")), 1000),
-        "search_agent_summary": truncate(str(state.get("search_agent_summary", "")), 1000),
-        # 新增：校验结果
-        "verification_results": state.get("verification_results", [])[:20],
+        "final_answer": truncate(str(state.get("final_answer", "")), 1000),
     }
 
 
@@ -771,16 +659,7 @@ def _snapshot_git(workspace: Path, session_id: str) -> str | None:
 
 
 def _restore_git(workspace: Path, session_id: str, commit: str) -> bool:
-    """从 Git 快照恢复工作区（使用共享仓库）
-
-    Args:
-        workspace: 工作区路径
-        session_id: session ID
-        commit: 目标 commit hash
-
-    Returns:
-        是否成功
-    """
+    """从 Git 快照恢复工作区"""
     import shutil as sh
 
     if sh.which("git") is None:

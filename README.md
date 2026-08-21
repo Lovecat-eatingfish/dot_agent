@@ -168,7 +168,6 @@ Python >= 3.13
 2 如果用户需要 resume 会话的话，比如cluade --rsume sesssion_xxxx 直接加载这个session_xxx 下面的所有turn_xx 的文件保留到全局的message list中，用来恢复上下文
 
 3. 每轮对话都需要进行提示词的拼接， 但是项目里面有plan agent 这个应该不需要拼接啥提示词， 主要就是code agent ， 这个需要进行 提示词的动静分裂： 静态提示词：（用户偏好，反馈，还有类似于claude.md 的文件 + 系统工具说明）， 动态方面： skill 的描述， mcp 的所有工具的描述， skill 和mcp 都要渐进式纰漏， 一开始给system promt 放的都是简陋的， 比如mcp 的tool 只会存放函数name和函数描述，参数定义不会放，因为太多了占用提示词的token，导致token膨胀， skill也是一样的， 只给skill的name 和 skill 的skill.md 的desc部分， ai 返回的内容 类型规定可以为： type： mcp， skill，tool 如果是mcp 就根据mcp 的tool的name 找到这个函数的准确定义 再给ai，让他进行一次tool的调用， skill也是类型， 所以tool的调用你估计需要做一下 这个mcp 工具和系统工具的区分， 可以给mcp的工具添加统一前缀  mcp_xxxxx, 给大模型mcp tool name的时候可以加上mcp
-   的前缀保持一致。 mcp 和skil的加载的路由和hook一样就好了
+的前缀保持一致。 mcp 和skil的加载的路由和hook一样就好了
 4. 项目的hook机制你做的很好 不需要改
-5. 还有就是链路追踪这个问题， 我的意思是 在每轮的开始 构建一个大的traceId，后面每个调用都生成子traceId 这个 子traceId 可以递增 和时间戳一样， 需要让前端可以分析出来 这个trace链路， 参考那个sky wark那个链路追踪的 就好了，简易版本的就好了，每个链路可以保存的数据多一点，可以就是这个state的数据 再加上当前节点 + 调用时间长短 等元数据
-6. 
+5. 还有就是链路追踪这个问题，我的意思是 在每轮的开始 构建一个大的traceId，后面每个调用都生成子traceId 这个 子traceId 可以递增 和时间戳一样， 需要让前端可以分析出来 这个trace链路， 参考那个sky wark那个链路追踪的 就好了，简易版本的就好了，每个链路可以保存的数据多一点，可以就是这个state的数据 再加上当前节点 + 调用时间长短 等元数据

@@ -80,6 +80,7 @@ def run_search_agent(
     search_agent = model.bind_tools([search_tool])
     messages = [
         SystemMessage(content=builder.build("search_agent")),
+        *state.get("messages", []),
         HumanMessage(
             content=(
                 f"Task: {state['task']}\n\n"

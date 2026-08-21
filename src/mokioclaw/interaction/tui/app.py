@@ -759,14 +759,16 @@ Agent全部执行完毕
         status = "finished"
         try:
             approval_handler = self._approval_handler if self.approval_mode == "inline" else None
-            # resume 参数兼容三种形态：Path（workspace 路径）、"session-xxx"、None（续接当前 workspace 最新 session）
-            resume_arg = resume if resume is not None else self.resume
-            resume_ws = resume_arg if isinstance(resume_arg, Path) else None
-            resume_sid = resume_arg if isinstance(resume_arg, str) and resume_arg.startswith("session-") else None
-            # 多轮连续对话：未显式指定恢复目标时，续接当前 workspace 的最新 session，
-            # 而不是每轮新建 session（否则会话历史被碎片化）
-            if resume_ws is None and resume_sid is None:
-                resume_ws = self.session_workspace
+            # /new 后 self.session_id 为空，此时不自动恢复，创建全新 session
+            if not self.session_id:
+                resume_ws = None
+                resume_sid = None
+            else:
+                resume_arg = resume if resume is not None else self.resume
+                resume_ws = resume_arg if isinstance(resume_arg, Path) else None
+                resume_sid = resume_arg if isinstance(resume_arg, str) and resume_arg.startswith("session-") else None
+                if resume_ws is None and resume_sid is None:
+                    resume_ws = self.session_workspace
             # 调用stream_session_events()拿到 agent 事件生成器；
             for event in self.stream_factory(
                     task,

@@ -37,7 +37,7 @@ def test_append_messages_to_session_persists_serialized(tmp_path: Path) -> None:
     append_messages_to_session(tmp_path, session, messages)
 
     # Reload from disk
-    reloaded = json.loads((tmp_path / ".mokioclaw" / "sessions" / session["session_id"] / "session.json").read_text())
+    reloaded = json.loads((tmp_path / ".mokioclaw" / "sessions" / f"{session['session_id']}.json").read_text())
     assert len(reloaded["messages"]) == 2
     assert reloaded["messages"][0]["type"] == "human"
     assert reloaded["messages"][1]["type"] == "ai"
@@ -49,13 +49,13 @@ def test_append_messages_twice_accumulates(tmp_path: Path) -> None:
     append_messages_to_session(tmp_path, session, [HumanMessage(content="turn 1")])
     append_messages_to_session(tmp_path, session, [AIMessage(content="turn 2")])
 
-    reloaded = json.loads((tmp_path / ".mokioclaw" / "sessions" / session["session_id"] / "session.json").read_text())
+    reloaded = json.loads((tmp_path / ".mokioclaw" / "sessions" / f"{session['session_id']}.json").read_text())
     assert len(reloaded["messages"]) == 2
     assert reloaded["messages"][0]["data"]["content"] == "turn 1"
     assert reloaded["messages"][1]["data"]["content"] == "turn 2"
 
 
-def test_save_turn_checkpoint_includes_messages_and_git_commit_id(tmp_path: Path) -> None:
+def test_save_turn_checkpoint_includes_state_and_git_commit_id(tmp_path: Path) -> None:
     session = create_session(tmp_path, "test task")
     messages = [HumanMessage(content="turn message")]
     checkpoint = save_turn_checkpoint(
@@ -63,24 +63,26 @@ def test_save_turn_checkpoint_includes_messages_and_git_commit_id(tmp_path: Path
         turn_messages=messages,
     )
 
-    turn_file = tmp_path / ".mokioclaw" / "sessions" / session["session_id"] / "turns" / "turn-001.json"
+    turn_file = tmp_path / ".mokioclaw" / "sessions" / session["session_id"] / "turn-001.json"
     assert turn_file.exists()
     data = json.loads(turn_file.read_text())
     assert data["turn"] == 1
     assert "git_commit_id" in data
-    assert len(data["messages"]) == 1
-    assert data["messages"][0]["type"] == "human"
-    assert data["messages"][0]["data"]["content"] == "turn message"
+    assert data["state_summary"] is not None
+    # turn 文件不再存储 messages（messages 存在 session-{id}.json 中）
 
 
-def test_save_turn_checkpoint_without_messages(tmp_path: Path) -> None:
+def test_save_turn_checkpoint_state_only(tmp_path: Path) -> None:
     session = create_session(tmp_path, "test task")
     checkpoint = save_turn_checkpoint(tmp_path, session, 1, "test task")
 
-    turn_file = tmp_path / ".mokioclaw" / "sessions" / session["session_id"] / "turns" / "turn-001.json"
+    turn_file = tmp_path / ".mokioclaw" / "sessions" / session["session_id"] / "turn-001.json"
     assert turn_file.exists()
     data = json.loads(turn_file.read_text())
-    assert data["messages"] == []
+    assert data["turn"] == 1
+    assert "git_commit_id" in data
+    assert data["state_summary"] is not None
+    # turn 文件只存 state_summary + git_commit_id，不存 messages
 
 
 # ============ load_turns_up_to ============
@@ -89,7 +91,8 @@ def test_save_turn_checkpoint_without_messages(tmp_path: Path) -> None:
 def test_load_turns_up_to_single_turn(tmp_path: Path) -> None:
     session = create_session(tmp_path, "test task")
     msgs = [HumanMessage(content="q1"), AIMessage(content="a1")]
-    save_turn_checkpoint(tmp_path, session, 1, "q1", turn_messages=msgs)
+    append_messages_to_session(tmp_path, session, msgs, turn=1)
+    save_turn_checkpoint(tmp_path, session, 1, "q1")
 
     loaded = load_turns_up_to(tmp_path, session["session_id"], 1)
     assert len(loaded) == 2
@@ -99,8 +102,10 @@ def test_load_turns_up_to_single_turn(tmp_path: Path) -> None:
 
 def test_load_turns_up_to_multiple_turns(tmp_path: Path) -> None:
     session = create_session(tmp_path, "test task")
-    save_turn_checkpoint(tmp_path, session, 1, "q1", turn_messages=[HumanMessage(content="q1")])
-    save_turn_checkpoint(tmp_path, session, 2, "q2", turn_messages=[HumanMessage(content="q2"), AIMessage(content="a2")])
+    append_messages_to_session(tmp_path, session, [HumanMessage(content="q1")], turn=1)
+    save_turn_checkpoint(tmp_path, session, 1, "q1")
+    append_messages_to_session(tmp_path, session, [HumanMessage(content="q2"), AIMessage(content="a2")], turn=2)
+    save_turn_checkpoint(tmp_path, session, 2, "q2")
 
     loaded = load_turns_up_to(tmp_path, session["session_id"], 2)
     assert len(loaded) == 3
@@ -111,7 +116,8 @@ def test_load_turns_up_to_multiple_turns(tmp_path: Path) -> None:
 
 def test_load_turns_up_to_missing_turn_skips(tmp_path: Path) -> None:
     session = create_session(tmp_path, "test task")
-    save_turn_checkpoint(tmp_path, session, 1, "q1", turn_messages=[HumanMessage(content="q1")])
+    append_messages_to_session(tmp_path, session, [HumanMessage(content="q1")], turn=1)
+    save_turn_checkpoint(tmp_path, session, 1, "q1")
     # turn 2 doesn't exist
 
     loaded = load_turns_up_to(tmp_path, session["session_id"], 3)
@@ -156,13 +162,16 @@ def test_rollback_truncates_messages(tmp_path: Path) -> None:
     from mokioclaw.reliability.session_store import rollback_to_turn
 
     session = create_session(tmp_path, "test task")
-    save_turn_checkpoint(tmp_path, session, 1, "q1", turn_messages=[HumanMessage(content="q1")])
-    save_turn_checkpoint(tmp_path, session, 2, "q2", turn_messages=[HumanMessage(content="q2")])
-    save_turn_checkpoint(tmp_path, session, 3, "q3", turn_messages=[HumanMessage(content="q3")])
+    append_messages_to_session(tmp_path, session, [HumanMessage(content="q1")], turn=1)
+    save_turn_checkpoint(tmp_path, session, 1, "q1")
+    append_messages_to_session(tmp_path, session, [HumanMessage(content="q2")], turn=2)
+    save_turn_checkpoint(tmp_path, session, 2, "q2")
+    append_messages_to_session(tmp_path, session, [HumanMessage(content="q3")], turn=3)
+    save_turn_checkpoint(tmp_path, session, 3, "q3")
 
     rollback_to_turn(tmp_path, session["session_id"], 2)
 
-    reloaded = json.loads((tmp_path / ".mokioclaw" / "sessions" / session["session_id"] / "session.json").read_text())
+    reloaded = json.loads((tmp_path / ".mokioclaw" / "sessions" / f"{session['session_id']}.json").read_text())
     assert reloaded["turn_index"] == 2
     assert reloaded["latest_checkpoint"] == "turn-002"
     assert len(reloaded["messages"]) == 2  # only turns 1 and 2
@@ -293,10 +302,11 @@ def test_trace_recorder_off_mode_no_spans(tmp_path: Path) -> None:
 # ============ PersistedState Expansion ============
 
 
-def test_build_state_summary_includes_new_fields(tmp_path: Path) -> None:
+def test_build_state_summary_is_minimal(tmp_path: Path) -> None:
     from mokioclaw.reliability.session_store import _build_state_summary
 
     state = {
+        "task": "create a web app",
         "plan_summary": "create a web app",
         "todos": [{"id": "1", "content": "setup", "status": "completed", "note": ""}],
         "acceptance_criteria": ["app runs"],
@@ -306,29 +316,22 @@ def test_build_state_summary_includes_new_fields(tmp_path: Path) -> None:
         "verifier_summary": "all tests pass",
         "repair_instruction": "",
         "last_error": "",
-        "context_summary": "compressed context",
-        "history_summary": "previous turns summary",
-        "compression_events": [{"before_tokens": 1000, "after_tokens": 100, "removed_messages": 5, "summary": "compressed", "next_node": "verifier", "strategy": "hard"}],
-        "research_notes": "found React docs",
-        "sources": [{"title": "React", "url": "https://react.dev"}],
-        "agent_handoffs": [{"from_agent": "planner", "to_agent": "codeAgent", "instruction": "build it", "result": "done"}],
-        "code_agent_summary": "created app.py",
-        "search_agent_summary": "searched docs",
-        "last_actor_summary": "codeAgent",
-        "verification_results": [{"command": "npm test", "ok": True, "exit_code": 0, "stdout": "ok", "stderr": ""}],
-        "verification_checks": [{"name": "tests", "passed": True, "detail": "3/3"}],
+        "final_answer": "Done",
     }
 
     summary = _build_state_summary(state)
 
-    assert summary["plan_summary"] == "create a web app"
-    assert summary["context_summary"] == "compressed context"
-    assert summary["history_summary"] == "previous turns summary"
-    assert len(summary["compression_events"]) == 1
-    assert summary["research_notes"] == "found React docs"
-    assert len(summary["sources"]) == 1
-    assert "planner->codeAgent" in summary["agent_handoffs"]
-    assert summary["code_agent_summary"] == "created app.py"
-    assert summary["search_agent_summary"] == "searched docs"
-    assert len(summary["verification_results"]) == 1
-    assert len(summary["verification_checks"]) == 1
+    # PersistedState 收敛到 6 字段
+    assert summary["task"] == "create a web app"
+    assert summary["passed"] is True
+    assert summary["attempts"] == 2
+    assert summary["repair_instruction"] == ""
+    assert summary["last_error"] == ""
+    assert summary["final_answer"] == "Done"
+
+    # 其余字段不再出现在 PersistedState 中（从 messages[] 重建）
+    assert "plan_summary" not in summary
+    assert "todos" not in summary
+    assert "verification_checks" not in summary
+    assert "sources" not in summary
+    assert "compression_events" not in summary

@@ -3,7 +3,7 @@ Agent 运行模式（对齐 Claude Code / docs/agent.md）
 
 模式：
 - auto:    全自动，工具放行；仍拦截明显毁灭性命令（rm -rf / 等）
-- plan:    只规划，写出 id_todo.md，不执行 mutating 工具，等待确认
+- plan:    只规划，plan 存 state/messages，不执行 mutating 工具，等待确认
 - approve: 每个高危工具（edit/write/bash/MCP 写）都需人工审批
 - edit:    只允许文件读写类工具，禁用 bash、网络 MCP 等
 - bypass:  跳过审批（对齐 Claude Code bypassPermissions），但毁灭性命令仍硬拦
@@ -118,7 +118,7 @@ def check_tool_permission(
                 allowed=False,
                 reason=(
                     f"agent_mode=plan blocks '{tool_name}'. "
-                    "Write the plan to id_todo.md and wait for user confirmation."
+                    "Plan is in conversation. Switch /mode auto to execute."
                 ),
             )
         return ModeGateResult(allowed=True)

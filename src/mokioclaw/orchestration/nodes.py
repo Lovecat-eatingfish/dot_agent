@@ -197,10 +197,11 @@ def chat_responder_node(state: MokioGraphState) -> dict[str, Any]:
     writer = _get_writer()
     builder = _get_prompt_builder(state)
     try:
+        history = state.get("messages", [])
         response = create_model().invoke(
             [
                 SystemMessage(content=builder.build("chat_responder")),
-                HumanMessage(content=_chat_input(state)),
+                *history,
             ]
         )
         record_llm_usage(response)  # /cost usage 统计
@@ -267,6 +268,7 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
         response = model.invoke(
             [
                 SystemMessage(content=builder.build("planner")),
+                *state.get("messages", []),
                 HumanMessage(content=_planner_input(working_state, memory)),
             ]
         )
@@ -313,35 +315,16 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
     metadata["planner_raw"] = content
     final_memory = build_layered_memory(working_state, node="planner")
 
-    # plan 模式：写出 id_todo.md，停止执行，等待用户确认
+    # plan 模式：plan 存入 state/messages，不再写文件
     runtime = working_state.get("runtime")
-    if runtime is not None and getattr(runtime, "agent_mode", "auto") == "plan":
-        plan_path = _write_plan_todo_file(runtime, working_state)
+    is_plan_mode = runtime is not None and getattr(runtime, "agent_mode", "auto") == "plan"
+    if is_plan_mode:
         writer(
             {
                 "type": "plan_mode_waiting",
-                "path": str(plan_path),
-                "message": "Plan written. Confirm then switch /mode auto (or approve) to execute.",
+                "message": "Plan ready (agent_mode=plan). Switch /mode auto to execute.",
             }
         )
-        return {
-            "plan_summary": working_state.get("plan_summary", ""),
-            "todos": working_state.get("todos", []),
-            "acceptance_criteria": working_state.get("acceptance_criteria", []),
-            "verification_commands": working_state.get("verification_commands", []),
-            "messages": [response],
-            "memory_snapshot": final_memory,
-            "history_summary": final_memory.get("history_summary_store", {}).get("history_summary", ""),
-            "metadata": metadata,
-            "planner_route": "final",
-            "planner_route_instruction": (
-                f"Plan-only mode: plan saved to {plan_path}. Awaiting user confirmation."
-            ),
-            "final_answer": (
-                f"Plan ready (agent_mode=plan). Written to `{plan_path}`.\n"
-                "Review the plan, then run `/mode auto` (or `/mode approve`) and continue."
-            ),
-        }
 
     return {
         "plan_summary": working_state.get("plan_summary", ""),
@@ -352,9 +335,13 @@ def planner_node(state: MokioGraphState) -> dict[str, Any]:
         "memory_snapshot": final_memory,
         "history_summary": final_memory.get("history_summary_store", {}).get("history_summary", ""),
         "metadata": metadata,
-        "context_next_node": "verifier",
-        "planner_route": working_state.get("planner_route", "verify"),
-        "planner_route_instruction": working_state.get("planner_route_instruction", ""),
+        "context_next_node": "final" if is_plan_mode else "verifier",
+        "planner_route": "final" if is_plan_mode else working_state.get("planner_route", "verify"),
+        "planner_route_instruction": "Plan-only mode. Switch /mode auto to execute." if is_plan_mode else working_state.get("planner_route_instruction", ""),
+        "final_answer": (
+            f"Plan ready (agent_mode=plan).\n\n{working_state.get('plan_summary', '')}\n\n"
+            "Switch /mode auto (or /mode approve) to execute."
+        ) if is_plan_mode else "",
     }
 
 
@@ -412,6 +399,7 @@ def verifier_node(state: MokioGraphState) -> dict[str, Any]:
 
     messages: list[Any] = [
         SystemMessage(content=builder.build("verifier")),
+        *state.get("messages", []),
         HumanMessage(content=_verifier_input(state, memory)),
     ]
     produced_messages: list[Any] = []
@@ -1015,6 +1003,7 @@ def verifier_route(state: MokioGraphState) -> str:
     return "planner"
 
 
+# todo 反馈机制
 def final_node(state: MokioGraphState) -> dict[str, Any]:
     """结束节点
 
@@ -1353,45 +1342,6 @@ def _router_input(state: MokioGraphState) -> str:
 
 
 _chat_input = _router_input
-
-
-def _write_plan_todo_file(runtime: Any, state: MokioGraphState) -> Any:
-    """plan 模式：把计划落到 id_todo.md 供用户确认"""
-    from pathlib import Path
-
-    path = Path(runtime.workspace) / "id_todo.md"
-    lines = [
-        "# Plan (agent_mode=plan)",
-        "",
-        f"## Task\n{state.get('task', '')}",
-        "",
-        f"## Summary\n{state.get('plan_summary', '')}",
-        "",
-        "## Todos",
-    ]
-    for todo in state.get("todos", []) or []:
-        status = todo.get("status", "pending")
-        lines.append(f"- [{ 'x' if status == 'completed' else ' ' }] **{todo.get('id', '')}**: {todo.get('content', '')}")
-    lines.extend(["", "## Acceptance Criteria"])
-    for item in state.get("acceptance_criteria", []) or []:
-        lines.append(f"- {item}")
-    lines.extend(["", "## Verification Commands"])
-    for cmd in state.get("verification_commands", []) or []:
-        lines.append(f"- `{cmd}`")
-    lines.extend(
-        [
-            "",
-            "## Next",
-            "Review this plan, then run `/mode auto` or `/mode approve` and continue the task.",
-            "",
-        ]
-    )
-    path.write_text("\n".join(lines), encoding="utf-8")
-    try:
-        runtime.record_read(path, complete=True)
-    except Exception:
-        pass
-    return path
 
 
 def _default_plan(task: str) -> dict[str, Any]:

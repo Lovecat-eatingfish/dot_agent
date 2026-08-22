@@ -89,9 +89,24 @@ def _get_message_id(msg: Any) -> str:
 
 @dataclass
 class SessionPersistence:
-    """会话持久化器，封装所有磁盘 / git 操作"""
+    """会话持久化器，封装所有磁盘 / git 操作
+
+    存储位置始终在用户编码空间的 .agent_sessions/ 子目录下：
+      sessions_root = workspace / ".agent_sessions"
+    这样 agent 内部存储（session.json、turns/）和用户代码在同一棵树里。
+    """
 
     sessions_root: Path
+    workspace: Optional[Path] = None
+
+    def __post_init__(self) -> None:
+        if self.workspace is not None:
+            self.sessions_root = self.workspace / ".agent_sessions"
+
+    def update_workspace(self, workspace: Path) -> None:
+        """用户编码空间变更时，同步更新存储根目录"""
+        self.workspace = workspace
+        self.sessions_root = workspace / ".agent_sessions"
 
     def session_dir(self, session_id: str) -> Path:
         return self.sessions_root / session_id

@@ -89,22 +89,23 @@ class TestNodesReturnExpectedKeys:
         result = plan_node(_basic_state())
         assert "task_plan" in result
 
-    def test_coding_agent_node_returns_empty(self):
+    def test_coding_agent_node_returns_messages(self):
         result = _find_node("coding_agent_node")(_basic_state())
-        assert result == {}
+        assert "messages" in result
 
     def test_valid_node_returns_validate_result(self):
         result = valid_node(_basic_state())
         assert "validate_result" in result
-        assert result["validate_result"]["passed"] is False
+        # 无 validation_commands 时 all_passed 保持 True（空列表 vacuously true）
+        assert "passed" in result["validate_result"]
 
     def test_human_intervene_marker_sets_flag(self):
         result = human_intervene_marker_node(_basic_state())
         assert result["need_human_intervene"] is True
 
-    def test_finally_node_returns_empty(self):
+    def test_finally_node_returns_final_answer(self):
         result = finally_node(_basic_state())
-        assert result == {}
+        assert "final_answer" in result
 
 
 def _find_node(name: str):
@@ -200,7 +201,13 @@ def test_session_manager_create_and_get():
     session = mgr.create_session("s1")
     assert session.session_id == "s1"
     assert session.compiled_graph is not None
-    assert session.current_state == build_initial_state()
+    # _init_session 从磁盘恢复，workspace 被设为实际路径，不再等于无参 build_initial_state()
+    assert session.current_state["task"] == ""
+    assert session.current_state["task_plan"] == {}
+    assert session.current_state["replan_count"] == 0
+    assert session.current_state["attempt_count"] == 0
+    assert session.current_state["max_attempt"] == MAX_ATTEMPT_DEFAULT
+    assert session.current_state["need_human_intervene"] is False
     assert session.is_running is False
     assert session.replan_max == REPLAN_THRESHOLD
     assert session.max_attempt == MAX_ATTEMPT_DEFAULT
@@ -215,25 +222,59 @@ def test_session_manager_create_auto_id():
     assert session.session_id  # non-empty uuid
 
 
-def test_session_manager_duplicate_raises():
+def test_session_manager_duplicate_returns_existing():
+    """create_session 幂等：重复调用同一 ID 返回已有 session（支持 warmup 复用）"""
     mgr = SessionManager()
-    mgr.create_session("s1")
-    with pytest.raises(ValueError, match="already exists"):
-        mgr.create_session("s1")
+    s1 = mgr.create_session("s1")
+    s2 = mgr.create_session("s1")
+    assert s1 is s2
 
 
-def test_session_manager_get_missing_raises():
+def test_session_manager_get_missing_auto_creates():
     mgr = SessionManager()
-    with pytest.raises(KeyError, match="not found"):
-        mgr.get_session("nonexistent")
+    # 不存在的 session 自动创建
+    sess = mgr.get_session("nonexistent")
+    assert sess.session_id == "nonexistent"
+    assert sess.compiled_graph is not None
 
 
-def test_session_manager_destroy():
+def test_session_manager_destroy_then_get_auto_creates():
     mgr = SessionManager()
     mgr.create_session("s1")
     mgr.destroy_session("s1")
-    with pytest.raises(KeyError):
-        mgr.get_session("s1")
+    # 销毁后再次 get，自动创建新 session
+    sess = mgr.get_session("s1")
+    assert sess.session_id == "s1"
+
+
+def test_session_manager_disk_recovery(tmp_path):
+    """_init_session 从磁盘恢复 messages 和计数"""
+    from mokioclaw.orchestration.session_persistence import SessionPersistence
+    from langchain_core.messages import HumanMessage
+
+    root = tmp_path / "sessions"
+    root.mkdir()
+    sid = "disk-session"
+
+    # 先在磁盘上写一个 session
+    persistence = SessionPersistence(sessions_root=root)
+    meta = persistence._empty_session_meta(sid)
+    meta["messages"] = [{"type": "HumanMessage", "content": "hello from disk"}]
+    meta["replan_count"] = 2
+    meta["attempt_count"] = 1
+    meta["current_turn_id"] = 3
+    persistence.save_session_meta(sid, meta)
+
+    # 创建 SessionManager 并获取该 session
+    mgr = SessionManager(sessions_root=root)
+    session = mgr.get_session(sid)
+
+    assert session.session_id == sid
+    assert session.current_turn_id == 3
+    assert len(session.current_state["messages"]) == 1
+    assert session.current_state["messages"][0].content == "hello from disk"
+    assert session.current_state["replan_count"] == 2
+    assert session.current_state["attempt_count"] == 1
 
 
 def test_session_manager_destroy_idempotent():

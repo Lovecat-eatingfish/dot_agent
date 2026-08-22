@@ -27,6 +27,7 @@ dependencies = [
 
 [project.scripts]
 dotagent  = "mokioclaw.interaction.app:app"
+dot       = "dot.main:main"
 
 [dependency-groups]
 dev = [

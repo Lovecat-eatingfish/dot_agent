@@ -11,3 +11,4 @@ docs/
 .tmp
 .tmp_sched
 .workbuddy
+.dot/

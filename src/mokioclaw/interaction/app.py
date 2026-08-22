@@ -58,7 +58,7 @@ from typer.core import TyperGroup
 from mokioclaw.interaction.formatter import print_event, safe_echo, safe_secho
 from mokioclaw.core.utils import utc_now as _utc_now
 from mokioclaw.security.approval import ApprovalDecision, ApprovalRequest
-from mokioclaw.orchestration.agent import stream_agent_events
+from mokioclaw.orchestration.agent_host import get_agent_host
 from mokioclaw.core.log import get_logger, setup_logging
 from mokioclaw.daemon.manager import DaemonManager
 from mokioclaw.daemon.scheduler import get_scheduler, ScheduledTask, CronScheduler
@@ -457,21 +457,21 @@ def main(
 
     # stream_agent_events 是生成器，逐个 yield 事件字典
     # -p headless 模式（对齐 Claude Code -p / SDK）：只输出最终结果，无交互 UI
+    host = get_agent_host()
     if print_mode:
         final_answer = ""
         trace_summary: dict[str, Any] = {}
         session_id = ""
         try:
-            for event in stream_agent_events(
+            for event in host.run(
                 task,
+                session_id=resume_session_id,
                 workspace=workspace_path,
                 max_attempts=max_attempts,
                 approval_mode=approval_mode,
                 agent_mode=agent_mode,
                 approval_handler=None,  # headless 无法人工审批
                 checkpoint_mode=checkpoint_mode,
-                resume_workspace=workspace_path if resume_requested else None,
-                resume_session_id=resume_session_id,
                 trace_mode=trace_mode,
                 safe_mode=safe_mode,
             ):
@@ -516,16 +516,15 @@ def main(
         raise typer.Exit()
 
     try:
-        for event in stream_agent_events(
+        for event in host.run(
             task,
+            session_id=resume_session_id,
             workspace=workspace_path,
             max_attempts=max_attempts,
             approval_mode=approval_mode,
             agent_mode=agent_mode,
             approval_handler=approval_handler,
             checkpoint_mode=checkpoint_mode,
-            resume_workspace=workspace_path if resume_requested else None,
-            resume_session_id=resume_session_id,
             trace_mode=trace_mode,
             safe_mode=safe_mode,
         ):

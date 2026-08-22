@@ -117,6 +117,7 @@ def intent_router_node(state: MokioGraphState) -> dict[str, Any]:
     route, reason, confidence = classify_intent(task)
 
     use_llm = os.getenv("MOKIO_INTENT_LLM", "").strip() in {"1", "true", "yes"} and confidence < 0.8
+    extra_messages: list[Any] = []
     if use_llm:
         builder = _get_prompt_builder(state)
         try:
@@ -133,6 +134,7 @@ def intent_router_node(state: MokioGraphState) -> dict[str, Any]:
                 route = candidate
                 confidence = parsed_confidence
                 reason = str(parsed.get("reason") or reason)
+            extra_messages.append(response)
         except Exception as exc:
             logger.warning("intent_router llm fallback failed: %s", exc, exc_info=True)
 
@@ -144,11 +146,14 @@ def intent_router_node(state: MokioGraphState) -> dict[str, Any]:
         "method": "llm" if use_llm else "heuristic",
     }
     writer(event)
-    return {
+    result: dict[str, Any] = {
         "intent_route": route,
         "intent_reason": reason,
         "intent_confidence": confidence,
     }
+    if extra_messages:
+        result["messages"] = extra_messages
+    return result
 
 
 def intent_route_fn(state: MokioGraphState) -> str:
@@ -218,7 +223,7 @@ def chat_responder_node(state: MokioGraphState) -> dict[str, Any]:
         "response": text,
     }
     writer(event)
-    return {"chat_response": text, "final_answer": text}
+    return {"chat_response": text, "final_answer": text, "messages": [response]}
 
 
 def planner_node(state: MokioGraphState) -> dict[str, Any]:

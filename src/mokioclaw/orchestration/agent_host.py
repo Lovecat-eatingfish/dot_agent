@@ -23,25 +23,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Generator, Optional
 
-from mokioclaw.core.hook_loader import load_hooks_into_runner
-from mokioclaw.core.hooks import HookRunner
 from mokioclaw.core.log import get_logger
-from mokioclaw.orchestration.agent_authorizer import AgentAuthorizer, AutoModeClassifier
 from mokioclaw.orchestration.coding_graph import (
-    REPLAN_THRESHOLD,
-    MAX_ATTEMPT_DEFAULT,
-    Session,
-    SessionManager,
-    build_graph,
-    build_initial_state,
+    SessionManager, Session,
 )
-from mokioclaw.orchestration.mcp_manager import MCPManager
-from mokioclaw.orchestration.mcp_host import MCPHost
-from mokioclaw.orchestration.session_persistence import SessionPersistence
-from mokioclaw.reliability.git_utils import git_init
-from mokioclaw.orchestration.skill_host import SkillHost
-from mokioclaw.orchestration.skills_manager import SkillsManager
-from mokioclaw.providers.openai_provider import create_model
+from mokioclaw.orchestration.session_persistence import _deserialize_messages
 from mokioclaw.reliability.tracing import TraceManager
 
 logger = get_logger(__name__)
@@ -71,11 +57,11 @@ class AgentHost:
     """
 
     def __init__(
-        self,
-        sessions_root: Optional[Path] = None,
-        *,
-        classifier_model: Any = None,
-        storage_provider: Any = None,
+            self,
+            sessions_root: Optional[Path] = None,
+            *,
+            classifier_model: Any = None,
+            storage_provider: Any = None,
     ) -> None:
         """初始化 AgentHost
 
@@ -89,6 +75,9 @@ class AgentHost:
 
         # 全局单例 SessionManager： 这个是核心： 里面哟mcp skill state 等的管理者
         self._session_mgr = SessionManager(sessions_root=self._sessions_root)
+        # 当前交互选中的 session。SessionManager 内部字典保存所有已加载 session。
+        latest = self._find_latest_session_dir()
+        self._active_session_id: Optional[str] = latest.name if latest is not None else None
 
         # Trace 管理器（全局共享）
         self._trace_mgr = TraceManager(storage=storage_provider)
@@ -101,12 +90,7 @@ class AgentHost:
     # ============================================================
 
     def create_session(self, session_id: Optional[str] = None) -> Session:
-        """创建新会话
-
-        - 图只编译一次
-        - state 只初始化一次
-        - 初始化 MCP / Skills / Authorizer / Tracing
-        - 持久化目录 + git init
+        """创建新会话（委托给 SessionManager，统一初始化逻辑）
 
         Args:
             session_id: 可选指定 session ID。
@@ -116,67 +100,49 @@ class AgentHost:
         Returns:
             Session 对象（含 compiled_graph + current_state + 所有管理器）
         """
-        if session_id == "uuid":
-            sid = str(_uuid())
-        elif session_id is None:
-            sid = _make_timestamp_id()
+        if session_id is None:
+            base_sid = _make_timestamp_id()
+            sid = base_sid
+            suffix = 2
+            while sid in self._session_mgr._sessions or (self._sessions_root / sid).exists():
+                sid = f"{base_sid}-{suffix}"
+                suffix += 1
         else:
             sid = session_id
 
-        # 1. 编译图（每个 session 只编译一次）
-        compiled_graph = build_graph().compile()
+        session = self._session_mgr.create_session(sid)
+        self._active_session_id = session.session_id
+        return session
 
-        # 2. 初始化 state
-        initial_state = build_initial_state()
+    @property
+    def sessions(self) -> dict[str, Session]:
+        """返回进程内已加载的 session 映射。"""
+        return self._session_mgr._sessions
 
-        # 3. 初始化持久化层
-        persistence = SessionPersistence(sessions_root=self._sessions_root)
-        persistence.save_session_meta(sid, persistence._empty_session_meta(sid))
-        git_init(persistence.session_dir(sid))
+    def resume_session(self, session_id: str) -> Session:
+        """加载并选中指定 session。
 
-        # 4. 初始化 MCP Manager + Host
-        mcp_mgr = MCPManager(workspace=persistence.session_dir(sid))
-        mcp_host = MCPHost(mcp_mgr)
+        指定的 session 不存在时直接报错，避免静默切换到另一个会话。
+        """
+        sid = str(session_id).strip()
+        if not sid:
+            raise ValueError("session_id must not be empty")
 
-        # 5. 初始化 Skills Manager + Host
-        skills_mgr = SkillsManager(workspace=persistence.session_dir(sid))
-        skill_host = SkillHost(skills_mgr)
+        session_path = self._sessions_root / sid
+        if sid not in self._session_mgr._sessions and not session_path.is_dir():
+            raise RuntimeError(f"Session not found: {sid}")
 
-        # 6. 初始化 Authorizer（Auto 模式分类器）
-        model = self._classifier_model or create_model()
-        classifier = AutoModeClassifier(model=model)
-        authorizer = AgentAuthorizer(classifier=classifier)
-
-        # 6.5 初始化 HookRunner 并加载 hooks 配置
-        hook_runner = HookRunner()
-        load_hooks_into_runner(hook_runner, persistence.session_dir(sid))
-
-        # 7. 组装 Session
-        session = Session(
-            session_id=sid,
-            compiled_graph=compiled_graph,
-            current_state=initial_state,
-            persistence=persistence,
-            workspace=persistence.session_dir(sid),
-            mcp_manager=mcp_mgr,
-            mcp_host=mcp_host,
-            skills_manager=skills_mgr,
-            skill_host=skill_host,
-            authorizer=authorizer,
-            hook_runner=hook_runner,
-        )
-
-        # 8. 存入内存
-        self._session_mgr._sessions[sid] = session
-
-        logger.info("Session created: %s", sid)
+        session = self._session_mgr.get_session(sid)
+        self._refresh_session_from_disk(session)
+        self._active_session_id = sid
+        logger.info("Resumed session: %s", sid)
         return session
 
     def resume_latest_session(self) -> Session:
         """恢复最新的会话
 
-        扫描 sessions_root 目录，找到最近修改的会话，
-        加载其 session.json messages 到内存，复用已有的 compiled_graph 和 state。
+        warmup 已在初始化时将磁盘上的 session 加载到内存，
+        这里只需找到最近修改的 session 目录，返回对应 session。
 
         Returns:
             最新会话的 Session 对象
@@ -184,70 +150,11 @@ class AgentHost:
         Raises:
             RuntimeError: 没有找到任何已有会话
         """
-        # 1. 找到最新会话目录
         latest_dir = self._find_latest_session_dir()
         if latest_dir is None:
             raise RuntimeError("No existing sessions found. Create one first with create_session().")
 
-        latest_sid = latest_dir.name
-
-        # 2. 如果该 session 已在内存中，直接返回
-        if latest_sid in self._session_mgr._sessions:
-            session = self._session_mgr._sessions[latest_sid]
-            # 刷新 messages（从磁盘加载最新）
-            if session.persistence is not None:
-                disk_meta = session.persistence.load_session_meta(latest_sid)
-                disk_messages = disk_meta.get("messages", [])
-                if disk_messages:
-                    session.current_state["messages"] = disk_messages
-            logger.info("Resumed existing session from memory: %s", latest_sid)
-            return session
-
-        # 3. 从磁盘恢复：编译图 + 加载 messages + 初始化管理器
-        compiled_graph = build_graph().compile()
-
-        persistence = SessionPersistence(sessions_root=self._sessions_root)
-        disk_meta = persistence.load_session_meta(latest_sid)
-        disk_messages = disk_meta.get("messages", [])
-
-        # 恢复 current_turn_id
-        current_turn_id = disk_meta.get("current_turn_id", 0)
-
-        initial_state = build_initial_state(messages=disk_messages)
-        initial_state["replan_count"] = disk_meta.get("replan_count", 0)
-        initial_state["attempt_count"] = disk_meta.get("attempt_count", 0)
-
-        # 初始化管理器
-        mcp_mgr = MCPManager(workspace=persistence.session_dir(latest_sid))
-        mcp_host = MCPHost(mcp_mgr)
-        skills_mgr = SkillsManager(workspace=persistence.session_dir(latest_sid))
-        skill_host = SkillHost(skills_mgr)
-        model = self._classifier_model or create_model()
-        classifier = AutoModeClassifier(model=model)
-        authorizer = AgentAuthorizer(classifier=classifier)
-
-        # 初始化 HookRunner 并加载 hooks 配置
-        hook_runner = HookRunner()
-        load_hooks_into_runner(hook_runner, persistence.session_dir(latest_sid))
-
-        session = Session(
-            session_id=latest_sid,
-            compiled_graph=compiled_graph,
-            current_state=initial_state,
-            persistence=persistence,
-            workspace=persistence.session_dir(latest_sid),
-            mcp_manager=mcp_mgr,
-            mcp_host=mcp_host,
-            skills_manager=skills_mgr,
-            skill_host=skill_host,
-            authorizer=authorizer,
-            hook_runner=hook_runner,
-            current_turn_id=current_turn_id,
-        )
-
-        self._session_mgr._sessions[latest_sid] = session
-        logger.info("Resumed latest session from disk: %s (turns=%d)", latest_sid, current_turn_id)
-        return session
+        return self.resume_session(latest_dir.name)
 
     def _find_latest_session_dir(self) -> Optional[Path]:
         """找到最近修改的会话目录"""
@@ -256,53 +163,146 @@ class AgentHost:
             return None
         candidates = sorted(
             (p for p in root.iterdir() if p.is_dir()),
-            key=lambda p: p.stat().st_mtime,
+            key=self._session_activity_time,
             reverse=True,
         )
         return candidates[0] if candidates else None
+
+    @staticmethod
+    def _session_activity_time(session_dir: Path) -> float:
+        """根据 session 目录内最近变更的文件判断最近活跃会话。
+
+        只看 session 目录本身会漏掉后续 turn 文件和 Git 提交，
+        因为这些变化通常发生在子目录中。
+        """
+        latest = 0.0
+        try:
+            latest = session_dir.stat().st_mtime
+            for path in session_dir.rglob("*"):
+                try:
+                    latest = max(latest, path.stat().st_mtime)
+                except OSError:
+                    continue
+        except OSError:
+            return 0.0
+        return latest
+
+    @staticmethod
+    def _refresh_session_from_disk(session: Session) -> None:
+        """把磁盘 session 元数据恢复到常驻内存 state。"""
+        if session.persistence is None:
+            return
+
+        meta = session.persistence.load_session_meta(session.session_id)
+        raw_messages = meta.get("messages", [])
+        if raw_messages:
+            session.current_state["messages"] = _deserialize_messages(raw_messages)
+        session.current_turn_id = int(meta.get("current_turn_id", session.current_turn_id or 0))
+        for key in ("replan_count", "attempt_count"):
+            if key in meta:
+                session.current_state[key] = meta[key]
+
+    def run(
+            self,
+            user_input: Optional[str] = None,
+            *,
+            session_id: Optional[str] = None,
+            resume_session_id: Optional[str] = None,
+            workspace: Optional[Path] = None, # 工作空间
+            max_attempts: int = 3,
+            approval_mode: str = "inline", # 审批模式
+            agent_mode: str = "auto", # agent 模式 todo：可能和approval_mode 冲突了
+            approval_handler: Any = None, # 人工审批函数
+            trace_mode: str = "on",
+            safe_mode: bool = False,
+    ) -> Generator[dict[str, Any], None, None]:
+        """驱动一轮 Agent 执行（统一入口）
+
+        - 创建新 session 或恢复已有 session
+        - 自动处理持久化（stream 结束后自动 diff + git commit + turn 快照）
+        - 自动创建 trace 埋点
+
+        Args:
+            user_input: 用户输入
+            session_id: 指定 session ID（None 则自动生成或恢复最新）
+            workspace: 工作区路径
+            max_attempts: 最大重试次数
+            approval_mode: 审批模式
+            agent_mode: Agent 模式
+            approval_handler: 审批回调
+            resume_session_id: 恢复指定 session
+            trace_mode: 追踪模式
+            safe_mode: 安全模式
+
+        Yields:
+            图执行事件字典
+            :param checkpoint_mode:
+        """
+        # 1. 选择当前 session：显式恢复 > 显式 session > 当前内存 session > 最近 session > 新建
+        if resume_session_id:
+            session = self.resume_session(resume_session_id)
+        elif session_id:
+            if session_id in self._session_mgr._sessions:
+                session = self._session_mgr.get_session(session_id)
+                self._active_session_id = session.session_id
+            else:
+                session = self.resume_session(session_id)
+        elif self._active_session_id and self._active_session_id in self._session_mgr._sessions:
+            session = self._session_mgr.get_session(self._active_session_id)
+        else:
+            latest = self._find_latest_session_dir()
+            session = self.resume_session(latest.name) if latest is not None else self.create_session()
+
+        session_id = session.session_id
+
+        # 2. 注入运行时配置到 state
+        _apply_runtime_config(
+            session,
+            workspace=workspace,
+            max_attempts=max_attempts,
+            approval_mode=approval_mode,
+            agent_mode=agent_mode,
+            approval_handler=approval_handler,
+            checkpoint_mode=checkpoint_mode,
+            trace_mode=trace_mode,
+            safe_mode=safe_mode,
+        )
+
+        # 3. 链路追踪
+        trace = self._trace_mgr.start_trace(session_id, user_input or "") if trace_mode != "off" else None
+        if trace is not None:
+            session.current_state["trace_id"] = trace.trace_id
+
+        trace_status = "success"
+        trace_error: Optional[str] = None
+        try:
+            # 4. 驱动图执行
+            yield from self._session_mgr.stream_session_events(
+                session_id,
+                new_user_input=user_input,
+            )
+        except Exception as exc:
+            logger.error("Session %s run failed: %s", session_id, exc, exc_info=True)
+            trace_status = "error"
+            trace_error = str(exc)
+            raise
+        finally:
+            if trace is not None:
+                self._trace_mgr.end_trace(trace.trace_id, trace_status, trace_error)
 
     def get_session(self, session_id: str) -> Session:
         """获取会话"""
         return self._session_mgr.get_session(session_id)
 
-    def destroy_session(self, session_id: str) -> None:
-        """销毁会话（清理内存）"""
-        self._session_mgr.destroy_session(session_id)
-
     # ============================================================
     # 运行入口
     # ============================================================
 
-    def run(self, session_id: str, user_input: Optional[str] = None) -> Generator[dict[str, Any], None, None]:
-        """驱动一轮 Agent 执行
-
-        - 复用已有的 compiled_graph 和 current_state
-        - 自动处理持久化（stream 结束后自动 diff + git commit + turn 快照）
-        - 自动创建 trace 埋点
-
-        Args:
-            session_id: 会话 ID
-            user_input: 用户输入（None 则复用当前 state）
-
-        Yields:
-            图执行事件字典
-        """
-        session = self._session_mgr.get_session(session_id)
-
-        # 链路追踪：创建 trace
-        trace = self._trace_mgr.start_trace(session_id, user_input or "")
-
-        try:
-            # 驱动图执行
-            yield from self._session_mgr.stream_session_events(
-                session_id,
-                new_user_input=user_input,
-            )
-            self._trace_mgr.end_trace(trace.trace_id, "success")
-        except Exception as exc:
-            logger.error("Session %s run failed: %s", session_id, exc, exc_info=True)
-            self._trace_mgr.end_trace(trace.trace_id, "error", str(exc))
-            raise
+    def destroy_session(self, session_id: str) -> None:
+        """销毁会话（清理内存）"""
+        self._session_mgr.destroy_session(session_id)
+        if self._active_session_id == session_id:
+            self._active_session_id = None
 
     # ============================================================
     # Rewind
@@ -400,6 +400,46 @@ def init_agent_host(**kwargs) -> AgentHost:
 
 
 # ============================================================
+# Runtime config helper
+# ============================================================
+
+def _apply_runtime_config(
+        session: Session,
+        *,
+        workspace: Optional[Path] = None,
+        max_attempts: int = 3,
+        approval_mode: str = "inline",
+        agent_mode: str = "auto",
+        approval_handler: Any = None,
+        checkpoint_mode: str = "light",
+        trace_mode: str = "on",
+        safe_mode: bool = False,
+) -> None:
+    """将运行时配置写入 session.current_state 和 session 属性。
+
+    workspace 是用户编码目录：用户在哪打开 agent 就自动是哪个目录（Path.cwd()）。
+    所有工具执行、MCP/Skills/Hook 配置加载都在这个目录下进行。
+    同时同步更新 SessionPersistence 的存储根目录（workspace/.agent_sessions/）。
+    """
+    # workspace 默认取当前目录（用户打开 agent 的位置）
+    user_workspace = workspace if workspace is not None else Path.cwd()
+    session.workspace = user_workspace
+    session.current_state["workspace"] = user_workspace
+    # 同步更新 persistence 的存储根目录，确保内部存储落在用户编码空间下
+    if session.persistence is not None:
+        session.persistence.update_workspace(user_workspace)
+    session.current_state["approval_mode"] = approval_mode
+    session.current_state["agent_mode"] = agent_mode
+    session.max_attempt = max_attempts
+    session.current_state["max_attempt"] = max_attempts
+    if approval_handler is not None:
+        session.current_state["approval_handler"] = approval_handler
+    session.current_state["checkpoint_mode"] = checkpoint_mode
+    session.current_state["trace_mode"] = trace_mode
+    session.current_state["safe_mode"] = safe_mode
+
+
+# ============================================================
 # UUID / Timestamp helpers
 # ============================================================
 
@@ -412,7 +452,6 @@ def _make_timestamp_id() -> str:
     """生成年月日时分秒格式的 session ID，如 20250820-153045"""
     from datetime import datetime
     return datetime.now().strftime("%Y%m%d-%H%M%S")
-
 
 # ============================================================
 # AgentHost

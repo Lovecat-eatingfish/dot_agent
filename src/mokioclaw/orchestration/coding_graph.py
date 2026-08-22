@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from _pyrepl.commands import interrupt
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Dict, Generator, Optional, TypedDict
@@ -16,26 +17,44 @@ from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolM
 from langgraph.graph import END, START, StateGraph, add_messages
 from langchain_core.runnables import RunnableConfig
 
+from mokioclaw.core.events import get_event_bus
 from mokioclaw.core.log import get_logger
 from mokioclaw.core.hook_loader import load_hooks_into_runner
 from mokioclaw.core.hooks import HookRunner
 from mokioclaw.core.utils import execute_tool_by_name, last_ai_content
-from mokioclaw.memory.tiered_compression import compress_messages_by_tier
 from mokioclaw.orchestration.agent_authorizer import AgentAuthorizer, AutoModeClassifier
+from mokioclaw.orchestration.mcp_host import MCPHost
 from mokioclaw.orchestration.mcp_manager import MCPManager
 from mokioclaw.orchestration.session_persistence import (
     AGENT_SESSIONS_DIR,
     SessionPersistence,
+    _deserialize_messages,
     diff_messages,
     persist_turn,
 )
+from mokioclaw.orchestration.skill_host import SkillHost
 from mokioclaw.orchestration.skills_manager import SkillsManager
 from mokioclaw.providers.openai_provider import create_model
 from mokioclaw.reliability.cost import record_llm_usage
+from mokioclaw.reliability.git_utils import git_init
 from mokioclaw.state.runtime import RuntimeState
 from mokioclaw.tools import build_tools
 
 logger = get_logger(__name__)
+
+# CodingAgentState 中由 graph 管理的字段（用于 selectively merge final state）
+_graph_state_keys = (
+    "messages",
+    "task",
+    "task_plan",
+    "replan_count",
+    "attempt_count",
+    "max_attempt",
+    "validate_result",
+    "tool_artifacts",
+    "need_human_intervene",
+    "resume_action",
+)
 
 
 def _get_writer():
@@ -60,11 +79,78 @@ def _get_writer():
             pass
 
     return writer
+
+
 # Constants
 # ============================================================
 
 REPLAN_THRESHOLD = 3
 MAX_ATTEMPT_DEFAULT = 3
+
+
+# ============================================================
+# RuntimeState 构建辅助
+# ============================================================
+
+def _build_runtime_from_state(state: CodingAgentState) -> RuntimeState:
+    """从 CodingAgentState 的扁平字段拼出最小 RuntimeState，供 build_tools / run_bash 使用。"""
+    from mokioclaw.state.runtime import RuntimeState
+
+    return RuntimeState(
+        workspace=state.get("workspace") or Path.cwd(),
+        approval_mode=state.get("approval_mode", "inline"),
+        allowed_tools=state.get("allowed_tools", []),
+        disallowed_tools=state.get("disallowed_tools", []),
+        approval_handler=state.get("approval_handler"),
+        bash_default_timeout_seconds=state.get("bash_default_timeout", 120),
+        bash_max_timeout_seconds=state.get("bash_max_timeout", 600),
+        bash_max_output_chars=state.get("bash_max_output_chars", 6000),
+        loaded_tools=state.get("loaded_tools", {}),
+        file_state_map=state.get("file_state_map", {}),
+    )
+
+
+def _inject_session_context(session: Session) -> None:
+    """把 Session 级上下文注入到 current_state，节点直接从 state 读取，不依赖外部框架。
+
+    注入的内容：
+      - mcp_catalog / mcp_rules / mcp_meta_tools：MCP 动态提示词 + 渐进披露工具
+      - skills_catalog / skills_rules / skills_meta_tool：Skills 动态提示词 + 渐进披露工具
+      - hook_runner：PreToolUse 拦截
+      - session_id：节点内日志、hook 回调时使用
+    """
+    st = session.current_state
+    if session.mcp_host is not None:
+        try:
+            st["mcp_catalog"] = session.mcp_host.get_catalog_text()
+            st["mcp_rules"] = session.mcp_host.get_system_prompt_rules()
+            st["mcp_meta_tools"] = session.mcp_host.get_meta_tools()
+        except Exception as exc:
+            logger.debug("_inject_session_context: mcp context load failed (%s)", exc)
+    if session.skill_host is not None:
+        try:
+            st["skills_catalog"] = session.skill_host.get_catalog_text()
+            st["skills_rules"] = session.skill_host.get_system_prompt_rules()
+            st["skills_meta_tool"] = session.skill_host.get_meta_tool()
+        except Exception as exc:
+            logger.debug("_inject_session_context: skills context load failed (%s)", exc)
+    st["hook_runner"] = session.hook_runner
+    st["session_id"] = session.session_id
+
+
+def _inject_runtime_fields(session: Session) -> None:
+    """将运行时信息注入 current_state，确保 graph 节点能取到。
+
+    workspace 是用户编码目录，优先用 state 里已有的值，
+    其次用 session.workspace（由 _apply_runtime_config 设为 Path.cwd() 或用户指定目录），
+    兜底用 Path.cwd()。不要使用 session.persistence.session_dir()（那是 agent 内部存储）。
+    """
+    st = session.current_state
+    if not st.get("workspace"):
+        st["workspace"] = session.workspace or Path.cwd()
+    if not st.get("approval_mode"):
+        st["approval_mode"] = "inline"
+    # 其余字段保持 state 中已有值（由上层 create_runtime 或 build_initial_state 写入）
 
 
 # ============================================================
@@ -74,42 +160,28 @@ MAX_ATTEMPT_DEFAULT = 3
 class CodingAgentState(TypedDict, total=False):
     """Coding Agent 图的运行时状态（内存为权威源）"""
 
-    # LLM 工作上下文
-    messages: Annotated[list[BaseMessage], add_messages]
 
-    # 运行时状态（工作区、审批、工具等）
-    runtime: RuntimeState
 
-    # plan_node 输出：
-    #     plan_description = task_plan.get("description", "")
-    #     subtasks = task_plan.get("subtasks", [])
-    #     constraints = task_plan.get("constraints", [])
-    #     todo： plan节点返回值添加 校验的计划，或者 command
-    task_plan: dict
+    # --- RuntimeState 拆出的必需字段（供 build_tools / run_bash 使用）---
+    approval_mode: str
+    allowed_tools: list[str]
+    disallowed_tools: list[str]
+    approval_handler: Any  # Callable | None
+    bash_default_timeout: int
+    bash_max_timeout: int
+    bash_max_output_chars: int
+    loaded_tools: dict[str, Any]
+    file_state_map: dict[str, str]
 
-    # 重规划计数（coding 触发 replan 时 +1）
-    replan_count: int
-
-    # 编码重试计数（仅编码失败累加，replan 不消耗）
-    attempt_count: int
-
-    # 最大编码重试次数
-    max_attempt: int
-
-    # valid_node 输出
-    validate_result: dict
-
-    # 工具调用缓存，coding 节点标记 plan_invalid 放在这里
-    tool_artifacts: dict
-
-    # 是否需要人工介入
-    need_human_intervene: bool
-
-    # 外部 resume 传入的值：continue / stop（human_intervene_marker 读取）
-    resume_action: str
-
-    # 当前轮次的原始用户需求
-    task: str
+    # --- Session 级上下文（注入到 state，节点直接从 state 读取，不依赖外部框架）---
+    mcp_catalog: str       # MCP 工具目录文本（name + description）
+    mcp_rules: str         # MCP 调用规则
+    mcp_meta_tools: list[dict[str, Any]]  # mcp_search 元工具定义
+    skills_catalog: str    # Skills 目录文本
+    skills_rules: str      # Skills 使用规则
+    skills_meta_tool: dict[str, Any]  # invoke_skill 元工具定义
+    hook_runner: Any       # HookRunner — 供 PreToolUse 拦截使用
+    session_id: str        # 当前 session ID
 
 
 # ============================================================
@@ -119,25 +191,29 @@ class CodingAgentState(TypedDict, total=False):
 def context_compress_node(state: CodingAgentState) -> dict[str, Any]:
     """上下文压缩节点
 
-    检测 messages token 是否超限，超限则调用 compress_messages_by_tier 压缩。
+    检测 messages token 是否超限，超限则调用五层压缩流水线。
     只修改 messages 字段，不碰其他 state 字段。
     仅在入口执行一次，replan 回跳 plan_node 不会再次触发此节点。
     """
-    messages: list[Any] = list(state.get("messages", []))
-    token_limit = _get_context_token_limit()
-    estimated = _estimate_message_tokens(messages)
+    from mokioclaw.compact.compact import apply_compression_pipeline
+    from mokioclaw.compact.compact_guard import estimate_token, get_auto_compact_threshold
+    from mokioclaw.compact.types import CompactConfig, CompactState
 
-    if estimated <= token_limit:
+    messages: list[Any] = list(state.get("messages", []))
+
+    config = CompactConfig()
+    est = estimate_token(messages)
+    threshold = get_auto_compact_threshold(config)
+
+    if est <= threshold:
         return {}
 
-    logger.info("context_compress_node: %d tokens > limit %d, compressing", estimated, token_limit)
-    context_summary = state.get("_context_summary", "")
+    logger.info("context_compress_node: %d tokens > threshold %d, compressing", est, threshold)
 
-    compressed: list[Any] = compress_messages_by_tier(
-        messages,
-        context_summary=context_summary,
-    )
+    compact_state = CompactState()
+    compressed: list[Any] = apply_compression_pipeline(messages, config, compact_state)
 
+    state.setdefault("messages", compressed)
     return {"messages": compressed}
 
 
@@ -175,15 +251,15 @@ def plan_node(state: CodingAgentState) -> dict[str, Any]:
     )
     if replan_count > 0:
         system_prompt += replan_hint
-
+    response = None
     try:
-        # todo： config 参数错误
         # todo：可以重试三次生成这个 plan计划，每次如果生成错误 把error 信息 再次拼接 给llm 重新生成
         config = RunnableConfig(**{"response_format": {"type": "json_object"}})
         response = create_model().invoke(
             [SystemMessage(content=system_prompt), *messages],
-            config={"response_format": {"type": "json_object"}},
+            response_format={"type": "json_object"}
         )
+        state['messages'].append(AIMessage(response.content))
         text = str(getattr(response, "content", "") or "").strip()
         if text.startswith("```"):
             lines = text.splitlines()
@@ -210,23 +286,22 @@ def plan_node(state: CodingAgentState) -> dict[str, Any]:
     plan.setdefault("constraints", [])
     plan.setdefault("error_feedback", "")
 
-    # todo： plan写入到 state
     state['task_plan'] = plan
+
 
     writer({"type": "plan_created", "plan": plan, "replan_count": replan_count})
 
-    return {"task_plan": plan}
+    return {"task_plan": plan, "messages": [response.content]}
 
 
 def coding_agent_node(state: CodingAgentState) -> dict[str, Any]:
     """编码执行节点
 
-    根据 task_plan 执行编码相关工作。
-    执行过程中识别 task_plan 是否不合理不可执行。
+    根据 task_plan 执行编码相关工作。执行过程中识别 task_plan 是否不合理不可执行。
     """
     writer = _get_writer()
-    runtime: RuntimeState | None = state.get("runtime")
     task_plan: dict = state.get("task_plan", {})
+    runtime = _build_runtime_from_state(state)
 
     # Build tools from runtime
     tools: list[Any] = []
@@ -239,7 +314,7 @@ def coding_agent_node(state: CodingAgentState) -> dict[str, Any]:
     subtasks = task_plan.get("subtasks", [])
     constraints = task_plan.get("constraints", [])
 
-    # Build agent prompt
+    # --- 静态提示词 ---
     system_prompt = (
         "You are a coding agent. Execute the given plan step by step.\n"
         f"Plan: {plan_description}\n"
@@ -249,8 +324,44 @@ def coding_agent_node(state: CodingAgentState) -> dict[str, Any]:
         "After completing, evaluate if the plan was reasonable and executable."
     )
 
+    # --- 从 state 读取 session 上下文（已由 _inject_session_context 注入）---
+    # 静态文件：用户配置（自定义指令 + .mokioclaw 规则）
+    static_context = state.get("custom_instructions", "")
+    if static_context:
+        system_prompt += f"\n\n[Static Context]\n{static_context}"
+
+    # 动态提示词：MCP 工具目录 + 规则
+    mcp_catalog = state.get("mcp_catalog", "")
+    mcp_rules = state.get("mcp_rules", "")
+    if mcp_catalog:
+        system_prompt += f"\n\n[Available MCP Tools]\n{mcp_catalog}"
+    if mcp_rules:
+        system_prompt += f"\n{mcp_rules}"
+    # 追加 MCP 元工具到 tools
+    meta_mcp_tools = state.get("mcp_meta_tools", [])
+    if meta_mcp_tools:
+        tools.extend(meta_mcp_tools)
+
+    # 动态提示词：Skills 目录 + 规则
+    skills_catalog = state.get("skills_catalog", "")
+    skills_rules = state.get("skills_rules", "")
+    if skills_catalog:
+        system_prompt += f"\n\n[Available Skills]\n{skills_catalog}"
+    if skills_rules:
+        system_prompt += f"\n{skills_rules}"
+    # 追加 Skills 元工具到 tools
+    meta_skill_tool = state.get("skills_meta_tool", {})
+    if meta_skill_tool:
+        tools.append(meta_skill_tool)
+
+    # Hook runner（从 state 读取）
+    hook_runner = state.get("hook_runner")
+
     messages: list[Any] = list(state.get("messages", []))
     agent_messages: list[Any] = [SystemMessage(content=system_prompt), *messages]
+    # 记录本轮新增的消息（LLM 响应 + tool 结果），全部落盘到 state
+    # 记录本轮新增的消息（LLM 响应 + tool 结果），全部落盘到 state
+    new_messages: list[Any] = []
 
     # Execute tool-calling loop
     max_loops = 10
@@ -266,6 +377,8 @@ def coding_agent_node(state: CodingAgentState) -> dict[str, Any]:
             break
 
         record_llm_usage(response)
+        agent_messages.append(response)
+        new_messages.append(response)
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
@@ -275,21 +388,47 @@ def coding_agent_node(state: CodingAgentState) -> dict[str, Any]:
         writer({"type": "tool_calls", "count": len(tool_calls), "loop": loop_count})
 
         for call in tool_calls:
+            tool_name = call.get("name", "")
+
+            # --- Hook 拦截检查 ---
+            if hook_runner is not None:
+                hook_result = _check_hook(
+                    hook_runner,
+                    state.get("session_id", ""),
+                    state.get("workspace"),
+                    tool_name,
+                    call.get("args") or {},
+                )
+                if hook_result.blocked:
+                    err_msg = ToolMessage(
+                        content=hook_result.feedback or f"Blocked by hook: {tool_name}",
+                        tool_call_id=call.get("id", f"call-{tool_call_count}"),
+                    )
+                    agent_messages.append(err_msg)
+                    new_messages.append(err_msg)
+                    writer({"type": "tool_blocked", "name": tool_name, "reason": hook_result.feedback})
+                    continue
+
             try:
                 tool_msg = execute_tool_by_name(
                     tools=tools,
                     call=call,
+                    hook_runner=hook_runner,
+                    budget=getattr(runtime, "result_budget", None),
+                    workspace=state.get("workspace"),
                     runtime=runtime,
                 )
                 agent_messages.append(tool_msg)
+                new_messages.append(tool_msg)
+
             except Exception as exc:
                 logger.warning("coding_agent_node: tool execution failed: %s", exc, exc_info=True)
-                agent_messages.append(
-                    ToolMessage(
-                        content=f"Error: {exc}",
-                        tool_call_id=call.get("id", f"call-{tool_call_count}"),
-                    )
+                err_msg = ToolMessage(
+                    content=f"Error: {exc}",
+                    tool_call_id=call.get("id", f"call-{tool_call_count}"),
                 )
+                agent_messages.append(err_msg)
+                new_messages.append(err_msg)
 
     summary = last_ai_content(agent_messages) or f"Executed {tool_call_count} tool calls in {loop_count} loops"
 
@@ -305,89 +444,211 @@ def coding_agent_node(state: CodingAgentState) -> dict[str, Any]:
     replan_count = int(state.get("replan_count", 0))
 
     if not plan_reasonable:
-        messages.append(AIMessage(content=f"[Plan Issue] {plan_issue}"))
+        issue_msg = AIMessage(content=f"[Plan Issue] {plan_issue}")
+        state.get('messages').append(issue_msg)
         if replan_count < REPLAN_THRESHOLD:
             new_replan = replan_count + 1
             updated_plan = dict(task_plan)
             updated_plan["error_feedback"] = plan_issue
             return {
-                "messages": [AIMessage(content=f"[Plan Issue] {plan_issue}")],
                 "task_plan": updated_plan,
                 "replan_count": new_replan,
                 "need_human_intervene": False,
             }
         else:
             return {
-                "messages": [AIMessage(content=f"[Plan Issue] {plan_issue}")],
                 "need_human_intervene": True,
                 "replan_count": replan_count,
             }
 
+    state.setdefault('messages', agent_messages)
     return {
-        "messages": [AIMessage(content=summary)],
         "need_human_intervene": False,
     }
 
 
+# todo： llm 去校验执行呀， 自己执行校验的命令干啥呀
 def valid_node(state: CodingAgentState) -> dict[str, Any]:
     """校验节点
 
-    执行 plan 预先定义的校验逻辑（编译、单元测试等），
-    判断编码结果是否达标。只处理编码实现层面的失败。
+    让 agent 自主验证编码结果是否符合预期。
+    plan 中的 validation_commands 只作为验证思路参考，不直接执行。
+    agent 通过工具（文件读取、bash 等）检查工作区，最终由 agent 判断 passed。
     """
     writer = _get_writer()
-    runtime: RuntimeState | None = state.get("runtime")
     task_plan: dict = state.get("task_plan", {})
     validation_commands: list[str] = task_plan.get("validation_commands", [])
+    runtime = _build_runtime_from_state(state)
 
-    results: list[dict[str, Any]] = []
-    all_passed = True
-    error_msg = ""
+    # Build tools（与 coding_agent_node 相同的工具集）
+    tools: list[Any] = []
+    try:
+        tools = build_tools(runtime) if runtime else []
+    except Exception as exc:
+        logger.warning("valid_node: tool build failed: %s", exc, exc_info=True)
 
-    for cmd in validation_commands:
+    # 构建校验提示词：让 agent 根据 plan 的验证思路自主检查
+    plan_description = task_plan.get("description", "")
+    subtasks = task_plan.get("subtasks", [])
+    system_prompt = (
+        "You are a verification agent. Inspect the workspace and determine if the coding task is complete.\n"
+        f"Task: {plan_description}\n"
+        f"Subtasks: {json.dumps(subtasks, ensure_ascii=False)}\n"
+    )
+    if validation_commands:
+        system_prompt += (
+            "\nVerification hints from the plan (use these as guidance, "
+            "adapt as needed based on actual workspace state):\n"
+        )
+        for cmd in validation_commands:
+            system_prompt += f"- {cmd}\n"
+    system_prompt += (
+        "\nUse the available tools to check the workspace. "
+        "Return ONLY a JSON object with these fields:\n"
+        '  "passed": boolean — true if the task is genuinely complete\n'
+        '  "reason": string — brief explanation\n'
+        '  "checks": list[{"name": string, "passed": boolean, "detail": string}] — individual checks performed\n'
+        "Do NOT include markdown fences or extra text."
+    )
+
+    messages: list[Any] = list(state.get("messages", []))
+    agent_messages: list[Any] = [SystemMessage(content=system_prompt), *messages]
+    new_messages: list[Any] = []
+
+    # Agent 自主校验循环（最多 8 轮工具调用）
+    max_loops = 8
+    loop_count = 0
+
+    while loop_count < max_loops:
+        loop_count += 1
         try:
-            from mokioclaw.tools.bash_tool import run_bash
-            exit_code, stdout, stderr = run_bash(runtime, cmd)
-            passed = exit_code == 0
-            results.append({
-                "command": cmd,
-                "passed": passed,
-                "exit_code": exit_code,
-                "stdout": (stdout or "")[:2000],
-                "stderr": (stderr or "")[:2000],
-            })
-            if not passed:
-                all_passed = False
-                error_msg = f"Command failed: {cmd}\nExit code: {exit_code}\nStderr: {(stderr or '')[:500]}"
-                break
+            response = create_model().bind_tools(tools).invoke(agent_messages)
         except Exception as exc:
-            all_passed = False
-            error_msg = f"Validation error: {exc}"
-            results.append({
-                "command": cmd,
+            logger.warning("valid_node: model invoke failed: %s", exc, exc_info=True)
+            validate_result = {
                 "passed": False,
-                "error": str(exc),
-            })
+                "error_msg": f"Model invoke failed: {exc}",
+                "fail_reason": f"Model invoke failed: {exc}",
+                "checks": [],
+            }
+            writer({"type": "validation_result", "passed": False, "error_msg": str(exc)})
+            return {
+                "validate_result": validate_result,
+                "attempt_count": int(state.get("attempt_count", 0)) + 1,
+            }
+
+        record_llm_usage(response)
+        agent_messages.append(response)
+        new_messages.append(response)
+
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
             break
 
-    fail_reason = error_msg if not all_passed else ""
+        writer({"type": "validation_tool_calls", "count": len(tool_calls), "loop": loop_count})
+
+        for call in tool_calls:
+            tool_name = call.get("name", "")
+
+            # Hook 拦截检查
+            hook_runner = state.get("hook_runner")
+            if hook_runner is not None:
+                hook_result = _check_hook(
+                    hook_runner,
+                    state.get("session_id", ""),
+                    state.get("workspace"),
+                    tool_name,
+                    call.get("args") or {},
+                )
+                if hook_result.blocked:
+                    err_msg = ToolMessage(
+                        content=hook_result.feedback or f"Blocked by hook: {tool_name}",
+                        tool_call_id=call.get("id", f"val-{loop_count}"),
+                    )
+                    agent_messages.append(err_msg)
+                    new_messages.append(err_msg)
+                    continue
+
+            try:
+                tool_msg = execute_tool_by_name(
+                    tools=tools,
+                    call=call,
+                    hook_runner=hook_runner,
+                    budget=getattr(runtime, "result_budget", None),
+                    workspace=state.get("workspace"),
+                    runtime=runtime,
+                )
+                agent_messages.append(tool_msg)
+                new_messages.append(tool_msg)
+            except Exception as exc:
+                logger.warning("valid_node: tool execution failed: %s", exc, exc_info=True)
+                err_msg = ToolMessage(
+                    content=f"Error: {exc}",
+                    tool_call_id=call.get("id", f"val-{loop_count}"),
+                )
+                agent_messages.append(err_msg)
+                new_messages.append(err_msg)
+
+    # 解析 agent 最终返回的 JSON 校验结果
+    validation_result = _parse_validation_result(agent_messages)
     attempt_count = int(state.get("attempt_count", 0)) + 1
 
-    validate_result = {
-        "passed": all_passed,
-        "error_msg": error_msg,
-        "fail_reason": fail_reason,
-        "checks": results,
-    }
-
-    writer({"type": "validation_result", "passed": all_passed, "error_msg": error_msg})
+    writer({"type": "validation_result", "passed": validation_result["passed"], "error_msg": validation_result.get("error_msg", "")})
 
     return {
-        "validate_result": validate_result,
+        "validate_result": validation_result,
         "attempt_count": attempt_count,
+        "messages": new_messages,
     }
 
 
+def _parse_validation_result(messages: list[Any]) -> dict[str, Any]:
+    """从 agent 消息历史中提取最终的校验 JSON 结果"""
+    # 从最后一条 AIMessage 中提取 JSON
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            text = str(getattr(msg, "content", "") or "").strip()
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].strip() == "```":
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+            parsed = _extract_json(text)
+            if parsed and isinstance(parsed, dict):
+                return {
+                    "passed": bool(parsed.get("passed", False)),
+                    "error_msg": str(parsed.get("reason", "")),
+                    "fail_reason": str(parsed.get("reason", "")),
+                    "checks": parsed.get("checks", []),
+                }
+    # 兜底：agent 没返回有效 JSON，标记为失败
+    return {
+        "passed": False,
+        "error_msg": "Verifier did not return valid JSON.",
+        "fail_reason": "Verifier did not return valid JSON.",
+        "checks": [],
+    }
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
+    """从文本中提取 JSON 对象"""
+    import re
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    raw = fenced.group(1) if fenced else text
+    start = raw.find("{")
+    if start == -1:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        parsed, _ = decoder.raw_decode(raw, start)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+# todo： 不行就先不要了
 def human_intervene_marker_node(state: CodingAgentState) -> dict[str, Any]:
     """人工介入标记节点
 
@@ -432,6 +693,7 @@ def human_intervene_marker_node(state: CodingAgentState) -> dict[str, Any]:
     }
 
 
+# todo 持久化  session.json  git commit 持久话turn_xxx.json文件
 def finally_node(state: CodingAgentState) -> dict[str, Any]:
     """终止节点
 
@@ -456,12 +718,12 @@ def finally_node(state: CodingAgentState) -> dict[str, Any]:
 # ============================================================
 
 def _evaluate_plan_quality(
-    *,
-    plan_description: str,
-    subtasks: list[dict],
-    tool_call_count: int,
-    loop_count: int,
-    summary: str,
+        *,
+        plan_description: str,
+        subtasks: list[dict],
+        tool_call_count: int,
+        loop_count: int,
+        summary: str,
 ) -> tuple[bool, str]:
     """评估 plan 是否合理可执行"""
     if not plan_description and not subtasks:
@@ -473,6 +735,34 @@ def _evaluate_plan_quality(
     if not summary or summary == "(no result)":
         return False, "Agent produced no output after execution."
     return True, ""
+
+
+def _check_hook(
+    hook_runner: HookRunner,
+    session_id: str,
+    workspace: Optional[Path],
+    tool_name: str,
+    tool_args: dict[str, Any],
+) -> Any:
+    """执行 PreToolUse Hook，返回合并结果"""
+    try:
+        from mokioclaw.core.hooks import HookEvent, HookPayload
+        result = hook_runner.run(
+            HookEvent.PreToolUse,
+            HookPayload(
+                event=HookEvent.PreToolUse,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                session_id=session_id,
+                workspace=str(workspace) if workspace else "",
+            ),
+        )
+        return result
+    except Exception as exc:
+        logger.debug("coding_agent_node: hook check skipped (%s)", exc)
+        # 返回默认允许
+        from mokioclaw.core.hooks import HookResult
+        return HookResult()
 
 
 # ============================================================
@@ -609,17 +899,34 @@ class Session:
 
     session_id: str
     compiled_graph: Any  # CompiledGraph — 图只编译一次
-    current_state: CodingAgentState  # 内存常驻 state，内存为权威源，就是agent运行的时候产生的交互数据
-    is_running: bool = False # 是不是在运行
-    replan_max: int = REPLAN_THRESHOLD # plan agent最大交互次数
-    max_attempt: int = MAX_ATTEMPT_DEFAULT # 最大 校验和code agent交互次数
-    persistence: Optional[SessionPersistence] = None # 会话和state持久化
-    workspace: Optional[Path] = None # 工作空间
-    current_turn_id: int = 0 # 当前会话的轮数
+
+    # LLM 工作上下文
+    messages: list[BaseMessage]
+    # 当前轮次的原始用户需求
+    task: str
+    # plan_node 输出
+    task_plan: dict
+    # 重规划计数（coding 触发 replan 时 +1）
+    replan_count: int
+    # 编码重试计数（仅编码失败累加，replan 不消耗）
+    attempt_count: int
+    # valid_node 输出
+    validate_result: dict
+
+    # 是否需要人工介入
+    need_human_intervene: bool
+
+    workspace: Path # 整个项目得工作目录
+    is_running: bool = False  # 是不是在运行
+    replan_max: int = REPLAN_THRESHOLD  # plan agent最大交互次数
+    max_attempt: int = MAX_ATTEMPT_DEFAULT  # 最大 校验和code agent交互次数
+    persistence: Optional[SessionPersistence] = None  # 会话和state持久化
+    sessionPath: Optional[Path] = None  # 这个轮会话保存得位置
+    current_turn_id: int = 0  # 当前会话的轮数
     mcp_host: Optional[Any] = None  # MCPHost（渐进披露，有状态）
     skill_host: Optional[Any] = None  # SkillHost（渐进披露，有状态）
-    authorizer: Optional[AgentAuthorizer] = None # 审批引擎
-    hook_runner: Optional[HookRunner] = None # Hook 执行引擎
+    authorizer: Optional[AgentAuthorizer] = None  # 审批引擎
+    hook_runner: Optional[HookRunner] = None  # Hook 执行引擎
 
 
 # ============================================================
@@ -637,60 +944,125 @@ class SessionManager:
     def __init__(self, sessions_root: Optional[Path] = None) -> None:
         self._sessions_root = sessions_root or Path(AGENT_SESSIONS_DIR)
         self._sessions: Dict[str, Session] = {}
+        self._warmup()
+
+    def _warmup(self) -> None:
+        """扫描磁盘，将已存在的 session 加载到内存"""
+        if not self._sessions_root.exists():
+            return
+        for entry in self._sessions_root.iterdir():
+            if not entry.is_dir():
+                continue
+            sid = entry.name
+            if sid in self._sessions:
+                continue
+            try:
+                self._init_session(sid)
+                logger.info("session warmup loaded", extra={"session_id": sid})
+            except Exception as exc:
+                logger.warning("session warmup skipped", extra={"session_id": sid, "error": str(exc)})
+
+    def _init_session(self, session_id: str) -> Session:
+        """共用的 session 初始化逻辑（graph / persistence / mcp / skills / authorizer）
+
+        注意两个 workspace 的区别：
+          - session_path: agent 内部存储目录（session.json、turns/），在用户编码空间下的 .agent_sessions/ 里
+          - user_workspace: 用户编码目录（如 D://test_springboot），由 _apply_runtime_config 注入
+                          初始化时先设一个默认值，后面会被 _apply_runtime_config 修正
+        """
+        compiled_graph = build_graph().compile()
+
+        # 先创建 persistence，sessions_root 后续会随 workspace 更新而更新
+        persistence = SessionPersistence(sessions_root=self._sessions_root)
+        session_path = persistence.session_dir(session_id)
+
+        # 从磁盘恢复已有状态
+        meta = persistence.load_session_meta(session_id)
+        raw_disk_messages = meta.get("messages", [])
+        disk_messages = _deserialize_messages(raw_disk_messages) if raw_disk_messages else []
+        initial_state = build_initial_state(
+            messages=disk_messages,
+            # user_workspace 不在这里设置，等 _apply_runtime_config 注入
+            approval_mode="inline",
+        )
+        initial_state["replan_count"] = meta.get("replan_count", 0)
+        initial_state["attempt_count"] = meta.get("attempt_count", 0)
+
+        # 默认 user_workspace：优先 session_path（warmup 场景），否则 cwd
+        # 后续会被 _apply_runtime_config 覆盖为用户的实际编码目录
+        user_workspace = session_path if session_path.exists() else Path.cwd()
+
+        # 同步 persistence 的存储根目录到 user_workspace/.agent_sessions/
+        persistence.update_workspace(user_workspace)
+
+        mcp_mgr = MCPManager(workspace=user_workspace)
+        mcp_host = MCPHost(mcp_mgr)
+        skills_mgr = SkillsManager(workspace=user_workspace)
+        skill_host = SkillHost(skills_mgr)
+
+        try:
+            classifier_model = create_model()
+        except Exception:
+            classifier_model = None
+        classifier = AutoModeClassifier(model=classifier_model)
+        authorizer = AgentAuthorizer(classifier=classifier)
+
+        # HookRunner：加载 user_workspace 下的 hook 配置
+        hook_runner = HookRunner()
+        if user_workspace.exists():
+            try:
+                load_hooks_into_runner(hook_runner, user_workspace)
+            except Exception as exc:
+                logger.debug("_init_session: hook load skipped for %s (%s)", session_id, exc)
+
+        session = Session(
+            session_id=session_id,
+            compiled_graph=compiled_graph,
+            current_state=initial_state,
+            persistence=persistence,
+            workspace=user_workspace,
+            mcp_host=mcp_host,
+            skill_host=skill_host,
+            authorizer=authorizer,
+            hook_runner=hook_runner,
+            current_turn_id=meta.get("current_turn_id", 0),
+        )
+        self._sessions[session_id] = session
+        return session
 
     def create_session(self, session_id: Optional[str] = None) -> Session:
         """创建新 session
 
         - 编译图一次
         - 初始化 state
-        - 初始化持久化目录（git init）
-        - 存入内存字典
+        - 若磁盘已存在（warmup 已加载），直接复用
+        - 否则初始化持久化目录（git init）并存入内存字典
         """
         sid = session_id or str(uuid.uuid4())
+
+        # warmup 已从磁盘加载，直接复用
         if sid in self._sessions:
-            raise ValueError(f"Session {sid} already exists")
+            return self._sessions[sid]
 
-        compiled_graph = build_graph().compile()
-        initial_state = build_initial_state()
+        session = self._init_session(sid)
 
-        # 初始化持久化层
-        persistence = SessionPersistence(sessions_root=self._sessions_root)
+        persistence = session.persistence
         persistence.save_session_meta(sid, persistence._empty_session_meta(sid))
         git_init(persistence.session_dir(sid))
 
-        # 初始化 MCP / Skills Host（渐进披露）
-        mcp_mgr = MCPManager(workspace=persistence.session_dir(sid))
-        mcp_host = MCPHost(mcp_mgr)
-        skills_mgr = SkillsManager(workspace=persistence.session_dir(sid))
-        skill_host = SkillHost(skills_mgr)
+        # 目录已创建，补加载 hooks
+        if session.workspace and session.workspace.exists() and session.hook_runner is not None:
+            try:
+                load_hooks_into_runner(session.hook_runner, session.workspace)
+            except Exception as exc:
+                logger.debug("create_session: hook load skipped (%s)", exc)
 
-        # 初始化 Auto 模式分类器（使用独立模型实例，与主 Agent 模型隔离）
-        try:
-            classifier_model = create_model()
-        except Exception:
-            classifier_model = None
-        classifier = AutoModeClassifier(model=classifier_model)
-
-        # 初始化 Agent 授权器
-        authorizer = AgentAuthorizer(classifier=classifier)
-
-        session = Session(
-            session_id=sid,
-            compiled_graph=compiled_graph,
-            current_state=initial_state,
-            persistence=persistence,
-            workspace=persistence.session_dir(sid),
-            mcp_host=mcp_host,
-            skill_host=skill_host,
-            authorizer=authorizer,
-        )
-        self._sessions[sid] = session
         return session
 
     def get_session(self, session_id: str) -> Session:
-        """获取 session，不存在则抛异常"""
+        """获取 session，不存在则自动创建"""
         if session_id not in self._sessions:
-            raise KeyError(f"Session {session_id} not found")
+            return self.create_session(session_id)
         return self._sessions[session_id]
 
     def destroy_session(self, session_id: str) -> None:
@@ -712,12 +1084,12 @@ class SessionManager:
         session.persistence.save_session_meta(session_id, meta)
 
     def write_turn_snapshot(
-        self,
-        session_id: str,
-        turn_id: int,
-        git_commit_hash: str,
-        final_state: dict[str, Any],
-        full_messages: list[Any],
+            self,
+            session_id: str,
+            turn_id: int,
+            git_commit_hash: str,
+            final_state: dict[str, Any],
+            full_messages: list[Any],
     ) -> None:
         """写入 turn 快照"""
         session = self.get_session(session_id)
@@ -728,7 +1100,7 @@ class SessionManager:
         )
 
     def read_turn_snapshot(
-        self, session_id: str, turn_id: int
+            self, session_id: str, turn_id: int
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """读取 turn 快照，返回 (graph_state, snapshot_raw)"""
         session = self.get_session(session_id)
@@ -766,7 +1138,7 @@ class SessionManager:
         return graph_state
 
     def stream_session_events(
-        self, session_id: str, new_user_input: Optional[str] = None
+            self, session_id: str, new_user_input: Optional[str] = None
     ) -> Generator[dict[str, Any], None, None]:
         """流式驱动图执行，yield 每个事件
 
@@ -786,8 +1158,8 @@ class SessionManager:
         if session.is_running:
             raise RuntimeError(f"Session {session_id} is already running")
 
-        # 加载磁盘上的完整消息作为事实源
-        if session.persistence is not None:
+        # 加载磁盘上的完整消息作为事实源（仅 messages 为空时才加载）
+        if session.persistence is not None and not session.current_state.get("messages"):
             disk_meta = session.persistence.load_session_meta(session_id)
             disk_messages = disk_meta.get("messages", [])
             if disk_messages:
@@ -795,22 +1167,44 @@ class SessionManager:
 
         # 追加本轮用户输入
         if new_user_input:
-            messages = list(session.current_state.get("messages", []))
             from langchain_core.messages import HumanMessage
-            messages.append(HumanMessage(content=new_user_input))
-            session.current_state["messages"] = messages
+            session.current_state.setdefault("messages", []).append(
+                HumanMessage(content=new_user_input)
+            )
 
         # 记录 graph 启动前的完整消息（用于 diff）
         old_full_messages = list(session.current_state.get("messages", []))
         session.is_running = True
 
+        # 注入运行时字段（从 session  workspace 等）
+        _inject_runtime_fields(session)
+        # 注入 session 上下文（MCP / Skills / Hook），节点从 state 读取
+        _inject_session_context(session)
+
         try:
             config = {"configurable": {"thread_id": session_id}, "recursion_limit": 50}
 
-            for event in session.compiled_graph.stream(
-                session.current_state,
+            # graph 逐步更新，需要收集最后一份完整 state 做回写
+            final_state: dict[str, Any] = {}
+            for chunk in session.compiled_graph.stream(
+                    session.current_state,
+                    config=config,
             ):
-                yield event
+                # chunk 格式: {node_name: state_update} 或 {node_name: (state_update, metadata)}
+                for node_output in chunk.values():
+                    if isinstance(node_output, dict):
+                        final_state.update(node_output)
+                    elif isinstance(node_output, tuple) and node_output:
+                        final_state.update(node_output[0])
+                yield chunk
+
+            # graph 结束后回写 final state 到内存
+            if final_state:
+                merged = dict(session.current_state)
+                for key in _graph_state_keys:
+                    if key in final_state:
+                        merged[key] = final_state[key]
+                session.current_state = merged
 
             # graph 结束后，在外部层执行持久化
             if session.persistence is not None and session.workspace is not None:
@@ -835,19 +1229,19 @@ class SessionManager:
     # ----------------------------------------------------------
 
     def _restore_state(
-        self, graph_state: dict[str, Any], current: CodingAgentState
+            self, graph_state: dict[str, Any], current: CodingAgentState
     ) -> CodingAgentState:
         """从快照 graph_state 恢复内存 state，保留类型兼容性"""
         restored = dict(current)
         for key in (
-            "messages",
-            "task_plan",
-            "replan_count",
-            "attempt_count",
-            "max_attempt",
-            "validate_result",
-            "tool_artifacts",
-            "need_human_intervene",
+                "messages",
+                "task_plan",
+                "replan_count",
+                "attempt_count",
+                "max_attempt",
+                "validate_result",
+                "tool_artifacts",
+                "need_human_intervene",
         ):
             if key in graph_state:
                 restored[key] = graph_state[key]
@@ -874,10 +1268,18 @@ def get_session_manager() -> SessionManager:
 # ============================================================
 
 def build_initial_state(
-    messages: Optional[list[BaseMessage]] = None,
-    replan_max: int = REPLAN_THRESHOLD,
-    max_attempt: int = MAX_ATTEMPT_DEFAULT,
-    task: str = "",
+        messages: Optional[list[BaseMessage]] = None,
+        replan_max: int = REPLAN_THRESHOLD,
+        max_attempt: int = MAX_ATTEMPT_DEFAULT,
+        task: str = "",
+        *,
+        workspace: Any = None,
+        approval_mode: str = "inline",
+        allowed_tools: Optional[list[str]] = None,
+        disallowed_tools: Optional[list[str]] = None,
+        bash_default_timeout: int = 120,
+        bash_max_timeout: int = 600,
+        bash_max_output_chars: int = 6000,
 ) -> CodingAgentState:
     """构建初始 GraphState
 
@@ -886,13 +1288,20 @@ def build_initial_state(
         replan_max: replan 阈值
         max_attempt: 编码重试阈值
         task: 当前轮次原始用户需求
+        workspace: 工作区路径
+        approval_mode: 审批模式
+        allowed_tools: 允许的工具列表
+        disallowed_tools: 禁止的工具列表
+        bash_default_timeout: bash 默认超时（秒）
+        bash_max_timeout: bash 最大超时（秒）
+        bash_max_output_chars: bash 最大输出字符数
 
     Returns:
         完整初始化的 CodingAgentState 字典
     """
     return {
         "messages": list(messages or []),
-        "runtime": None,
+        "task": task,
         "task_plan": {},
         "replan_count": 0,
         "attempt_count": 0,
@@ -901,5 +1310,14 @@ def build_initial_state(
         "tool_artifacts": {},
         "need_human_intervene": False,
         "resume_action": "",
-        "task": task,
+        "workspace": workspace,
+        "approval_mode": approval_mode,
+        "allowed_tools": list(allowed_tools or []),
+        "disallowed_tools": list(disallowed_tools or []),
+        "approval_handler": None,
+        "bash_default_timeout": bash_default_timeout,
+        "bash_max_timeout": bash_max_timeout,
+        "bash_max_output_chars": bash_max_output_chars,
+        "loaded_tools": {},
+        "file_state_map": {},
     }

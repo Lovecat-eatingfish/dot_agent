@@ -395,6 +395,7 @@ def coerce_bool(value: Any, default: bool = False) -> bool:
 # 工具执行
 # ---------------------------------------------------------------------------
 
+# todo 有没有集成mcp 和skill 的工具的调用， 搁着胡扯呢
 def execute_tool_by_name(
     tools: list[Any],
     call: dict[str, Any],

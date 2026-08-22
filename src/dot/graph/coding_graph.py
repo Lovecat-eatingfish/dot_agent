@@ -117,6 +117,37 @@ def context_compress_node(state: DotAgentState) -> dict[str, Any]:
     return {}
 
 
+def _invoke_llm(messages: list[Any], *, node: str, tools: list[Any] | None = None, config: Any = None) -> Any:
+    """统一的 LLM 调用入口（带链路追踪 span）"""
+    import os
+
+    from ..trace import get_tracer
+
+    span = get_tracer().start_span(
+        "llm", "llm_inference",
+        tags={
+            "node": node,
+            "model": os.environ.get("MODEL", ""),
+            "messages": len(messages),
+            "with_tools": bool(tools),
+        },
+    )
+    try:
+        model = create_model()
+        if tools:
+            model = model.bind_tools(tools)
+        response = model.invoke(messages, config=config) if config is not None else model.invoke(messages)
+        content = getattr(response, "content", "")
+        tool_calls = getattr(response, "tool_calls", None) or []
+        span.set_output_summary(f"content_len={len(str(content))} tool_calls={len(tool_calls)}")
+        span.finish()
+        return response
+    except BaseException as exc:
+        span.set_output_summary(f"{type(exc).__name__}: {exc}")
+        span.finish(exc)
+        raise
+
+
 def plan_node(state: DotAgentState) -> dict[str, Any]:
     """规划节点：读取 messages，生成 task_plan JSON"""
     session = state["session"]
@@ -135,8 +166,9 @@ def plan_node(state: DotAgentState) -> dict[str, Any]:
     plan: dict[str, Any] = {}
     try:
         config = RunnableConfig(**{"response_format": {"type": "json_object"}})
-        response = create_model().invoke(
+        response = _invoke_llm(
             [SystemMessage(content=system_prompt), *session.messages],
+            node="plan_node",
             config=config,
         )
         session.messages.append(response)
@@ -184,6 +216,7 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
 
     plan_description = task_plan.get("description", "")
     subtasks = task_plan.get("subtasks", [])
+    # 约束条件
     constraints = task_plan.get("constraints", [])
 
     # 静态上下文（G6：用户自定义指令 + 记忆索引），只注入 coding_agent
@@ -227,7 +260,7 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
         logger.info("[node:coding_agent] loop=%d/%d, messages_in_context=%d", loop_count, CODING_MAX_LOOPS, len(agent_messages))
 
         try:
-            response = create_model().bind_tools(tools).invoke(agent_messages)
+            response = _invoke_llm(agent_messages, node="coding_agent", tools=tools)
         except Exception as exc:
             logger.warning("coding_agent_node: model invoke failed: %s", exc, exc_info=True)
             break
@@ -314,7 +347,7 @@ def valid_node(state: DotAgentState) -> dict[str, Any]:
         agent_messages: list[Any] = [SystemMessage(content=system_prompt), *session.messages]
 
         try:
-            response = create_model().bind_tools(tools).invoke(agent_messages)
+            response = _invoke_llm(agent_messages, node="valid_node", tools=tools)
         except Exception as exc:
             logger.warning("valid_node: model invoke failed: %s", exc, exc_info=True)
             session.validate_result = {
@@ -456,16 +489,41 @@ def route_valid_node(state: DotAgentState) -> str:
 # Graph Builder
 # ============================================================
 
+def _traced_node(name: str, fn):
+    """节点追踪包装：service=graph_node，自动挂 turn span 之下"""
+    from ..trace import get_tracer
+
+    def wrapper(state: DotAgentState) -> dict[str, Any]:
+        session = state.get("session") if isinstance(state, dict) else None
+        span = get_tracer().start_span(
+            "graph_node", name,
+            input_summary=(getattr(session, "task", "") or "")[:80],
+        )
+        try:
+            result = fn(state)
+            if isinstance(result, dict) and result:
+                span.set_output_summary(f"keys={sorted(result.keys())[:5]}")
+            else:
+                span.set_output_summary("state-on-session")
+            span.finish()
+            return result
+        except BaseException as exc:
+            span.finish(exc)
+            raise
+
+    return wrapper
+
+
 def build_graph() -> StateGraph:
     """构建未编译的图（无 checkpointer：介入/断点机制全部自定义）"""
     graph = StateGraph(DotAgentState)
 
-    graph.add_node("context_compress", context_compress_node)
-    graph.add_node("plan_node", plan_node)
-    graph.add_node("coding_agent", coding_agent_node)
-    graph.add_node("valid_node", valid_node)
-    graph.add_node("human_intervene", human_intervene_node)
-    graph.add_node("finally_node", finally_node)
+    graph.add_node("context_compress", _traced_node("context_compress", context_compress_node))
+    graph.add_node("plan_node", _traced_node("plan_node", plan_node))
+    graph.add_node("coding_agent", _traced_node("coding_agent", coding_agent_node))
+    graph.add_node("valid_node", _traced_node("valid_node", valid_node))
+    graph.add_node("human_intervene", _traced_node("human_intervene", human_intervene_node))
+    graph.add_node("finally_node", _traced_node("finally_node", finally_node))
 
     # 固定链路
     graph.add_edge(START, "context_compress")
@@ -517,12 +575,48 @@ def _run_tool_call(
     *,
     prefix: str,
 ) -> ToolMessage | None:
-    """执行单个工具调用（对齐 fix.md 的分发规则）：
+    """执行单个工具调用（对齐 fix.md / fix-权限控制.md）：
+    0. 权限校验（最前）：三级拦截（系统黑名单→项目黑名单→模式规则）
+       ASK → 控制台 Y/N 审批 → 确认后带单次标记重走完整校验
     1. mcp_ / skill_ 开头 → dispatch_special_tool 特殊处理
        （mcp_ 未加载返回定义、已加载转发执行；skill_ 返回 skill 内容）
     2. 其余系统工具 → Hook 拦截 → execute_tool_by_name
     """
     tool_name = call.get("name", "")
+
+    # ---- 权限校验（统一入口，所有工具必经）----
+    from ..core.permission import Decision, get_permission_manager
+
+    pm = get_permission_manager()
+    args = call.get("args") or {}
+    agent_mode = getattr(runtime, "agent_mode", "auto") if runtime is not None else "auto"
+    decision = pm.check(tool_name, args, agent_mode=agent_mode, workspace=session.workspace)
+
+    if decision.decision is Decision.DENY:
+        writer({"type": "permission_denied", "name": tool_name, "source": decision.source, "reason": decision.reason})
+        return ToolMessage(
+            content=decision.deny_message(),
+            tool_call_id=call.get("id", f"{prefix}-{tool_name}"),
+        )
+
+    if decision.decision is Decision.ASK:
+        approved = pm.ask_user(tool_name, args, decision, agent_mode=agent_mode)
+        if not approved:
+            writer({"type": "permission_denied", "name": tool_name, "source": "user", "reason": "user rejected"})
+            return ToolMessage(
+                content="用户拒绝了本次操作的审批请求。",
+                tool_call_id=call.get("id", f"{prefix}-{tool_name}"),
+            )
+        # 确认后重走完整校验（黑名单依然拦截，模式层单次放行）
+        decision = pm.check(
+            tool_name, args, agent_mode=agent_mode, workspace=session.workspace, approved=True,
+        )
+        if decision.decision is Decision.DENY:
+            writer({"type": "permission_denied", "name": tool_name, "source": decision.source, "reason": decision.reason})
+            return ToolMessage(
+                content=decision.deny_message(),
+                tool_call_id=call.get("id", f"{prefix}-{tool_name}"),
+            )
 
     # 渐进披露特殊分发（mcp_/skill_ 前缀）
     special = dispatch_special_tool(session, call)

@@ -18,6 +18,7 @@ from typing import Any
 
 from ..core.git_utils import agent_git_commit, agent_git_reset_hard
 from ..core.log import get_logger
+from ..trace import get_tracer
 from ..core.utils import utc_now
 
 logger = get_logger(__name__)
@@ -305,6 +306,10 @@ def persist_turn(
     """
     full_messages = list(session.messages)
     logger.info("[persist_turn] session=%s, turn=%d, messages=%d", session_id, turn_id, len(full_messages))
+    span = get_tracer().start_span(
+        "session", "persist_turn",
+        tags={"turn_id": turn_id, "messages": len(full_messages)},
+    )
 
     # 全量 session.json
     meta = {
@@ -340,6 +345,8 @@ def persist_turn(
         final_state=_session_to_state(session),
         full_messages=full_messages,
     )
+    span.set_output_summary(f"git={git_hash[:8] if git_hash else 'none'}")
+    span.finish()
 
 
 def _read_created_at(persistence: SessionPersistence, session_id: str) -> str:

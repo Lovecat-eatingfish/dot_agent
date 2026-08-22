@@ -1,45 +1,26 @@
 """
-dot.mcp — MCP (Model Context Protocol) 协议栈 + 渐进披露
+dot.mcp — MCP 集成（基于官方 MCP SDK，doc/fix-mcp.md）
 
-  - protocol:   JSON-RPC 消息格式、协议常量、数据结构
-  - transport:  传输层（stdio 子进程 + HTTP/SSE）
-  - client:     单 Server 连接（initialize 握手、工具发现、调用）
-  - sandbox:    MCP 调用沙箱策略
-  - bridge:     多 Server 桥接管理器 + LangChain 集成
-  - disclosure: 渐进披露（目录注入 + LoadMcpTool 按需加载）
-  - manager:    MCPManager（bridge 的生命周期包装）
-  - host:       MCPHost / MCPToolExecutor（mcp_ 前缀映射 + 运行时拦截）
+架构：
+  - client:        SdkClient（官方 ClientSession 封装：stdio / sse / streamable-http）
+  - _async_bridge: AsyncMCPBridge（后台 event loop 线程驱动 SDK，对外同步 API）
+  - manager:       MCPManager（.dot/mcp.json 配置加载 + 连接管理）
+  - host:          MCPHost / MCPToolExecutor（渐进披露：目录注入 + 按需加载）
 """
 from __future__ import annotations
 
-from .bridge import MCPBridge, get_mcp_bridge, reset_mcp_bridge
-from .client import MCPClient
-from .disclosure import (
-    build_load_mcp_tool,
-    build_mcp_catalog_text,
-    select_mcp_tools_for_bind,
-    should_defer_mcp_schemas,
-)
+from ._async_bridge import AsyncMCPBridge
+from .client import MCPToolInfo, SdkClient, SdkClientConfig
 from .host import MCPHost, MCPToolExecutor
-from .manager import MCPManager
-from .protocol import MCPResource, MCPTool, MCPToolResult
-from .sandbox import SandboxPolicy, workspace_policy
+from .manager import MCPManager, infer_transport_type
 
 __all__ = [
-    "MCPBridge",
-    "get_mcp_bridge",
-    "reset_mcp_bridge",
-    "MCPClient",
-    "build_load_mcp_tool",
-    "build_mcp_catalog_text",
-    "select_mcp_tools_for_bind",
-    "should_defer_mcp_schemas",
+    "AsyncMCPBridge",
+    "SdkClient",
+    "SdkClientConfig",
+    "MCPToolInfo",
+    "MCPManager",
     "MCPHost",
     "MCPToolExecutor",
-    "MCPManager",
-    "MCPResource",
-    "MCPTool",
-    "MCPToolResult",
-    "SandboxPolicy",
-    "workspace_policy",
+    "infer_transport_type",
 ]

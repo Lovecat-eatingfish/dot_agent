@@ -1,479 +1,209 @@
 """
-MCP Client
+SdkClient — 官方 MCP SDK 客户端封装（单 Server 连接）
 
-连接单个 MCP Server，处理 initialize 握手、工具发现和工具调用。
-每个 MCPClient 实例管理一个 Server 连接。
+使用官方 mcp 库的 ClientSession，支持三种传输：
+  - stdio: stdio_client + StdioServerParameters（本地子进程 server）
+  - sse:   sse_client（SSE 远程 server）
+  - http:  streamable_http_client（streamable-http 远程 server，如高德 mcp.amap.com/mcp）
+
+注意：官方 SDK 是 async 的，本类的 async 方法由 AsyncMCPBridge
+在后台 event loop 线程内调用；对外不暴露同步 API。
 """
 from __future__ import annotations
 
-import re
-import threading
-import time
-from typing import Any
+from contextlib import AsyncExitStack
+from dataclasses import dataclass, field
+from typing import Any, Optional, TypedDict
 
-import os
 from ..core.log import get_logger
-from .protocol import (
-    MCPServerState,
-    MCPInitializeResult,
-    MCPResource,
-    MCPTool,
-    MCPToolResult,
-    build_error_response,
-    build_notification,
-    build_request,
-    build_response,
-    extract_content_parts,
-    is_response,
-    parse_message,
-)
-from .sandbox import SandboxPolicy
-from .transport import MCPTransportBase
 
 logger = get_logger(__name__)
 
-
-def _mcp_timeout(default: int) -> int:
-    return int(os.getenv("MCP_TIMEOUT", str(default)))
-
-
-def _mcp_tool_timeout(default: int) -> int:
-    return int(os.getenv("MCP_TOOL_TIMEOUT", str(default)))
+# initialize / 请求默认超时（秒）
+INIT_TIMEOUT = 15
 
 
-def _max_mcp_output_tokens(default: int) -> int:
-    return int(os.getenv("MAX_MCP_OUTPUT_TOKENS", str(default)))
+class SdkClientConfig(TypedDict, total=False):
+    """单个 MCP Server 的连接配置（与 .dot/mcp.json 的 server 段对应）"""
+    name: str
+    transport_type: str  # "stdio" | "sse" | "http"
+    # http / sse
+    url: str
+    headers: dict[str, str]
+    # stdio
+    command: str
+    args: list[str]
+    env: dict[str, str]
+    cwd: str
 
-# initialize 超时时间（秒）
-_INIT_TIMEOUT = 15.0
-# 工具调用默认超时
-_CALL_TIMEOUT = 60.0
-# 握手后 resources/list 拉取超时（不应拖慢 connect）
-_RESOURCES_TIMEOUT = 5.0
+
+@dataclass
+class MCPToolInfo:
+    """统一的工具元数据（渐进披露层使用，不依赖 SDK 类型）"""
+    name: str
+    description: str
+    input_schema: dict[str, Any] = field(default_factory=dict)
+    server_name: str = ""
 
 
-class MCPClient:
-    """MCP Server 客户端
+class SdkClient:
+    """官方 ClientSession 的单连接封装
 
-    管理单个 MCP Server 的连接生命周期：
-    1. connect() — 启动子进程，发送 initialize
-    2. initialize() — 握手，获取 server capabilities + tools
-    3. call_tool() — 调用工具（经沙箱验证）
-    4. disconnect() — 清理
+    生命周期：connect()（建传输 + 握手）→ list_tools/call_tool/... → disconnect()
+    全部为 async 方法，须在同一 event loop 内调用。
     """
 
-    def __init__(
-        self,
-        name: str,
-        transport: MCPTransportBase,
-        sandbox_policy: SandboxPolicy | None = None,
-    ) -> None:
-        self.name = name
-        self._transport = transport
-        self._policy = sandbox_policy
-        self._state = MCPServerState.DISCONNECTED
-        self._tools: list[MCPTool] = []
-        self._resources: list[dict[str, Any]] = []
-        self._resources_fetched: bool = False
-        self._capabilities: dict[str, Any] = {}
-        self._server_info: dict[str, Any] = {}
-        self._request_counter = 0
-        # 请求-响应周期互斥：并发调用同一 server 时，receive 循环会丢弃
-        # 不匹配 id 的响应（互相吞消息）且 _next_id 的 += 非原子 → 必须串行
-        self._call_lock = threading.Lock()
+    def __init__(self, config: SdkClientConfig) -> None:
+        self.config = config
+        self.name: str = config.get("name", "")
+        self._stack: Optional[AsyncExitStack] = None
+        self._session: Any = None
+        self.connected = False
 
-    @property
-    def state(self) -> MCPServerState:
-        return self._state
+    # ============================================================
+    # 连接生命周期
+    # ============================================================
 
-    @property
-    def tools(self) -> list[MCPTool]:
-        return list(self._tools)
+    async def connect(self) -> None:
+        """建立传输 + initialize 握手"""
+        import asyncio
 
-    @property
-    def server_info(self) -> dict[str, Any]:
-        return dict(self._server_info)
+        from mcp import ClientSession
 
-    @property
-    def capabilities(self) -> dict[str, Any]:
-        return dict(self._capabilities)
-
-    def connect(self) -> bool:
-        """连接到 MCP Server 并完成 initialize 握手
-
-        Returns:
-            是否成功连接
-        """
+        self._stack = AsyncExitStack()
         try:
-            self._transport.connect()
-            self._state = MCPServerState.INITIALIZING
-            return self._initialize()
-        except Exception as exc:
-            logger.error("MCP client '%s' connect failed: %s", self.name, exc)
-            self._state = MCPServerState.FAILED
-            return False
-
-    def _initialize(self) -> bool:
-        """发送 initialize 请求并等待响应"""
-        req_id = self._next_id()
-        params = {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {
-                "roots": {"listChanged": False},
-                "sampling": {},
-            },
-            "clientInfo": {
-                "name": "dot_agent",
-                "version": "0.1.0",
-            },
-        }
-        self._transport.send(build_request("initialize", params, req_id))
-
-        # 等待响应
-        deadline = time.time() + _INIT_TIMEOUT
-        while time.time() < deadline:
-            msg = self._transport.receive(timeout=deadline - time.time())
-            if msg is None:
-                break
-            if not isinstance(msg, dict):
-                continue
-            if not is_response(msg):
-                continue
-            if str(msg.get("id")) != str(req_id):
-                continue
-            if "error" in msg:
-                logger.error("MCP initialize error: %s", msg["error"])
-                self._state = MCPServerState.FAILED
-                return False
-            result = msg.get("result", {})
-            self._capabilities = result.get("capabilities", {})
-            self._server_info = result.get("serverInfo", {})
-            self._state = MCPServerState.CONNECTED
+            streams = await self._stack.enter_async_context(self._open_transport())
+            read, write = streams[0], streams[1]
+            self._session = await self._stack.enter_async_context(ClientSession(read, write))
+            await asyncio.wait_for(self._session.initialize(), timeout=INIT_TIMEOUT)
+            self.connected = True
+            server_info = getattr(self._session, "server_info", None)
             logger.info(
-                "MCP client '%s' connected to %s v%s",
+                "MCP server '%s' connected (%s)%s",
                 self.name,
-                self._server_info.get("name", "?"),
-                self._server_info.get("version", "?"),
+                self.config.get("transport_type"),
+                f" → {getattr(server_info, 'name', '?')}" if server_info else "",
             )
-            # 发送 initialized 通知
-            self._transport.send(build_notification("notifications/initialized"))
-            # 握手成功后按 capabilities 拉取 resources（对齐 Claude Code resources 注入）
-            if self._capabilities.get("resources"):
-                try:
-                    self.list_resources()
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("MCP '%s' list_resources after init failed: %s", self.name, exc)
-            return True
+        except Exception:
+            await self._safe_disconnect()
+            raise
 
-        logger.error("MCP initialize timeout for '%s'", self.name)
-        self._state = MCPServerState.FAILED
-        return False
+    def _open_transport(self):
+        """按 transport_type 打开官方 SDK 的传输 async context"""
+        import httpx
 
-    def list_tools(self) -> list[MCPTool]:
-        """获取 server 支持的工具列表
+        transport = (self.config.get("transport_type") or "").lower()
+        if transport in ("http", "streamable-http", "streamable_http"):
+            from mcp.client.streamable_http import streamable_http_client
 
-        自动缓存，后续调用返回缓存结果。
-        """
-        if self._tools:
-            return list(self._tools)
+            url = self.config.get("url", "")
+            if not url:
+                raise ValueError(f"MCP server '{self.name}' http transport requires url")
+            headers = {str(k): str(v) for k, v in (self.config.get("headers") or {}).items()}
+            # mcp 2.x: headers 通过自定义 httpx client 传入
+            http_client = httpx.AsyncClient(headers=headers) if headers else None
+            return streamable_http_client(url, http_client=http_client)
 
-        req_id = self._next_id()
-        self._transport.send(build_request("tools/list", {}, req_id))
+        if transport == "sse":
+            from mcp.client.sse import sse_client
 
-        deadline = time.time() + _CALL_TIMEOUT
-        while time.time() < deadline:
-            msg = self._transport.receive(timeout=deadline - time.time())
-            if msg is None:
-                break
-            if not isinstance(msg, dict):
-                continue
-            if not is_response(msg):
-                continue
-            if str(msg.get("id")) != str(req_id):
-                continue
-            if "error" in msg:
-                logger.error("MCP tools/list error: %s", msg["error"])
-                return []
-            result = msg.get("result", {})
-            raw_tools = result.get("tools", [])
-            self._tools = [
-                MCPTool(
-                    name=t.get("name", ""),
-                    description=t.get("description", ""),
-                    input_schema=t.get("inputSchema", {}),
-                    server_name=self.name,
-                    annotations=t.get("annotations", {}),
-                )
-                for t in raw_tools
-                if t.get("name")
-            ]
-            return list(self._tools)
+            url = self.config.get("url", "")
+            if not url:
+                raise ValueError(f"MCP server '{self.name}' sse transport requires url")
+            headers = {str(k): str(v) for k, v in (self.config.get("headers") or {}).items()}
+            return sse_client(url, headers=headers or None, timeout=60)
 
-        return []
+        # 默认 stdio
+        from mcp import StdioServerParameters
+        from mcp.client.stdio import stdio_client
 
-    def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> MCPToolResult:
-        """调用 MCP 工具（含沙箱检查）
-
-        Args:
-            tool_name: 工具名称
-            arguments: 工具参数
-
-        Returns:
-            MCPToolResult 包含执行结果
-        """
-        # 1. 沙箱检查（递归检查所有嵌套的字符串值）
-        if self._policy:
-            try:
-                for key, value in arguments.items():
-                    _check_sandbox_value(self._policy, key, value)
-            except SandboxBlockedError as exc:
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"Sandbox blocked: {exc}"}],
-                    is_error=True,
-                )
-
-        with self._call_lock:
-            return self._call_tool_locked(tool_name, arguments)
-
-    def _call_tool_locked(self, tool_name: str, arguments: dict[str, Any]) -> MCPToolResult:
-        """实际调用（调用方持 _call_lock）"""
-        # 2. 发送工具调用请求
-        req_id = self._next_id()
-        params = {
-            "name": tool_name,
-            "arguments": arguments,
-        }
-        self._transport.send(build_request("tools/call", params, req_id))
-
-        # 3. 等待响应
-        deadline = time.time() + _CALL_TIMEOUT
-        while time.time() < deadline:
-            msg = self._transport.receive(timeout=deadline - time.time())
-            if msg is None:
-                break
-            if not isinstance(msg, dict):
-                continue
-            if not is_response(msg):
-                continue
-            if str(msg.get("id")) != str(req_id):
-                continue
-
-            if "error" in msg:
-                error = msg["error"]
-                return MCPToolResult(
-                    content=[{"type": "text", "text": f"MCP error: {error.get('message', 'unknown')}"}],
-                    is_error=True,
-                )
-
-            result = msg.get("result", {})
-            content = result.get("content", [])
-            is_error = bool(result.get("isError", False))
-            return MCPToolResult(content=content, is_error=is_error)
-
-        return MCPToolResult(
-            content=[{"type": "text", "text": f"Tool call timeout after {_CALL_TIMEOUT}s"}],
-            is_error=True,
+        command = self.config.get("command", "")
+        if not command:
+            raise ValueError(f"MCP server '{self.name}' stdio transport requires command")
+        params = StdioServerParameters(
+            command=command,
+            args=list(self.config.get("args") or []),
+            env={str(k): str(v) for k, v in (self.config.get("env") or {}).items()} or None,
+            cwd=self.config.get("cwd") or None,
         )
+        return stdio_client(params)
 
-    def ping(self) -> bool:
-        """检查 server 是否存活"""
-        with self._call_lock:
-            return self._ping_locked()
+    async def disconnect(self) -> None:
+        """关闭传输与 session"""
+        self.connected = False
+        stack, self._stack = self._stack, None
+        self._session = None
+        if stack is not None:
+            try:
+                await stack.aclose()
+            except Exception as exc:
+                logger.debug("MCP server '%s' disconnect: %s", self.name, exc)
 
-    def _ping_locked(self) -> bool:
-        req_id = self._next_id()
-        self._transport.send(build_request("ping", {}, req_id))
+    async def _safe_disconnect(self) -> None:
+        try:
+            await self.disconnect()
+        except Exception:
+            pass
 
-        deadline = time.time() + 5.0
-        while time.time() < deadline:
-            msg = self._transport.receive(timeout=deadline - time.time())
-            if msg is None:
-                break
-            if not isinstance(msg, dict):
-                continue
-            if is_response(msg) and str(msg.get("id")) == str(req_id):
-                return "error" not in msg
-        return False
+    # ============================================================
+    # 工具操作
+    # ============================================================
 
-    def disconnect(self) -> None:
-        """断开连接"""
-        self._transport.disconnect()
-        self._state = MCPServerState.DISCONNECTED
-        self._tools = []
-        self._resources = []
-        self._resources_fetched = False
+    async def list_tools(self) -> list[MCPToolInfo]:
+        """拉取 server 的工具列表（转换为统一元数据）
 
-    # ===== Resources（对齐 Claude Code MCP resources 注入） =====
-
-    def list_resources(self) -> list[MCPResource]:
-        """获取 server 支持的资源列表（resources/list）
-
-        自动缓存；握手成功后若 capabilities 含 resources 则自动调用。
-        用 _resources_fetched 区分"未拉取"与"拉取到空列表"，避免无资源 server 反复请求。
+        注意 mcp 2.x 的 Tool 字段是 snake_case（input_schema）。
         """
-        if self._resources_fetched:
-            return [
-                MCPResource(
-                    uri=r.get("uri", ""),
-                    name=r.get("name", ""),
-                    description=r.get("description", ""),
-                    mime_type=r.get("mimeType", ""),
-                )
-                for r in self._resources
-                if r.get("uri")
-            ]
-
-        req_id = self._next_id()
-        self._transport.send(build_request("resources/list", {}, req_id))
-
-        deadline = time.time() + _RESOURCES_TIMEOUT
-        while time.time() < deadline:
-            msg = self._transport.receive(timeout=deadline - time.time())
-            if msg is None:
-                break
-            if not isinstance(msg, dict):
-                continue
-            if not is_response(msg):
-                continue
-            if str(msg.get("id")) != str(req_id):
-                continue
-            if "error" in msg:
-                logger.error("MCP resources/list error: %s", msg["error"])
-                self._resources_fetched = True
-                return []
-            result = msg.get("result", {})
-            self._resources = result.get("resources", []) or []
-            self._resources_fetched = True
-            return [
-                MCPResource(
-                    uri=r.get("uri", ""),
-                    name=r.get("name", ""),
-                    description=r.get("description", ""),
-                    mime_type=r.get("mimeType", ""),
-                )
-                for r in self._resources
-                if r.get("uri")
-            ]
-
-        return []
-
-    def read_resource(self, uri: str) -> dict[str, Any]:
-        """读取单个资源内容（resources/read）
-
-        Returns:
-            {"contents": [...], "ok": bool, "error": str?}
-        """
-        req_id = self._next_id()
-        self._transport.send(build_request("resources/read", {"uri": uri}, req_id))
-
-        deadline = time.time() + _CALL_TIMEOUT
-        while time.time() < deadline:
-            msg = self._transport.receive(timeout=deadline - time.time())
-            if msg is None:
-                break
-            if not isinstance(msg, dict):
-                continue
-            if not is_response(msg):
-                continue
-            if str(msg.get("id")) != str(req_id):
-                continue
-            if "error" in msg:
-                err = msg["error"]
-                # MCP Server 可能返回 {"error": "string"} 或 {"error": {"message": "..."}}
-                if isinstance(err, dict):
-                    err_msg = str(err.get("message", "unknown"))
-                else:
-                    err_msg = str(err) or "unknown"
-                return {"ok": False, "error": err_msg}
-            result = msg.get("result", {})
-            return {"ok": True, "contents": result.get("contents", [])}
-
-        return {"ok": False, "error": f"resources/read timeout after {_CALL_TIMEOUT}s"}
-
-    @property
-    def resources(self) -> list[MCPResource]:
-        """已缓存的资源列表"""
+        if not self.connected or self._session is None:
+            return []
+        resp = await self._session.list_tools()
         return [
-            MCPResource(
-                uri=r.get("uri", ""),
-                name=r.get("name", ""),
-                description=r.get("description", ""),
-                mime_type=r.get("mimeType", ""),
+            MCPToolInfo(
+                name=tool.name or "",
+                description=tool.description or "",
+                input_schema=dict(getattr(tool, "input_schema", None) or {}),
+                server_name=self.name,
             )
-            for r in self._resources
+            for tool in (getattr(resp, "tools", None) or [])
+            if tool.name
         ]
 
-    def _next_id(self) -> str:
-        self._request_counter += 1
-        return f"{self._request_counter}"
+    async def call_tool(self, tool_name: str, arguments: dict[str, Any]):
+        """调用工具，返回官方 CallToolResult"""
+        if not self.connected or self._session is None:
+            raise RuntimeError(f"MCP server '{self.name}' not connected")
+        return await self._session.call_tool(tool_name, arguments=arguments or {})
+
+    # ============================================================
+    # 资源操作
+    # ============================================================
+
+    async def list_resources(self) -> list[Any]:
+        if not self.connected or self._session is None:
+            return []
+        resp = await self._session.list_resources()
+        return list(getattr(resp, "resources", None) or [])
+
+    async def read_resource(self, uri: str) -> dict[str, Any]:
+        if not self.connected or self._session is None:
+            return {"ok": False, "error": "not connected"}
+        try:
+            resp = await self._session.read_resource(uri)
+            return {"ok": True, "contents": _safe_contents(resp)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
 
-# ============================================================
-# 辅助函数
-# ============================================================
-
-def _looks_like_path(value: str) -> bool:
-    """检查字符串是否看起来像文件路径"""
-    # 包含路径分隔符
-    if "/" in value or "\\" in value:
-        return True
-    # 以 ~ 开头（home 目录）
-    if value.startswith("~"):
-        return True
-    # 以 ./ 或 ../ 开头（相对路径）
-    if value.startswith("./") or value.startswith("../"):
-        return True
-    # 以 / 开头（绝对路径）
-    if value.startswith("/") or re.match(r'^[A-Za-z]:[/\\]', value):
-        return True
-    # 版本号（3.13.1 / v2.1.0）不是路径
-    if re.fullmatch(r"v?\d+(\.\d+)+", value):
-        return False
-    # 包含扩展名且看起来像文件名（避免误判版本号如 v2.0.1）
-    if "." in value and len(value) < 100:
-        # 检查是否像文件名：最后一个点后是常见扩展名
-        parts = value.rsplit(".", 1)
-        if len(parts) == 2 and len(parts[1]) <= 5 and parts[1].isalnum():
-            return True
-    return False
-
-
-def _looks_like_command(value: str) -> bool:
-    """检查字符串是否看起来像命令或包含 shell 元字符"""
-    value = value.strip()
-    if not value:
-        return False
-    first_word = value.split()[0]
-    if first_word.startswith("$"):
-        return True
-    if first_word in ("rm", "rmdir", "sudo", "curl", "wget", "python", "bash", "sh", "cmd"):
-        return True
-    # 检测 shell 元字符注入
-    _SHELL_METACHARS = (";", "|", "&", "$(", "`", "&&", "||", ">", "<")
-    if any(meta in value for meta in _SHELL_METACHARS):
-        return True
-    return False
-
-
-def _check_sandbox_value(policy: Any, key: str, value: Any) -> None:
-    """递归检查值是否违反沙箱策略"""
-    if isinstance(value, dict):
-        for k, v in value.items():
-            _check_sandbox_value(policy, k, v)
-    elif isinstance(value, list):
-        for i, item in enumerate(value):
-            _check_sandbox_value(policy, f"{key}[{i}]", item)
-    elif isinstance(value, str):
-        if _looks_like_path(value):
-            allowed, reason = policy.check_file_access(value)
-            if not allowed:
-                raise SandboxBlockedError(reason)
-        if _looks_like_command(value):
-            allowed, reason = policy.check_command(value)
-            if not allowed:
-                raise SandboxBlockedError(reason)
-
-
-class SandboxBlockedError(Exception):
-    """沙箱拦截异常"""
-    pass
+def _safe_contents(resp: Any) -> list[Any]:
+    contents = getattr(resp, "contents", None) or []
+    result = []
+    for item in contents:
+        try:
+            result.append({
+                "uri": str(getattr(item, "uri", "")),
+                "mime_type": str(getattr(item, "mimeType", "") or ""),
+                "text": getattr(item, "text", None),
+            })
+        except Exception:
+            continue
+    return result

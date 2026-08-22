@@ -111,7 +111,7 @@ class MCPHost:
             ValueError: 工具不存在
         """
         if tool_name not in self._schema_cache:
-            raise ValueError(f"工具 {tool_name} 不存在，请查看 skill 目录")
+            raise ValueError(f"工具 {tool_name} 不存在，请查看 所有 MCP 工具目录")
         self._loaded_tools.add(tool_name)
         return self._schema_cache[tool_name]
 

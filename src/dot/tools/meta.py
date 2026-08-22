@@ -80,7 +80,7 @@ def build_mcp_search_tool(session: Any) -> StructuredTool | None:
         description=(
             "搜索 MCP 外部工具。不带参数返回全部工具目录（name + 描述）；"
             "带 tool_name 返回该工具完整定义（description + input_schema）并加载为可调用。"
-            "调用任何 mcp_ 开头的工具前应先用它获取定义。"
+            "调用任何 mcp_ 开头的工具前应先用它获取tool的定义，在调用这个mcp 工具。"
         ),
     )
 
@@ -203,12 +203,12 @@ def _make_mcp_callable(session: Any, tool_name: str) -> StructuredTool:
 # ============================================================
 
 def build_tools_for_session(session: Any) -> list[StructuredTool]:
-    """为 session 构建完整工具列表：基础工具（按 agent_mode）+ 元工具
+    """为 session 构建完整工具列表：基础工具 + 元工具
 
-    - plan: 只读工具（FileRead/Glob/Grep + 只读 Bash）+ mcp_search/skill_search
-    - edit / auto: 全工具 + 元工具（edit 的 bash 审批由 bash_tool 按 agent_mode 处理）
+    三种模式都注册全量工具（含写工具）——权限由 PermissionManager
+    在工具调用时拦截（fix-权限控制.md）：plan 写=ASK、plan/edit bash=ASK/DENY。
     """
-    from . import build_read_only_tools, build_tools
+    from . import build_tools
 
     runtime: RuntimeState | None = getattr(session, "runtime", None)
     if runtime is None:
@@ -219,12 +219,9 @@ def build_tools_for_session(session: Any) -> list[StructuredTool]:
         )
         session.runtime = runtime
 
-    agent_mode = getattr(runtime, "agent_mode", "auto") or "auto"
-    if agent_mode == "plan":
-        tools: list[StructuredTool] = list(build_read_only_tools(runtime))
-    else:
-        tools = list(build_tools(runtime))
+    tools: list[StructuredTool] = list(build_tools(runtime))
 
+    # 构建元工具：mcp_search, skill_search
     mcp_tool = build_mcp_search_tool(session)
     if mcp_tool is not None:
         tools.append(mcp_tool)

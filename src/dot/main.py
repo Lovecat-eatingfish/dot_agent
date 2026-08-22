@@ -25,12 +25,19 @@ from pathlib import Path
 from typing import Any
 
 from dot.host.agent_host import AgentHost
-from dot.core.approval import ApprovalDecision, ApprovalRequest
 from dot.core.log import get_logger, setup_logging
 
 logger = get_logger(__name__)
 
 AGENT_MODES = ("plan", "edit", "auto")
+
+# 审批提示音（Windows winsound）
+def _play_approval_sound() -> None:
+    try:
+        import winsound
+        winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -54,23 +61,8 @@ def main() -> None:
         _run_interactive(host)
 
 
-def _console_approval_handler(request: ApprovalRequest) -> ApprovalDecision:
-    """edit 模式的控制台审批：y/n"""
-    print()
-    print(f"[approval] 高风险操作: {request.risk_reason}")
-    print(f"[approval] command: {request.command[:200]}")
-    try:
-        answer = input("[approval] 允许执行? [y/n]: ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return ApprovalDecision(approved=False, reason="cancelled")
-    return ApprovalDecision(approved=answer in ("y", "yes", ""))
-
-
 def _run_once(host: AgentHost, task: str) -> None:
     """单次执行任务并打印结果"""
-    print(f"[dot] workspace={host.workspace}")
-    print(f"[dot] task={task!r}")
-    print()
     _run_turn(host, task)
 
 
@@ -78,12 +70,6 @@ def _run_interactive(host: AgentHost) -> None:
     """交互模式：循环读取用户输入并执行"""
     session = host.get_or_create_session()
     agent_mode = "auto"
-
-    print("=" * 60)
-    print("  dot agent — 控制台调试模式")
-    print(f"  session: {session.session_id}  (turn {session.current_turn_id})")
-    print("  命令: /sessions /resume /turns /rewind /mode /quit")
-    print("=" * 60)
 
     # 跨进程恢复：上轮结束时可能停在人工介入状态（自定义机制，靠 session.json）
     if host.has_pending_intervention():
@@ -133,9 +119,8 @@ def _run_interactive(host: AgentHost) -> None:
 def _run_turn(host: AgentHost, user_input: str, *, agent_mode: str = "auto") -> None:
     """执行一轮任务：跑图 → 检查介入状态 → 打印事件"""
     logger.info("=== turn start: input=%r, mode=%s ===", user_input, agent_mode)
-    approval_handler = _console_approval_handler if agent_mode == "edit" else None
     try:
-        for chunk in host.run(user_input, agent_mode=agent_mode, approval_handler=approval_handler):
+        for chunk in host.run(user_input, agent_mode=agent_mode):
             logger.debug("chunk: %s", _safe_chunk(chunk))
             _handle_chunk(chunk)
 
@@ -167,9 +152,8 @@ def _handle_intervention(host: AgentHost, *, agent_mode: str = "auto") -> None:
         print("请输入 c (continue) 或 s (stop)")
 
     logger.info("intervention resume action=%s", action)
-    approval_handler = _console_approval_handler if agent_mode == "edit" else None
     try:
-        for chunk in host.resume_intervention(action, agent_mode=agent_mode, approval_handler=approval_handler):
+        for chunk in host.resume_intervention(action, agent_mode=agent_mode):
             logger.debug("resume chunk: %s", _safe_chunk(chunk))
             _handle_chunk(chunk)
     except KeyboardInterrupt:

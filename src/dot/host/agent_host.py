@@ -33,6 +33,11 @@ class AgentHost:
         # 人工介入后恢复
         for chunk in host.resume_intervention("continue"):
             ...
+
+        trace: 跟着session走，每个turn都有一个span，span之间有parent关系
+        session的state跟着session走
+        mcp ，skill，hook，权限控制 这些都是各个对话共享的
+        一个workspace 的所有会话共享一个workspace，mcp ，skill，hook，权限控制 这些都是各个对话共享的
     """
 
     def __init__(
@@ -42,6 +47,18 @@ class AgentHost:
     ) -> None:
         self.workspace = workspace or Path.cwd()
         root = Path(sessions_root) if sessions_root else (self.workspace / session_dir)
+
+        # 链路追踪初始化（DOT_TRACE_ENABLED=0 关闭；落盘 <workspace>/.dot/traces/）
+        from dot.trace import init_tracer
+
+        init_tracer(self.workspace)
+
+        # 权限系统初始化：加载 .agent-security.json + 默认控制台 Y/N 审批
+        from dot.core.permission import get_permission_manager, make_console_approval_handler
+
+        pm = get_permission_manager()
+        pm.load_project(self.workspace)
+        pm.set_approval_handler(make_console_approval_handler())
         self.session_manager = SessionManager(sessions_root=root, workspace=self.workspace)
         logger.info("[AgentHost] initialized, workspace=%s, sessions_root=%s", self.workspace, root)
 
@@ -84,7 +101,6 @@ class AgentHost:
         *,
         session_id: str | None = None,
         agent_mode: str = "auto",
-        approval_handler: Callable[..., Any] | None = None,
     ) -> Iterator[dict[str, Any]]:
         """执行一轮任务（plan → coding → valid → finally）"""
         yield from self.session_manager.stream_session_events(
@@ -92,7 +108,6 @@ class AgentHost:
             user_input=user_input,
             workspace=self.workspace,
             agent_mode=agent_mode,
-            approval_handler=approval_handler,
         )
 
     def resume_intervention(
@@ -100,13 +115,11 @@ class AgentHost:
         action: str,
         *,
         agent_mode: str = "auto",
-        approval_handler: Callable[..., Any] | None = None,
     ) -> Iterator[dict[str, Any]]:
         """人工介入后恢复：continue 重新规划 / stop 结束"""
         yield from self.session_manager.resume_session(
             action,
             agent_mode=agent_mode,
-            approval_handler=approval_handler,
         )
 
     def has_pending_intervention(self, session_id: str | None = None) -> bool:

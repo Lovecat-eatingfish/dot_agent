@@ -104,6 +104,12 @@ class MCPHost:
         """获取所有可用 mcp_ 工具名列表"""
         return list(self._all_tool_names)
 
+    def close(self) -> None:
+        """关闭底层 MCP 连接（session 销毁/切换时调用）"""
+        shutdown = getattr(self._mcp_manager, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+
     def get_catalog_text(self) -> str:
         """获取工具目录纯文本（用于注入 system prompt）"""
         return self._catalog_text

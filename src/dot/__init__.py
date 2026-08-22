@@ -35,6 +35,7 @@ from .graph.prompts import (
 from .session import Session, SessionManager, SessionPersistence, persist_turn
 from .tools.meta import build_tools_for_session
 from dot.host.agent_host import AgentHost
+from .trace import Tracer, get_tracer, init_tracer
 
 __all__ = [
     # session
@@ -60,4 +61,8 @@ __all__ = [
     # tools
     "build_tools_for_session",
     "AgentHost",
+    # trace
+    "Tracer",
+    "get_tracer",
+    "init_tracer",
 ]

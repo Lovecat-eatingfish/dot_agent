@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from .approval import ApprovalDecision, ApprovalRequest, normalize_approval_mode
 from .hooks import HookRunner
 from .path_security import validate_path_access
 from .tool_result_budget import ToolResultBudget
@@ -53,7 +52,8 @@ class RuntimeState:
     # 已读取文件的快照表，key 是文件绝对路径
     read_files: dict[Path, FileSnapshot] = field(default_factory=dict)
 
-    # 审批模式：inline（命令行询问）、auto（自动批准）、deny（自动拒绝）
+    # （已废弃）审批统一由 core.permission.PermissionManager 管理；
+    # 字段保留仅为兼容旧引用，不再参与权限决策
     approval_mode: str = "inline"
 
     # Agent 运行模式：auto / plan / approve / edit
@@ -63,8 +63,8 @@ class RuntimeState:
     allowed_tools: list[str] = field(default_factory=list)
     disallowed_tools: list[str] = field(default_factory=list)
 
-    # 审批处理函数，approval_mode=inline 时由控制台入口提供
-    approval_handler: Callable[[ApprovalRequest], ApprovalDecision | bool] | None = None
+    # （已废弃）审批统一由 PermissionManager 管理，字段仅为兼容保留
+    approval_handler: Callable[[Any], Any] | None = None
 
     # 递增消息序号（并行工具调用时加锁）
     message_seq: int = 0
@@ -104,7 +104,6 @@ class RuntimeState:
     result_budget: ToolResultBudget = field(default_factory=ToolResultBudget)
 
     def __post_init__(self) -> None:
-        self.approval_mode = normalize_approval_mode(self.approval_mode)
         self.agent_mode = normalize_agent_mode(self.agent_mode)
 
     def next_message_id(self) -> str:

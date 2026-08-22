@@ -22,7 +22,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ..core.approval import ApprovalDecision, classify_command_risk, make_approval_request
 from ..core.log import get_logger
 from ..core.runtime import RuntimeState
 from ..core.utils import BashResult, coerce_bool
@@ -106,7 +105,7 @@ def bash_tool_description() -> str:
 - Run scripts: python script.py, node app.js
 - Check files: ls, dir, type, cat
 - Search files: grep "pattern" *.py
-- Install deps: pip install package (requires approval)
+- Install deps: pip install package
 - Git operations: git status, git diff
 
 **Output format**:
@@ -117,12 +116,10 @@ def bash_tool_description() -> str:
 - stdout_path/stderr_path: path to full output file (if truncated)
 - timed_out: true if command exceeded timeout
 - duration_ms: execution time in milliseconds
-- requires_approval: true if command needed human approval
 
 **Security**:
 - Dangerous commands (rm -rf, format, shutdown) are BLOCKED.
-- High-risk commands (pip install, npm install, curl, uvicorn) require approval.
-- See approval mode: inline (prompt), auto (approve all), deny (block all).
+- Permission gating (mode rules + blacklists) is enforced by PermissionManager before this tool runs.
 """.format(platform={
     "windows": "Windows (cmd.exe)",
     "darwin": "macOS (POSIX shell)",
@@ -304,12 +301,6 @@ def run_bash(
     if blocked:
         return {"ok": False, "error": f"blocked potentially dangerous command pattern: {blocked}"}
 
-    # edit 模式：所有 bash 命令都需人工审批（对齐 fix.md），审批通过即执行
-    force_approval = getattr(state, "agent_mode", "auto") == "edit"
-    approval = _resolve_approval(state, normalized_command, force=force_approval)
-    if approval is not None and not approval.get("approved"):
-        return approval
-
     started = time.perf_counter()
     env, env_error = _build_env(state)
     if env_error is not None:
@@ -317,7 +308,7 @@ def run_bash(
     max_output_chars = _state_int(state, "bash_max_output_chars", DEFAULT_MAX_OUTPUT_CHARS)
     bash_cwd = _effective_cwd(state)
     if background:
-        return _run_background(state, normalized_command, env, approval)
+        return _run_background(state, normalized_command, env)
     proc: subprocess.Popen | None = None
     try:
         proc = subprocess.Popen(
@@ -344,7 +335,6 @@ def run_bash(
             "exit_code": None,
             **_format_captured_output(state, _decode_output(exc.stdout), _decode_output(exc.stderr), max_output_chars),
             "duration_ms": round((time.perf_counter() - started) * 1000),
-            **(approval or {}),
         }
 
     output = _format_captured_output(state, _decode_output(stdout_bytes), _decode_output(stderr_bytes), max_output_chars)
@@ -355,7 +345,6 @@ def run_bash(
         "exit_code": proc.returncode,
         **output,
         "duration_ms": round((time.perf_counter() - started) * 1000),
-        **(approval or {}),
     }
 
 
@@ -473,65 +462,6 @@ def run_bash_read_only(
         "exit_code": completed.returncode,
         **output,
         "duration_ms": round((time.perf_counter() - started) * 1000),
-    }
-
-
-def _resolve_approval(state: RuntimeState, command: str, *, force: bool = False) -> BashResult | None:
-    """命令审批
-
-    - force=True（edit 模式）：所有命令都走审批
-    - 默认：仅 RISK_PATTERNS 命中的高风险命令走审批
-    - approval_mode=auto：自动批准
-    - deny / 无 handler：拒绝
-    - inline + handler：询问
-    """
-    risk_reason = classify_command_risk(command)
-    if risk_reason is None and not force:
-        return None
-    if risk_reason is None:
-        risk_reason = "edit mode requires approval for all bash commands"
-
-    request = make_approval_request(command, risk_reason)
-    base = {
-        "requires_approval": True,
-        "approval_id": request.id,
-        "risk_reason": risk_reason,
-        "approval_preview": {
-            "tool": "BashTool",
-            "action": f"Run shell command: {command}",
-            "risk_reason": risk_reason,
-            "args_preview": command[:500],
-        },
-        "command": command,
-    }
-    if state.approval_mode == "auto":
-        return {**base, "approved": True}
-    if state.approval_mode == "deny" or state.approval_handler is None:
-        return {
-            **base,
-            "ok": False,
-            "approved": False,
-            "error": f"human approval required for high-risk command: {risk_reason}",
-            "recoverable": True,
-            "suggested_fix": "Ask the user for approval before running this command.",
-        }
-
-    decision = state.approval_handler(request)
-    if isinstance(decision, ApprovalDecision):
-        approved = decision.approved
-        decision_reason = decision.reason
-    else:
-        approved = bool(decision)
-        decision_reason = ""
-    if approved:
-        return {**base, "approved": True}
-    return {
-        **base,
-        "ok": False,
-        "approved": False,
-        "error": decision_reason or f"human rejected high-risk command: {risk_reason}",
-        "recoverable": True,
-        "suggested_fix": "Choose a safer alternative or ask the user to approve the command.",
     }
 
 
@@ -685,7 +615,6 @@ def _run_background(
     state: RuntimeState,
     command: str,
     env: dict[str, str],
-    approval: dict[str, Any] | None,
 ) -> BashResult:
     output_dir = state.workspace / ".dot" / "background"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -721,7 +650,6 @@ def _run_background(
         "stdout_path": str(stdout_path.relative_to(state.workspace)),
         "stderr_path": str(stderr_path.relative_to(state.workspace)),
         "duration_ms": 0,
-        **(approval or {}),
     }
 
 

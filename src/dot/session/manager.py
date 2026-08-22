@@ -81,8 +81,8 @@ class SessionManager:
             if session_id is None or session_id == "" or self._session.session_id == session_id:
                 logger.info("[SessionManager] returning existing session: %s", self._session.session_id)
                 return self._session
-            # 切换 session：清理旧注册
-            runtime_registry.clear(self._session.session_id)
+            # 切换 session：关闭旧连接并清理注册
+            self._shutdown_session_runtime(self._session)
             logger.info("[SessionManager] switching from %s to %s", self._session.session_id, session_id)
             self._session = None
 
@@ -111,10 +111,20 @@ class SessionManager:
         raise RuntimeError("No active session. Call get_or_create() first.")
 
     def destroy_session(self) -> None:
-        """清理内存"""
+        """清理内存并关闭 MCP 连接"""
         if self._session is not None:
-            runtime_registry.clear(self._session.session_id)
+            self._shutdown_session_runtime(self._session)
         self._session = None
+
+    def _shutdown_session_runtime(self, session: Session) -> None:
+        """关闭 session 级运行时资源（MCP 连接）并清理注册表"""
+        mcp_host = getattr(session, "mcp_host", None)
+        if mcp_host is not None:
+            try:
+                mcp_host.close()
+            except Exception as exc:
+                logger.debug("mcp host close: %s", exc)
+        runtime_registry.clear(session.session_id)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """列出磁盘上的所有 session 概要"""
@@ -179,15 +189,9 @@ class SessionManager:
         *,
         workspace: Path | None = None,
         max_attempts: int = 3,
-        approval_mode: str = "inline",
         agent_mode: str = "auto",
-        approval_handler: Any = None,
     ) -> None:
-        """应用运行时配置；agent_mode 联动审批策略（对齐 fix.md 工作模式）：
-        - auto：approval_mode 联动为 auto（权限最大）
-        - edit：approval_mode 联动为 inline（每次 bash 审批由 bash_tool 处理）
-        - plan：只读工具集（build_tools_for_session 按 agent_mode 选择）
-        """
+        """应用运行时配置（权限由 PermissionManager 按 agent_mode 统一裁决）"""
         user_workspace = (
             workspace if workspace is not None
             else (session.workspace if str(session.workspace) and session.workspace.exists() else self._default_workspace)
@@ -195,17 +199,10 @@ class SessionManager:
         session.workspace = user_workspace
         session.max_attempt = max_attempts
 
-        # agent_mode → 审批策略联动（未显式指定 approval_mode 时生效）
-        if approval_mode is None:
-            approval_mode = "auto" if agent_mode == "auto" else "inline"
-
         runtime = self._ensure_runtime(session)
         runtime.workspace = user_workspace
-        runtime.approval_mode = approval_mode
         runtime.agent_mode = agent_mode
         runtime.session_id = session.session_id
-        if approval_handler is not None:
-            runtime.approval_handler = approval_handler
 
     # ============================================================
     # Stream events（每轮图执行）
@@ -218,9 +215,7 @@ class SessionManager:
         *,
         workspace: Path | None = None,
         max_attempts: int = 3,
-        approval_mode: str | None = None,
-        agent_mode: str = "auto",
-        approval_handler: Any = None,
+        agent_mode: str = "edit",
     ) -> Iterator[dict[str, Any]]:
         """驱动一轮图执行，yield 事件流
 
@@ -236,17 +231,29 @@ class SessionManager:
 
         logger.info("[stream] session=%s, user_input=%r, agent_mode=%s", session.session_id, user_input, agent_mode)
 
+        # 链路追踪：turn span 是 trace 起点（trace_id 由此生成并贯穿全程）
+        from ..trace import activate_span, deactivate_span, get_tracer, set_session_context
+
+        # 把sessionId 放入线程上下文，方便后续 trace 分析
+        set_session_context(session.session_id)
+        # 创建 turn span，作为 trace 起点（trace_id 由此生成并贯穿全程）
+        turn_span = get_tracer().start_span(
+            "session", "turn",
+            tags={"agent_mode": agent_mode, "workspace": str(session.workspace)},
+            input_summary=user_input or "",
+        )
+
+        # todo： 可以去掉
         self.apply_runtime_config(
             session,
             workspace=workspace,
             max_attempts=max_attempts,
-            approval_mode=approval_mode,
             agent_mode=agent_mode,
-            approval_handler=approval_handler,
         )
 
-        # 先重置，再追加用户输入
+        # 先重置: 每一轮都需要重置的东西，再追加用户输入
         session.reset_per_turn()
+
         if user_input:
             session.messages.append(HumanMessage(content=user_input))
             session.task = user_input
@@ -256,10 +263,21 @@ class SessionManager:
 
         session.is_running = True
         logger.info("[stream] graph stream starting...")
+        turn_token = activate_span(turn_span)
         try:
             for chunk in session.compiled_graph.stream({"session": session}, config=config):
                 yield chunk
+            turn_span.set_output_summary(
+                f"turn={session.current_turn_id} msgs={len(session.messages)} "
+                f"passed={session.validate_result.get('passed')} awaiting={session.awaiting_intervention}"
+            )
+        except BaseException as exc:
+            turn_span.finish(exc)
+            raise
+        else:
+            turn_span.finish()
         finally:
+            deactivate_span(turn_token)
             session.is_running = False
 
     def resume_session(
@@ -268,7 +286,6 @@ class SessionManager:
         *,
         session_id: str | None = None,
         agent_mode: str = "auto",
-        approval_handler: Any = None,
     ) -> Iterator[dict[str, Any]]:
         """人工介入后恢复（自定义机制，不依赖 langgraph Command）
 
@@ -284,13 +301,28 @@ class SessionManager:
             logger.warning("[resume] session %s has no pending intervention", session.session_id)
             return
 
+        # 链路追踪：resume 是一条新 trace
+        from ..trace import activate_span, deactivate_span, get_tracer, set_session_context
+
+        set_session_context(session.session_id)
+        span = get_tracer().start_span(
+            "session", "resume_turn",
+            tags={"resume_action": resume_action, "agent_mode": agent_mode},
+            input_summary=f"resume after intervention ({session.session_id})",
+        )
+
         session.awaiting_intervention = False
         session.resume_action = resume_action
+
+        span_token = activate_span(span)
 
         if resume_action == "stop":
             # 结束：更新 session.json 里的介入标记即可
             self._persist_meta_only(session)
             logger.info("[resume] intervention stopped, session=%s", session.session_id)
+            span.set_output_summary("intervention stopped")
+            span.finish()
+            deactivate_span(span_token)
             return
 
         # continue：计数清零，从 plan 重新规划
@@ -303,7 +335,6 @@ class SessionManager:
         self.apply_runtime_config(
             session,
             agent_mode=agent_mode,
-            approval_handler=approval_handler,
         )
 
         config = {"recursion_limit": 60}
@@ -312,7 +343,17 @@ class SessionManager:
         try:
             for chunk in session.compiled_graph.stream({"session": session}, config=config):
                 yield chunk
+            span.set_output_summary(
+                f"turn={session.current_turn_id} msgs={len(session.messages)} "
+                f"passed={session.validate_result.get('passed')} awaiting={session.awaiting_intervention}"
+            )
+        except BaseException as exc:
+            span.finish(exc)
+            raise
+        else:
+            span.finish()
         finally:
+            deactivate_span(span_token)
             session.is_running = False
 
     def has_pending_intervention(self, session_id: str | None = None) -> bool:
@@ -405,14 +446,18 @@ class SessionManager:
         return session
 
     def _build_mcp_host(self, workspace: Path) -> MCPHost:
-        """构建 MCP host（渐进披露）"""
+        """构建 MCP host（渐进披露，基于官方 MCP SDK）
+
+        读取 .dot/mcp.json（全局 + 项目级）建立全部连接后拉取工具目录。
+        """
         try:
             manager = MCPManager(workspace=workspace)
+            connect = manager.load_config_and_connect()
             host = MCPHost(manager)
             host.discover_tools()
             return host
         except Exception as exc:
-            logger.debug("MCP host init skipped: %s", exc)
+            logger.warning("MCP host init failed: %s", exc)
             return MCPHost(MCPManager(workspace=workspace))
 
     def _build_skill_host(self, workspace: Path) -> SkillHost:

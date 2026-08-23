@@ -278,12 +278,16 @@ def build_tools_for_session(session: Any) -> list[StructuredTool]:
         tools = [t for t in tools if t.name != "BashTool"]
         return tools
 
-    # agent 完整模式：全量基础工具 + MCP/Skill 元工具
+    # agent 完整模式：全量基础工具 + MCP/Skill 元工具 + 子Agent工具
     mcp_tool = build_mcp_search_tool(session)
     if mcp_tool is not None:
         tools.append(mcp_tool)
     skill_tool = build_skill_search_tool(session)
     if skill_tool is not None:
         tools.append(skill_tool)
+
+    # 子Agent工具（同步阻塞 Fork）
+    from .subagent import build_subagent_tool
+    tools.append(build_subagent_tool(session))
 
     return tools

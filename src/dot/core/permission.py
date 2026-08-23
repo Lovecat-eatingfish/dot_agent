@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .log import get_logger
-from .path_security import PathSecurityError, validate_path_access
+from .path_security import PathSecurityError, WorkspaceNs, validate_path_access
 
 logger = get_logger(__name__)
 
@@ -244,12 +244,12 @@ class PermissionManager:
                     candidate = Path(path_str).expanduser()
                     if not candidate.is_absolute():
                         candidate = ws / candidate  # 相对路径锚定到 workspace 再校验
-                    fake = _FakeState(ws)
+                    fake = WorkspaceNs(ws)
                     validate_path_access(fake, candidate, "write" if tool_name in FILE_WRITE_TOOLS else "read")
                 except PathSecurityError as exc:
                     return PermissionDecision(Decision.DENY, "system", str(exc))
-                except Exception:
-                    pass  # 路径异常时交由工具自身详细报错
+                except Exception as exc:
+                    logger.debug("[permission] path validation skipped: %s", exc)
 
         # ---- 2. 项目自定义黑名单 ----
         if tool_name == "BashTool":
@@ -362,15 +362,8 @@ class PermissionManager:
             span.set_tag("source", decision.source)
             span.set_output_summary(decision.reason or decision.decision.value)
             span.finish()
-        except Exception:
-            pass
-
-
-class _FakeState:
-    """validate_path_access 只读 state.workspace，用最小替身避免循环依赖"""
-
-    def __init__(self, workspace: Path) -> None:
-        self.workspace = workspace
+        except Exception as exc:
+            logger.debug("[permission] trace span finish failed: %s", exc)
 
 
 # ============================================================
@@ -403,5 +396,5 @@ def make_console_approval_handler() -> Callable[[dict[str, Any]], bool]:
         print(f"  规则来源: {info.get('source', '')} ({info.get('reason', '')})")
         print(f"  参数: {str(info.get('args', {}))[:200]}")
         answer = input("  风险操作需手动确认，输入 Y 执行 / N 取消: ").strip().lower()
-        return answer in ("y", "yes", "")
+        return answer in ("y", "yes")
     return handler

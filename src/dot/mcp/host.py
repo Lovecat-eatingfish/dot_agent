@@ -21,7 +21,6 @@ MCP Host 渐进披露（Tool-Search 模式）
 """
 from __future__ import annotations
 
-import re
 from typing import Any, Optional
 
 

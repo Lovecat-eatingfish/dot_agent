@@ -222,6 +222,10 @@ class SessionManager:
         session.plan_invalid = bool(graph_state.get("plan_invalid", False))
         session.awaiting_intervention = bool(graph_state.get("awaiting_intervention", False))
         session.current_turn_id = target_turn_id
+        # 恢复压缩状态
+        from ..compress.state import CompressionState
+        cs_data = graph_state.get("compression_state")
+        session.compression_state = CompressionState.from_dict(cs_data) if cs_data else CompressionState()
 
         logger.info("Session %s rewound to turn %d (code restored via agent git)", session.session_id, target_turn_id)
         return graph_state
@@ -240,6 +244,20 @@ class SessionManager:
         if not session.workspace or not session.workspace.exists():
             session.workspace = self._default_workspace
         session.agent_mode = agent_mode
+
+    def request_cancel(self, session_id: str | None = None) -> bool:
+        """请求中断当前 turn（CLI Ctrl+C 入口）
+
+        设置取消令牌，worker 在下一个节点边界检测到后提前结束 graph stream。
+        节点内部的长循环（如 coding_agent 多轮工具调用）需等当前节点跑完，
+        不侵入 graph 节点逻辑。返回是否成功设置（会话存在且正在运行）。
+        """
+        session = self.get_session(session_id)
+        if session is None or not session.is_running:
+            return False
+        session._cancel_event.set()
+        logger.info("[SessionManager] cancel requested: %s", session.session_id)
+        return True
 
     # ============================================================
     # Stream events（每轮图执行）
@@ -269,6 +287,7 @@ class SessionManager:
         # 主线程 session-state setup（worker 起来前就绪）
         self.apply_runtime_config(session, agent_mode=agent_mode)
         session.reset_per_turn()
+        session._cancel_event.clear()
         if user_input:
             session.messages.append(HumanMessage(content=user_input))
             session.task = user_input
@@ -278,12 +297,19 @@ class SessionManager:
         logger.info("[stream] graph stream starting...")
 
         def _body(session: Session, span: Any, emit: Callable[[Any], None]) -> None:
+            cancelled = False
             for chunk in session.compiled_graph.stream({"session": session}, config=config):
+                if session._cancel_event.is_set():
+                    cancelled = True
+                    break
                 emit(chunk)
             span.set_output_summary(
                 f"turn={session.current_turn_id} msgs={len(session.messages)} "
                 f"passed={session.validate_result.get('passed')} awaiting={session.awaiting_intervention}"
+                f" cancelled={cancelled}"
             )
+            if cancelled:
+                emit({"__dot_cancelled__": True})
 
         yield from self._run_turn_worker(
             session,
@@ -449,6 +475,12 @@ class SessionManager:
 
         # 共享设施来自 SharedServices（单份，全会话复用，不在此重复构建）
         shared = self._shared
+
+        # 恢复压缩状态
+        from ..compress.state import CompressionState
+        cs_data = meta.get("compression_state")
+        compression_state = CompressionState.from_dict(cs_data) if cs_data else CompressionState()
+
         session = Session(
             session_id=session_id,
             compiled_graph=shared.compiled_graph,
@@ -462,6 +494,8 @@ class SessionManager:
             skill_host=shared.skill_host,
             hook_runner=shared.hook_runner,
             awaiting_intervention=bool(meta.get("awaiting_intervention", False)),
+            compression_state=compression_state,
+            run_mode=meta.get("run_mode", "agent"),
         )
 
         if is_new:

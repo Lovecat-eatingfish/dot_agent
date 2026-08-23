@@ -1,100 +1,33 @@
+"""CLI smoke tests for the dot agent entry point."""
 from __future__ import annotations
 
 from typer.testing import CliRunner
 
-from mokioclaw.interaction.app import app
+from dot.cli.app import app
+
+runner = CliRunner()
 
 
-def test_cli_shows_help_without_task() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(app, [])
-
+def test_cli_help_available() -> None:
+    result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "mokioclaw" in result.output
+    assert "interactive" in result.output
+    assert "run" in result.output
 
 
-def test_cli_accepts_max_attempts_option_without_task() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["--max-attempts", "2"])
-
+def test_cli_interactive_help() -> None:
+    result = runner.invoke(app, ["interactive", "--help"])
     assert result.exit_code == 0
-    assert "mokioclaw" in result.output
+    assert "--workspace" in result.output
+    assert "--mode" in result.output
 
 
-def test_cli_accepts_approval_mode_option_without_task() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["--approval-mode", "deny"])
-
+def test_cli_run_help() -> None:
+    result = runner.invoke(app, ["run", "--help"])
     assert result.exit_code == 0
-    assert "mokioclaw" in result.output
+    assert "task" in result.output
 
 
-def test_cli_accepts_checkpoint_mode_option_without_task() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["--checkpoint-mode", "strict"])
-
+def test_cli_console_help() -> None:
+    result = runner.invoke(app, ["console", "--help"])
     assert result.exit_code == 0
-    assert "mokioclaw" in result.output
-
-
-def test_cli_accepts_trace_mode_option_without_task() -> None:
-    runner = CliRunner()
-
-    result = runner.invoke(app, ["--trace-mode", "off"])
-
-    assert result.exit_code == 0
-    assert "mokioclaw" in result.output
-
-
-def test_cli_accepts_resume_option_without_task(monkeypatch, tmp_path) -> None:
-    runner = CliRunner()
-    calls = []
-
-    def fake_stream(*args, **kwargs):
-        calls.append((args, kwargs))
-        yield {"type": "workspace", "path": str(tmp_path)}
-
-    monkeypatch.setattr("mokioclaw.interaction.app.stream_agent_events", fake_stream)
-    result = runner.invoke(app, ["--resume", str(tmp_path)])
-
-    assert result.exit_code == 0
-    assert calls
-    assert calls[0][1]["resume_workspace"] == tmp_path
-
-
-def test_cli_passes_trace_mode(monkeypatch, tmp_path) -> None:
-    runner = CliRunner()
-    calls = []
-
-    def fake_stream(*args, **kwargs):
-        calls.append((args, kwargs))
-        yield {"type": "workspace", "path": str(tmp_path)}
-
-    monkeypatch.setattr("mokioclaw.interaction.app.stream_agent_events", fake_stream)
-    result = runner.invoke(app, ["--trace-mode", "off", "demo task"])
-
-    assert result.exit_code == 0
-    assert calls
-    assert calls[0][1]["trace_mode"] == "off"
-
-
-def test_cli_accepts_continue_option_without_task(monkeypatch, tmp_path) -> None:
-    calls = []
-
-    def fake_stream(*args, **kwargs):
-        calls.append((args, kwargs))
-        return iter(())
-
-    monkeypatch.setattr("mokioclaw.interaction.app.stream_agent_events", fake_stream)
-    from mokioclaw.interaction.app import app
-    from typer.testing import CliRunner
-
-    runner = CliRunner()
-    result = runner.invoke(app, ["--continue", str(tmp_path)])
-
-    assert result.exit_code == 0
-    assert calls[0][1]["resume_workspace"] == tmp_path

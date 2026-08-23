@@ -1,5 +1,5 @@
 """
-统一日志配置（dot 独立副本）
+统一日志配置（dot 独立副本，移除 colorlog 依赖）
 
 默认输出到 stderr（控制台调试可见），DEBUG 级别。
 可通过 DOT_LOG_LEVEL / MOKIO_LOG_LEVEL 环境变量调整。
@@ -16,12 +16,39 @@ import logging
 import os
 import sys
 from dotenv import load_dotenv
-import colorlog
 
-# ✅ 模块导入就加载 .env
+
+# ANSI 颜色码
+class AnsiColor:
+    CYAN = "\033[36m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    BOLD_PURPLE = "\033[1;35m"
+    RESET = "\033[0m"
+
+
 load_dotenv()
 
 _initialized = False
+
+
+class ColoredFormatter(logging.Formatter):
+    LEVEL_COLORS = {
+        logging.DEBUG: AnsiColor.CYAN,
+        logging.INFO: AnsiColor.GREEN,
+        logging.WARNING: AnsiColor.YELLOW,
+        logging.ERROR: AnsiColor.RED,
+        logging.CRITICAL: AnsiColor.BOLD_PURPLE,
+    }
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = self.LEVEL_COLORS.get(record.levelno, "")
+        msg = super().format(record)
+        # 仅终端输出才加颜色；非TTY输出不输出ANSI码
+        if sys.stderr.isatty():
+            return f"{color}{msg}{AnsiColor.RESET}"
+        return msg
 
 
 def _env(name: str, legacy_name: str) -> str | None:
@@ -29,7 +56,7 @@ def _env(name: str, legacy_name: str) -> str | None:
 
 
 def setup_logging(level: str | None = None) -> None:
-    """初始化日志配置，输出到 stderr，带控制台彩色"""
+    """初始化日志配置，输出到 stderr，带控制台彩色（纯标准库）"""
     global _initialized
     if _initialized:
         return
@@ -38,27 +65,13 @@ def setup_logging(level: str | None = None) -> None:
     resolved = (level or _env("DOT_LOG_LEVEL", "MOKIO_LOG_LEVEL") or "DEBUG").upper()
     log_level = getattr(logging, resolved, logging.DEBUG)
 
-    # 彩色格式
-    # log_color: 自动根据级别替换颜色；asctime无颜色
-    color_fmt = "%(log_color)s%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     datefmt = "%H:%M:%S"
 
-    # 颜色配置
-    handler = colorlog.StreamHandler(stream=sys.stderr)
-    handler.setFormatter(colorlog.ColoredFormatter(
-        fmt=color_fmt,
-        datefmt=datefmt,
-        log_colors={
-            "DEBUG": "cyan",
-            "INFO": "green",
-            "WARNING": "yellow",
-            "ERROR": "red",
-            "CRITICAL": "bold_purple",
-        }
-    ))
+    handler = logging.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(ColoredFormatter(fmt=fmt, datefmt=datefmt))
 
     root = logging.getLogger()
-    # ✅ 安全删除旧handler
     for h in root.handlers[:]:
         root.removeHandler(h)
 

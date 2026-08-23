@@ -33,11 +33,12 @@ import json
 from pathlib import Path
 from typing import Any, TypedDict
 
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 
+from ..compress.node import context_compress_node
 from ..core.hooks import HookEvent, HookPayload, HookResult, HookRunner
 from ..core.llm import create_model
 from ..core.log import get_logger
@@ -51,8 +52,6 @@ logger = get_logger(__name__)
 # 工具循环上限
 CODING_MAX_LOOPS = 10
 VALID_MAX_LOOPS = 8
-# 上下文压缩阈值（消息条数）
-COMPRESS_MAX_MESSAGES = 100
 
 
 class DotAgentState(TypedDict, total=False):
@@ -75,46 +74,6 @@ def _get_writer() -> Any:
 # ============================================================
 # Nodes
 # ============================================================
-
-def context_compress_node(state: DotAgentState) -> dict[str, Any]:
-    """上下文压缩节点
-
-    检测 messages 是否超限，超限则裁剪（保留系统语义 + 最近 N 条），
-    直接替换 session.messages。触发前发 PreCompact Hook。
-    """
-    session = state["session"]
-    writer = _get_writer()
-    messages = list(session.messages)
-    logger.info("[node:context_compress] messages=%d", len(messages))
-
-    if len(messages) <= COMPRESS_MAX_MESSAGES:
-        logger.info("[node:context_compress] no compression needed, skip")
-        return {}
-
-    # PreCompact Hook（auto 触发）
-    if session.hook_runner is not None:
-        try:
-            session.hook_runner.run(
-                HookEvent.PreCompact,
-                HookPayload(
-                    event=HookEvent.PreCompact,
-                    compact_trigger="auto",
-                    session_id=session.session_id,
-                    workspace=str(session.workspace),
-                ),
-            )
-        except Exception as exc:
-            logger.debug("PreCompact hook skipped: %s", exc)
-
-    system_msgs = [m for m in messages if isinstance(m, SystemMessage)]
-    other_msgs = [m for m in messages if not isinstance(m, SystemMessage)]
-    kept = other_msgs[-COMPRESS_MAX_MESSAGES:]
-    compressed = system_msgs + kept
-    session.messages = compressed
-
-    logger.info("[node:context_compress] compressed %d -> %d messages", len(messages), len(compressed))
-    writer({"type": "context_compressed", "before": len(messages), "after": len(compressed)})
-    return {}
 
 
 def _invoke_llm(messages: list[Any], *, node: str, tools: list[Any] | None = None, config: Any = None) -> Any:
@@ -139,6 +98,10 @@ def _invoke_llm(messages: list[Any], *, node: str, tools: list[Any] | None = Non
         response = model.invoke(messages, config=config) if config is not None else model.invoke(messages)
         content = getattr(response, "content", "")
         tool_calls = getattr(response, "tool_calls", None) or []
+        # 原始响应日志（带 node 名称，方便追踪是 plan/coding/valid 哪个 agent 返回的）
+        _raw = str(content) if content else "(empty)"
+        logger.info("[%s] LLM response: content_len=%d, tool_calls=%d, raw=%s",
+                    node, len(_raw), len(tool_calls), _raw[:500])
         span.set_output_summary(f"content_len={len(str(content))} tool_calls={len(tool_calls)}")
         span.finish()
         return response
@@ -165,17 +128,41 @@ def plan_node(state: DotAgentState) -> dict[str, Any]:
 
     plan: dict[str, Any] = {}
     try:
+        # 第一次尝试：带 response_format=json_object（部分模型不支持会导致空返回）
         config = RunnableConfig(**{"response_format": {"type": "json_object"}})
         response = _invoke_llm(
             [SystemMessage(content=system_prompt), *session.messages],
             node="plan_node",
             config=config,
         )
-        session.messages.append(response)
+        raw_content = str(getattr(response, "content", "") or "")
+        logger.info("[node:plan] LLM raw response (first 500 chars): %s", raw_content[:500])
+        text = _extract_json_text(raw_content)
+        if text:
+            plan, _ = json.JSONDecoder().raw_decode(text)
 
-        text = _extract_json_text(str(getattr(response, "content", "") or ""))
-        plan = json.loads(text) if text else {}
+        # 降级重试：如果第一次解析出空 plan，去掉 response_format 再试一次
+        if not plan:
+            logger.warning("[node:plan] first attempt returned empty plan, retrying without response_format")
+            # 移除上次失败的响应（如果有），避免污染上下文
+            session.messages.append(response)
+            response2 = _invoke_llm(
+                [SystemMessage(content=system_prompt), *session.messages],
+                node="plan_node",
+            )
+            raw_content2 = str(getattr(response2, "content", "") or "")
+            logger.info("[node:plan] retry raw response (first 500 chars): %s", raw_content2[:500])
+            session.messages.append(response2)
+            text2 = _extract_json_text(raw_content2)
+            if text2:
+                plan, _ = json.JSONDecoder().raw_decode(text2)
+        else:
+            session.messages.append(response)
+
         logger.info("[node:plan] LLM responded, plan keys=%s", list(plan.keys()))
+    except json.JSONDecodeError as exc:
+        logger.warning("plan_node: JSON parse failed: %s, text=%r", exc, text[:200] if text else "")
+        plan = {}
     except Exception as exc:
         logger.warning("plan_node: LLM plan generation failed: %s", exc, exc_info=True)
         plan = {}
@@ -320,7 +307,12 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
 
 
 def valid_node(state: DotAgentState) -> dict[str, Any]:
-    """校验节点：agent 自主验证编码结果"""
+    """校验节点：agent 自主验证编码结果
+
+    纯对话优化：如果本轮 coding_agent 没有调用任何工具（纯文本回复），
+    跳过 LLM 验证，直接标记 passed=True。避免对问答类任务做无意义的
+    工作区检查导致反复重试。
+    """
     session = state["session"]
     writer = _get_writer()
     task_plan = session.task_plan
@@ -330,6 +322,29 @@ def valid_node(state: DotAgentState) -> dict[str, Any]:
         session.attempt_count, session.max_attempt,
         task_plan.get("description", "")[:80],
     )
+
+    # 纯对话检测：本轮没有 ToolMessage → coding_agent 只回复了文本，无需验证
+    # 只检查最后一个 HumanMessage 之后的消息（当前轮次）
+    _last_human_idx = -1
+    for _i in range(len(session.messages) - 1, -1, -1):
+        if isinstance(session.messages[_i], HumanMessage):
+            _last_human_idx = _i
+            break
+    _has_tool_messages = any(
+        isinstance(session.messages[_j], ToolMessage)
+        for _j in range(_last_human_idx + 1, len(session.messages))
+    )
+    if not _has_tool_messages:
+        session.validate_result = {
+            "passed": True,
+            "error_msg": "",
+            "fail_reason": "",
+            "checks": [{"name": "chat_only", "passed": True, "detail": "纯对话任务，无需工作区验证"}],
+        }
+        session.attempt_count += 1
+        logger.info("[node:valid_node] chat-only task, auto-passed")
+        writer({"type": "validation_result", "passed": True, "chat_only": True})
+        return {}
 
     try:
         tools = build_tools_for_session(session)
@@ -617,6 +632,9 @@ def _run_tool_call(
     # 渐进披露特殊分发（mcp_/skill_ 前缀）
     special = dispatch_special_tool(session, call)
     if special is not None:
+        # MCP 工具首次调用：返回 schema 定义（非执行结果）
+        _sc = getattr(special, "content", "")
+        logger.info("[tool:%s] dispatch_special_tool returned (schema/definition): %s", tool_name, _sc[:300])
         return special
 
     # PreToolUse Hook 拦截
@@ -630,11 +648,15 @@ def _run_tool_call(
             )
 
     try:
-        return execute_tool_by_name(
+        result_msg = execute_tool_by_name(
             tools=tools,
             call=call,
             session=session,
         )
+        # 记录工具执行结果（MCP 工具调试用）
+        _rc = getattr(result_msg, "content", "") if result_msg else ""
+        logger.info("[tool:%s] executed, result: %s", tool_name, _rc[:500])
+        return result_msg
     except Exception as exc:
         logger.warning("tool execution failed: %s", exc, exc_info=True)
         return ToolMessage(
@@ -660,29 +682,6 @@ def _check_hook(session: Session, tool_name: str, tool_args: dict[str, Any]) -> 
         return HookResult()
 
 
-#
-# def _evaluate_plan_quality(
-#     *,
-#     plan_description: str,
-#     subtasks: list[dict],
-#     tool_call_count: int,
-#     loop_count: int,
-#     summary: str,
-# ) -> tuple[bool, str]:
-#     """启发式 plan 质量评估（空 plan / 无产出 / 循环耗尽视为无效）"""
-#     if not plan_description and not subtasks:
-#         return False, "Plan is empty — no description or subtasks provided."
-#     if not subtasks:
-#         return False, "Plan has no subtasks — nothing to execute."
-#     if loop_count >= CODING_MAX_LOOPS and tool_call_count == 0:
-#         return False, "Agent exhausted all loops without making any tool calls."
-#     if not summary or summary == "(no result)":
-#         return False, "Agent produced no output after execution."
-#     return True, ""
-
-import json
-from typing import Any, Tuple
-
 
 def _evaluate_plan_quality(
         *,
@@ -691,15 +690,24 @@ def _evaluate_plan_quality(
         tool_call_count: int,
         loop_count: int,
         summary: str,
-) -> Tuple[bool, str]:
+) -> tuple[bool, str]:
     """
     LLM驱动评估计划执行质量。
+    快速路径：纯对话任务（无工具调用 + 有文本输出）直接通过，不走 LLM 评估。
     兜底：完全空计划直接判定无效；其余交给LLM判断是否需要重规划。
     返回 (is_reasonable: bool, issue: str)
     """
-    # 兜底：完全空计划，不走LLM，节省token
+    # 兜底：完全空计划 + agent 也没有有意义的输出 → 直接判定无效
     if not plan_description and not subtasks:
-        return False, "Plan is empty — no description or subtasks provided."
+        if not summary or summary.startswith("Executed"):
+            return False, "Plan is empty — no description or subtasks provided."
+        logger.info("[evaluate] plan empty but agent produced output, delegating to LLM evaluator")
+
+    # 快速路径：agent 没调工具但有实际文本输出 → 纯对话任务，直接通过
+    # 避免对"你好""谢谢"这类简单对话浪费 LLM 评估 token
+    if tool_call_count == 0 and summary and len(summary) > 5:
+        logger.info("[evaluate] chat-only task (no tools, has text), auto-pass")
+        return True, ""
 
     eval_system = """
 You are a plan‑execution evaluator.
@@ -716,11 +724,10 @@ Rules:
 - is_reasonable = false: execution deviates from plan, stuck, meaningless loop, failed to complete subtasks → need replan.
 - issue: when is_reasonable=false, write concise reason; otherwise empty string.
 
-Evaluate from these dimensions:
-- Whether the agent followed the subtasks in the plan.
-- Whether stuck in useless loops, zero effective tool calls.
-- Whether output answers user request / coding objective.
-- For simple chat‑only tasks: no tool calls is acceptable, as long as meaningful answer produced.
+CRITICAL RULES:
+- For conversational tasks (greetings, questions, explanations, chat): no tool calls is CORRECT. If the agent produced a meaningful text response, is_reasonable MUST be true.
+- For coding tasks: zero effective tool calls + no code output = unreasonable.
+- Do NOT penalize the agent for not using tools when the task doesn't require them.
 """
 
     eval_user_prompt = f"""
@@ -746,7 +753,8 @@ Please evaluate this plan execution.
         # 调用现有统一LLM入口，node标记为plan_evaluate，不使用tools
         resp = _invoke_llm(messages, node="plan_evaluate", tools=None)
         raw_content = getattr(resp, "content", "")
-        parsed = json.loads(raw_content.strip())
+        # raw_decode 只解析第一个 JSON 对象，忽略尾部多余数据
+        parsed, _ = json.JSONDecoder().raw_decode(raw_content.strip())
         is_reasonable = bool(parsed.get("is_reasonable", True))
         issue = str(parsed.get("issue", ""))
         return is_reasonable, issue
@@ -764,7 +772,7 @@ def _parse_validation_result(messages: list[Any]) -> dict[str, Any]:
             text = _extract_json_text(str(getattr(msg, "content", "") or ""))
             if text:
                 try:
-                    parsed = json.loads(text)
+                    parsed, _ = json.JSONDecoder().raw_decode(text)
                     if isinstance(parsed, dict):
                         return {
                             "passed": bool(parsed.get("passed", False)),
@@ -783,14 +791,27 @@ def _parse_validation_result(messages: list[Any]) -> dict[str, Any]:
 
 
 def _extract_json_text(text: str) -> str:
-    """剥 markdown 围栏，截取第一个 { 起的 JSON 文本"""
-    if text.startswith("```"):
+    """剥 markdown 围栏 / think 标签，截取第一个 { 起的 JSON 文本"""
+    if not text:
+        return ""
+    # 剥 <think>...</think> 标签（某些模型会返回思考过程）
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    # 剥 markdown 围栏（```json ... ``` 或 ``` ... ```）
+    if "```" in text:
         lines = text.splitlines()
-        if lines and lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
+        # 找到 ``` 开始和结束
+        start_idx = None
+        end_idx = None
+        for i, line in enumerate(lines):
+            if line.strip().startswith("```") and start_idx is None:
+                start_idx = i + 1
+            elif line.strip() == "```" and start_idx is not None:
+                end_idx = i
+                break
+        if start_idx is not None and end_idx is not None:
+            text = "\n".join(lines[start_idx:end_idx]).strip()
+    # 截取第一个 { 起的 JSON 文本
     start = text.find("{")
     if start == -1:
         return ""
@@ -806,8 +827,8 @@ def _load_file_safe(path: Path) -> str:
     try:
         if path.exists() and path.is_file():
             return path.read_text(encoding="utf-8").strip()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("failed to load %s: %s", path, exc)
     return ""
 
 

@@ -30,6 +30,11 @@ def get_plan_system_prompt(replan_count: int = 0, error_feedback: str = "") -> s
         "- subtasks cannot be empty array: for pure chat/question‑answer task, create one subtask representing answer user question.\n"
         "- status inside subtask use value: pending.\n"
         "- Respond with ONLY the JSON object, no markdown fences, no extra text outside json.\n"
+        "\nIMPORTANT for conversational tasks:\n"
+        "- For simple greetings, casual chat, or quick questions that need NO file changes or commands:\n"
+        "  Keep the plan MINIMAL. One short description, one simple subtask like 'Reply to user'.\n"
+        "  Do NOT create complex subtasks or validation_commands for simple conversations.\n"
+        "  The coding agent will respond directly with text — no tools needed.\n"
     )
     if replan_count > 0:
         base += (
@@ -63,12 +68,33 @@ def get_coding_system_prompt(
         skills_catalog: Skills 目录文本
         skills_rules: Skills 使用规则
     """
+    # plan 为空时的自主决策指引
+    _empty_plan_hint = ""
+    if not plan_description and not subtasks:
+        _empty_plan_hint = (
+            "\n[IMPORTANT] The plan is EMPTY (no description, no subtasks). "
+            "This means the planner failed to generate a plan. "
+            "You MUST decide what to do yourself based on the user's latest message in the conversation. "
+            "Read the user's message carefully and respond directly. "
+            "For conversational tasks (questions, greetings, remembering info), just reply with text. "
+            "For coding tasks, decide the steps yourself and execute them.\n"
+        )
+
     parts: list[str] = [
         "You are a coding agent. Execute the given plan step by step.\n",
-        f"Plan: {plan_description}\n",
+        f"Plan: {plan_description or '(empty)'}\n",
         f"Subtasks: {_json_dumps(subtasks)}\n",
         f"Constraints: {_json_dumps(constraints)}\n",
-        "Use the available tools to complete the tasks.\n",
+        "Use the available tools to complete the tasks.\n"
+        "\nCRITICAL — When to use tools vs text:\n"
+        "- Conversational tasks (greetings, questions, explanations, remembering info, chat):\n"
+        "  → Respond with TEXT ONLY. Do NOT call any tools. Just answer directly.\n"
+        "- Coding tasks (write code, fix bugs, create files, run commands):\n"
+        " → Use tools as needed (FileWriteTool, BashTool, etc.)\n"
+        "- Information tasks (weather, search, lookups):\n"
+        "  → Use the appropriate MCP tools to fetch data, then present results.\n"
+        "NEVER call tools just to 'verify', 'explore', or 'check the workspace' for conversational tasks.\n",
+        _empty_plan_hint,
         "After completing, evaluate if the plan was reasonable and executable.",
     ]
 

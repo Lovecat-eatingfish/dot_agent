@@ -111,18 +111,21 @@ def load_skill_markdown(skill: Skill) -> str:
 
 
 def discover_skills(skills_dir: Path) -> list[Skill]:
-    """扫描目录，加载所有 Skill（仅元数据）"""
+    """扫描目录，加载所有 Skill（仅元数据）
+
+    支持嵌套目录（**/SKILL.md），兼容旧的 mokioclaw 插件目录结构。
+    """
     if not skills_dir.exists():
         return []
     skills: list[Skill] = []
     seen: set[str] = set()
-    # 优先 SKILL.md（Claude Code）
-    for md_path in sorted(skills_dir.glob("*/SKILL.md")):
+    # 递归扫描 SKILL.md（支持嵌套目录，如 plugins/builtin/xxx/skills/review/SKILL.md）
+    for md_path in sorted(skills_dir.rglob("SKILL.md")):
         skill = load_skill(md_path)
         if skill is not None and skill.name not in seen:
             skills.append(skill)
             seen.add(skill.name)
-    for yaml_path in sorted(skills_dir.glob("*/skill.yaml")):
+    for yaml_path in sorted(skills_dir.rglob("skill.yaml")):
         skill = load_skill(yaml_path)
         if skill is not None and skill.name not in seen:
             skills.append(skill)

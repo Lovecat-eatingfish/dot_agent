@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
-from contextlib import AsyncExitStack
 from typing import Any
 
 from ..core.log import get_logger
@@ -55,8 +54,8 @@ class AsyncMCPBridge:
         asyncio.set_event_loop(self._loop)
         try:
             self._loop.run_forever()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.error("MCP event loop crashed: %s", exc, exc_info=True)
 
     def _submit(self, coro, timeout: int = _DEFAULT_TIMEOUT):
         """提交 coroutine 到 loop 线程并等待结果"""

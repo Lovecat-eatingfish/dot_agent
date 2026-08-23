@@ -102,16 +102,8 @@ def create_model(
 
     # 模型优先级：显式参数（降级回退用）> 运行时覆盖 > env 默认
     resolved_model = model or get_active_model() or env["model"]
-    # ===== 加这一段打印 =====
-    # print("=" * 50)
-    # print("[DEBUG] LLM 调用参数：")
-    # print(f"  model     : {resolved_model}")
-    # print(f"  base_url  : {env['base_url']}")
-    # print(f"  api_key   : {env['api_key'][:8]}...{env['api_key'][-4:]}")  # 只打印前后几位，防泄露
-    # print("=" * 50)
     return ChatOpenAI(
         api_key=env["api_key"],
-        openai_api_key=env["api_key"],
         model=resolved_model,
         base_url=env["base_url"],
         temperature=0,

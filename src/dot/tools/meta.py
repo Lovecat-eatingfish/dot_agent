@@ -189,11 +189,18 @@ def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | N
 
 
 def _make_mcp_callable(session: Any, tool_name: str) -> StructuredTool:
-    """为已加载的 mcp_ 工具创建可调用包装（转发 MCPToolExecutor）"""
+    """为已加载的 mcp_ 工具创建可调用包装（转发 MCPToolExecutor）
+
+    关键：把 MCP 工具的 input_schema 传给 StructuredTool 的 args_schema，
+    这样 model.bind_tools() 时 LLM 能看到完整的参数定义，而不是空 schema。
+    """
     from ..mcp.host import MCPToolExecutor
 
     host = session.mcp_host
     executor = MCPToolExecutor(host)
+    schema = host._schema_cache.get(tool_name, {})
+    desc = schema.get("description", "") or f"MCP tool {tool_name}"
+    input_schema = schema.get("input_schema", {})
 
     def _invoke(**kwargs: Any) -> dict[str, Any]:
         try:
@@ -202,9 +209,43 @@ def _make_mcp_callable(session: Any, tool_name: str) -> StructuredTool:
         except Exception as exc:
             return {"ok": False, "is_error": True, "error": f"{type(exc).__name__}: {exc}"}
 
-    schema = host._schema_cache.get(tool_name, {})
-    desc = schema.get("description", "") or f"MCP tool {tool_name}"
+    # 从 MCP input_schema 构建 pydantic args_schema，让 LLM 看到完整参数定义
+    args_schema = _build_args_schema(tool_name, input_schema)
+    if args_schema is not None:
+        return StructuredTool.from_function(
+            name=tool_name, func=_invoke, description=desc, args_schema=args_schema,
+        )
     return StructuredTool.from_function(name=tool_name, func=_invoke, description=desc)
+
+
+def _build_args_schema(tool_name: str, input_schema: dict) -> Any:
+    """从 MCP input_schema 构建 pydantic model（供 StructuredTool.args_schema 使用）
+
+    input_schema 格式示例：
+    {"type":"object","properties":{"city":{"type":"string","description":"城市名"}},"required":["city"]}
+    """
+    from pydantic import Field, create_model
+
+    if not input_schema or not isinstance(input_schema, dict):
+        return None
+    properties = input_schema.get("properties", {})
+    if not properties:
+        return None
+    required = set(input_schema.get("required", []))
+    fields: dict[str, Any] = {}
+    for prop_name, prop_def in properties.items():
+        prop_type = prop_def.get("type", "string")
+        py_type = {"string": str, "integer": int, "number": float, "boolean": bool}.get(prop_type, str)
+        desc = prop_def.get("description", "")
+        if prop_name in required:
+            fields[prop_name] = (py_type, Field(description=desc))
+        else:
+            default = prop_def.get("default")
+            fields[prop_name] = (py_type, Field(default=default, description=desc))
+    try:
+        return create_model(f"{tool_name}_args", **fields)
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -212,16 +253,32 @@ def _make_mcp_callable(session: Any, tool_name: str) -> StructuredTool:
 # ============================================================
 
 def build_tools_for_session(session: Any) -> list[StructuredTool]:
-    """为 session 构建完整工具列表：基础工具 + 元工具
+    """为 session 构建工具列表（按 run_mode 管控工具权限）
 
-    三种模式都注册全量工具（含写工具）——权限由 PermissionManager
-    在工具调用时拦截（fix-权限控制.md）：plan 写=ASK、plan/edit bash=ASK/DENY。
+    run_mode（CLI 运行模式，存于 session.run_mode，热生效）：
+      - agent：全量基础工具 + MCP/Skill 元工具（默认，完整能力）
+      - chat：无工具（纯对话，仅 LLM 问答，不读写文件/执行命令/请求 MCP）
+      - code：仅安全文件工具（read/write/glob/grep），禁用 Bash、MCP 变更工具
+
+    与 agent_mode（plan/edit/auto，权限细粒度拦截）正交：run_mode 决定
+    工具是否暴露给模型，agent_mode 决定暴露后的工具是否需审批/拦截。
     """
     from . import build_tools
 
+    run_mode = getattr(session, "run_mode", "agent")
+
+    # chat 纯对话模式：禁用所有工具
+    if run_mode == "chat":
+        return []
+
     tools: list[StructuredTool] = list(build_tools(session))
 
-    # 构建元工具：mcp_search, skill_search
+    # code 代码专注模式：仅保留文件工具，禁用 BashTool
+    if run_mode == "code":
+        tools = [t for t in tools if t.name != "BashTool"]
+        return tools
+
+    # agent 完整模式：全量基础工具 + MCP/Skill 元工具
     mcp_tool = build_mcp_search_tool(session)
     if mcp_tool is not None:
         tools.append(mcp_tool)

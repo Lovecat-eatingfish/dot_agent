@@ -164,7 +164,7 @@ def _check_write_permission(path: Path, workspace: Path) -> None:
 def is_path_safe_for_read(path: Path, workspace: Path) -> bool:
     """快速检查路径是否可读（不抛出异常）"""
     try:
-        validate_path_access(_Ns(workspace=workspace), path, "read")
+        validate_path_access(WorkspaceNs(workspace=workspace), path, "read")
         return True
     except PathSecurityError:
         return False
@@ -173,14 +173,14 @@ def is_path_safe_for_read(path: Path, workspace: Path) -> bool:
 def is_path_safe_for_write(path: Path, workspace: Path) -> bool:
     """快速检查路径是否可写（不抛出异常）"""
     try:
-        validate_path_access(_Ns(workspace=workspace), path, "write")
+        validate_path_access(WorkspaceNs(workspace=workspace), path, "write")
         return True
     except PathSecurityError:
         return False
 
 
-class _Ns:
-    """最小命名空间，只持有 workspace 属性（避免为路径校验引入 RuntimeState 依赖）"""
+class WorkspaceNs:
+    """最小命名空间，只持有 workspace 属性（供 validate_path_access 使用）"""
     def __init__(self, workspace: Path) -> None:
         self.workspace = workspace
 

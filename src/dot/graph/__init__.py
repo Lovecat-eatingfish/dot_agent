@@ -6,6 +6,7 @@ dot.graph — LangGraph 图编排
 """
 from __future__ import annotations
 
+from ..compress.node import context_compress_node
 from .coding_graph import DotAgentState, build_graph, compile_graph
 from .prompts import (
     get_coding_system_prompt,
@@ -14,6 +15,7 @@ from .prompts import (
 )
 
 __all__ = [
+    "context_compress_node",
     "DotAgentState",
     "build_graph",
     "compile_graph",

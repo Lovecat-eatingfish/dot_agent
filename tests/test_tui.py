@@ -1,261 +1,332 @@
+"""TUI 模块测试（dot 项目）
+
+覆盖：
+  - InputPanel 回车提交 / Shift+Enter 换行 / Ctrl+D 提交
+  - 斜杠命令本地处理（不进 LLM）
+  - 历史输入 ↑/↓ 回溯
+  - 模式循环切换
+  - 事件渲染（user/assistant/tool/final/error）
+"""
 from __future__ import annotations
 
 import asyncio
-from pathlib import Path
+from typing import Any, Iterator
 
-from rich.text import Text
-from typer.testing import CliRunner
+import pytest
 
-from mokioclaw.interaction.app import app
-from mokioclaw.interaction.event_summary import summarize_event
-from mokioclaw.interaction.tui import MokioClawTuiApp
-from mokioclaw.interaction.tui.approval import ApprovalGate
-from mokioclaw.interaction.tui.logo import render_logo
-from mokioclaw.security.approval import ApprovalRequest
+from dot.cli.tui.app import DotTUI
+from dot.cli.tui.widgets import ChatPanel, InputPanel, LogPanel, StatusBar
 
 
-def test_tui_help_is_available() -> None:
-    runner = CliRunner()
+# ============================================================
+# Fake bridge：不触碰真实 AgentHost / LLM
+# ============================================================
 
-    result = runner.invoke(app, ["tui", "--help"])
+class FakeBridge:
+    """SessionBridge 桩：记录调用，run_turn 返回可控事件流"""
 
-    assert result.exit_code == 0
-    assert "Textual TUI" in result.output
+    def __init__(self, events: list[dict[str, Any]] | None = None) -> None:
+        self.host = FakeHost()
+        self._mode = "agent"
+        self._history: list[str] = []
+        self._history_pos = -1
+        self._running = False
+        self._events = events or []
+        self.submitted: list[str] = []
+        self.slash_calls: list[str] = []
+        self.reset_calls = 0
+        self.save_calls = 0
 
+    # --- 模式 ---
+    def get_mode(self) -> str:
+        return self._mode
 
-def test_tui_options_are_accepted(monkeypatch) -> None:
-    runner = CliRunner()
-    captured = {}
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
 
-    class FakeApp:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
+    def cycle_mode(self, *, forward: bool = True) -> str:
+        order = ["agent", "chat", "code"]
+        idx = order.index(self._mode)
+        step = 1 if forward else -1
+        self._mode = order[(idx + step) % len(order)]
+        return self._mode
 
-        def run(self):
+    # --- 工作目录 ---
+    def get_workspace(self) -> str:
+        return "/fake/workspace"
+
+    # --- 运行状态 ---
+    def is_running(self) -> bool:
+        return self._running
+
+    def cancel(self) -> bool:
+        return True
+
+    # --- 历史 ---
+    def add_history(self, text: str) -> None:
+        text = text.strip()
+        if text and (not self._history or self._history[-1] != text):
+            self._history.append(text)
+        self._history_pos = -1
+
+    def history_prev(self) -> str | None:
+        if not self._history:
             return None
+        if self._history_pos == -1:
+            self._history_pos = len(self._history) - 1
+        elif self._history_pos > 0:
+            self._history_pos -= 1
+        return self._history[self._history_pos]
 
-    monkeypatch.setattr("mokioclaw.interaction.tui.MokioClawTuiApp", FakeApp)
+    def history_next(self) -> str | None:
+        if not self._history or self._history_pos < 0:
+            return None
+        if self._history_pos < len(self._history) - 1:
+            self._history_pos += 1
+            return self._history[self._history_pos]
+        self._history_pos = -1
+        return ""
 
-    result = runner.invoke(
-        app,
-        ["tui", "--trace-mode", "off", "--checkpoint-mode", "strict", "--approval-mode", "deny", "--workspace", "demo-workspace"],
-    )
+    # --- 会话 ---
+    def reset_session(self) -> str:
+        self.reset_calls += 1
+        return "新会话: fake"
 
-    assert result.exit_code == 0
-    assert captured["trace_mode"] == "off"
-    assert captured["checkpoint_mode"] == "strict"
-    assert captured["approval_mode"] == "deny"
-    assert captured["workspace"] == Path("demo-workspace")
+    def save_session(self, name: str | None = None) -> str:
+        self.save_calls += 1
+        return "fake-session-id"
 
-
-def test_natural_task_entry_still_works(monkeypatch, tmp_path) -> None:
-    runner = CliRunner()
-    calls = []
-
-    def fake_stream(*args, **kwargs):
-        calls.append((args, kwargs))
-        yield {"type": "workspace", "path": str(tmp_path)}
-
-    monkeypatch.setattr("mokioclaw.interaction.app.stream_agent_events", fake_stream)
-
-    result = runner.invoke(app, ["demo task"])
-
-    assert result.exit_code == 0
-    assert calls[0][0][0] == "demo task"
-
-
-def test_logo_renderer_returns_non_empty_text() -> None:
-    logo = render_logo(max_width=20, max_rows=8)
-
-    assert isinstance(logo, Text)
-    assert str(logo).strip()
-    assert len(str(logo).splitlines()) <= 8
+    # --- 执行 ---
+    def run_turn(self, text: str) -> Iterator[dict[str, Any]]:
+        self.submitted.append(text)
+        self.add_history(text)
+        yield from self._events
 
 
-def test_logo_renderer_falls_back_for_missing_asset(tmp_path) -> None:
-    logo = render_logo(tmp_path / "missing.png", max_width=20, max_rows=8)
+class FakeHost:
+    def get_mcp_status(self) -> dict[str, Any]:
+        return {"online": True, "servers": [], "tools": []}
 
-    assert str(logo).strip()
+    def get_token_status(self) -> dict[str, Any]:
+        return {"water_level": 0}
 
 
-def test_tui_renders_fake_stream_events(tmp_path) -> None:
-    def fake_stream(*args, **kwargs):
-        yield {
-            "type": "custom_event",
-            "event": {"type": "session_started", "session_id": "session-demo", "workspace": str(tmp_path / "workspace-a")},
-        }
-        yield {"type": "workspace", "path": str(tmp_path / "workspace-a")}
-        yield {
-            "type": "custom_event",
-            "event": {
-                "type": "todo_update",
-                "plan_summary": "demo plan",
-                "todos": [{"id": "todo-1", "content": "write file", "status": "in_progress"}],
-            },
-        }
-        yield {
-            "type": "graph_event",
-            "event": {"final": {"final_answer": "PASSED: wrote the file"}},
-        }
-        yield {
-            "type": "custom_event",
-            "event": {
-                "type": "trace_summary",
-                "trace_id": "trace-demo",
-                "status": "finished",
-                "trace_dir": str(tmp_path / "trace-demo"),
-                "node_visits": {"final": 1},
-                "tool_calls": 1,
-                "failed_tool_calls": 0,
-            },
-        }
+# ============================================================
+# 工具函数
+# ============================================================
+
+def _make_app(bridge: FakeBridge | None = None) -> DotTUI:
+    return DotTUI(bridge or FakeBridge())
+
+
+def _run(coro) -> Any:
+    return asyncio.run(coro)
+
+
+def _log_text(widget) -> str:
+    """RichLog 内容拼接为纯文本"""
+    parts = []
+    for strip in getattr(widget, "lines", []):
+        parts.append(strip.text)
+    return "\n".join(parts)
+
+
+# ============================================================
+# 回车提交 / 换行
+# ============================================================
+
+def test_enter_submits_message() -> None:
+    bridge = FakeBridge()
+    app = _make_app(bridge)
 
     async def run() -> None:
-        app = MokioClawTuiApp(initial_task="demo task", stream_factory=fake_stream)
-        async with app.run_test(size=(120, 36)) as pilot:
-            await pilot.pause(0.3)
-            assert "workspace-a" in app.latest_workspace
-            assert "trace-demo" in app.latest_trace
-            assert "session-demo" in app.sidebar_text
-            assert app.run_count == 1
-            assert not app.running
-
-    asyncio.run(run())
-
-
-def test_tui_renders_lightweight_chat_response() -> None:
-    def fake_stream(*args, **kwargs):
-        yield {
-            "type": "custom_event",
-            "event": {
-                "type": "chat_response",
-                "mode": "lightweight",
-                "reason": "greeting",
-                "response": "你好，我在。",
-            },
-        }
-
-    async def run() -> None:
-        app = MokioClawTuiApp(initial_task="你好", stream_factory=fake_stream)
         async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause(0.2)
-            assert app.run_count == 1
-            assert app.latest_workspace
-            assert not app.running
-
-    asyncio.run(run())
-
-
-def test_tui_chat_response_keeps_long_body_visible() -> None:
-    body = (
-        "Cloudflare 是一家云服务平台。\n"
-        "- CDN 与性能优化。\n"
-        "- 安全能力：DDoS 防护、WAF、Bot 管理。\n"
-        "- DNS 服务：托管权威 DNS、DNSSEC、智能解析和全局 Anycast 网络。"
-    )
-
-    async def run() -> None:
-        app = MokioClawTuiApp(stream_factory=lambda *args, **kwargs: [])
-        async with app.run_test(size=(100, 30)) as pilot:
-            app._handle_event(
-                {
-                    "type": "custom_event",
-                    "event": {"type": "chat_response", "mode": "lightweight", "reason": "q&a", "response": body},
-                }
-            )
-            await pilot.pause(0.1)
-            summary = summarize_event(
-                {"type": "custom_event", "event": {"type": "chat_response", "mode": "lightweight", "reason": "q&a", "response": body}}
-            )
-            assert "DNSSEC" in app._compact_body(summary)
-
-    asyncio.run(run())
-
-    summary = summarize_event({"type": "custom_event", "event": {"type": "chat_response", "response": body}})
-    assert "DNSSEC" in summary.body
-
-
-def test_tui_hides_low_level_entry_graph_updates() -> None:
-    async def run() -> None:
-        app = MokioClawTuiApp(stream_factory=lambda *args, **kwargs: [])
-        async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause(0.1)
-            before = len(app.query_one("#events").children)
-            app._handle_event({"type": "graph_event", "event": {"intent_router": {"intent_route": "chat"}}})
-            app._handle_event({"type": "graph_event", "event": {"chat_responder": {"chat_response": "hi"}}})
-            app._handle_event({"type": "custom_event", "event": {"type": "session_turn_started", "turn": 1, "task": "hello"}})
-            await pilot.pause(0.1)
-            assert len(app.query_one("#events").children) == before
-
-    asyncio.run(run())
-
-
-def test_tui_input_bar_stays_visible() -> None:
-    async def run() -> None:
-        app = MokioClawTuiApp(stream_factory=lambda *args, **kwargs: [])
-        async with app.run_test(size=(100, 28)) as pilot:
+            inp = app.query_one(InputPanel)
+            inp.focus()
             await pilot.press("h", "e", "l", "l", "o")
+            await pilot.press("enter")
             await pilot.pause(0.1)
-            input_widget = app.query_one("#task-input")
-            footer = app.query_one("Footer")
-            assert input_widget.region.y < footer.region.y
-            assert input_widget.value == "hello"
+            assert bridge.submitted == ["hello"]
+            assert inp.text == ""
 
-    asyncio.run(run())
+    _run(run())
 
 
-def test_tui_user_message_card_keeps_compact_height() -> None:
-    async def run() -> None:
-        app = MokioClawTuiApp(stream_factory=lambda *args, **kwargs: [])
-        async with app.run_test(size=(100, 24)) as pilot:
-            app._write_run_start("你好", None)
-            await pilot.pause(0.1)
-            user_card = app.query(".event-user").last()
-            assert user_card.region.height <= 4
-
-    asyncio.run(run())
-
-
-def test_tui_runs_multiple_tasks_in_same_session_workspace(tmp_path) -> None:
-    calls = []
-
-    def fake_stream(*args, **kwargs):
-        calls.append((args, kwargs))
-        yield {"type": "workspace", "path": str(kwargs["session_workspace"])}
+def test_shift_enter_inserts_newline_not_submit() -> None:
+    bridge = FakeBridge()
+    app = _make_app(bridge)
 
     async def run() -> None:
-        app = MokioClawTuiApp(workspace=tmp_path / "session-workspace", stream_factory=fake_stream)
         async with app.run_test(size=(100, 30)) as pilot:
-            app.start_task("first")
-            await pilot.pause(0.2)
-            app.start_task("second")
-            await pilot.pause(0.2)
-
-    asyncio.run(run())
-
-    assert len(calls) == 2
-    assert calls[0][1]["session_workspace"] == tmp_path / "session-workspace"
-    assert calls[1][1]["session_workspace"] == tmp_path / "session-workspace"
-    assert calls[0][0][0] == "first"
-    assert calls[1][0][0] == "second"
-
-
-def test_tui_new_session_command_switches_workspace(tmp_path) -> None:
-    async def run() -> None:
-        app = MokioClawTuiApp(workspace=tmp_path / "first", stream_factory=lambda *args, **kwargs: [])
-        async with app.run_test(size=(100, 30)) as pilot:
-            old_workspace = app.session_workspace
-            app.start_new_session()
+            inp = app.query_one(InputPanel)
+            inp.focus()
+            await pilot.press("a")
+            await pilot.press("shift+enter")
+            await pilot.press("b")
             await pilot.pause(0.1)
-            assert app.session_workspace != old_workspace
-            assert app.latest_workspace == str(app.session_workspace)
+            assert bridge.submitted == []
+            assert inp.text == "a\nb"
 
-    asyncio.run(run())
+    _run(run())
 
 
-def test_approval_gate_returns_decision() -> None:
-    gate = ApprovalGate(ApprovalRequest(id="approval-demo", command="uv add fastapi", risk_reason="dependency change"))
+def test_ctrl_d_submits_message() -> None:
+    bridge = FakeBridge()
+    app = _make_app(bridge)
 
-    gate.resolve(True)
+    async def run() -> None:
+        async with app.run_test(size=(100, 30)) as pilot:
+            inp = app.query_one(InputPanel)
+            inp.focus()
+            await pilot.press("h", "i")
+            await pilot.press("ctrl+d")
+            await pilot.pause(0.1)
+            assert bridge.submitted == ["hi"]
 
-    assert gate.wait().approved is True
+    _run(run())
+
+
+def test_empty_input_does_not_submit() -> None:
+    bridge = FakeBridge()
+    app = _make_app(bridge)
+
+    async def run() -> None:
+        async with app.run_test(size=(100, 30)) as pilot:
+            inp = app.query_one(InputPanel)
+            inp.focus()
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            assert bridge.submitted == []
+
+    _run(run())
+
+
+# ============================================================
+# 斜杠命令
+# ============================================================
+
+def test_slash_command_does_not_call_llm() -> None:
+    bridge = FakeBridge()
+    app = _make_app(bridge)
+
+    async def run() -> None:
+        async with app.run_test(size=(100, 30)) as pilot:
+            inp = app.query_one(InputPanel)
+            inp.focus()
+            await pilot.press("/", "h", "e", "l", "p")
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            # 斜杠命令不应进入 run_turn（不进 LLM）
+            assert bridge.submitted == []
+            assert inp.text == ""
+
+    _run(run())
+
+
+# ============================================================
+# 历史输入
+# ============================================================
+
+def test_history_up_down_navigation() -> None:
+    bridge = FakeBridge()
+    bridge.add_history("first")
+    bridge.add_history("second")
+    app = _make_app(bridge)
+
+    async def run() -> None:
+        async with app.run_test(size=(100, 30)) as pilot:
+            inp = app.query_one(InputPanel)
+            inp.focus()
+            await pilot.press("up")
+            await pilot.pause(0.05)
+            assert inp.text == "second"
+            await pilot.press("up")
+            await pilot.pause(0.05)
+            assert inp.text == "first"
+            await pilot.press("down")
+            await pilot.pause(0.05)
+            assert inp.text == "second"
+
+    _run(run())
+
+
+# ============================================================
+# 模式循环
+# ============================================================
+
+def test_tab_cycles_mode() -> None:
+    bridge = FakeBridge()
+    app = _make_app(bridge)
+
+    async def run() -> None:
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.press("tab")
+            await pilot.pause(0.05)
+            assert bridge.get_mode() == "chat"
+            await pilot.press("tab")
+            await pilot.pause(0.05)
+            assert bridge.get_mode() == "code"
+
+    _run(run())
+
+
+# ============================================================
+# 事件渲染
+# ============================================================
+
+def test_render_user_and_assistant_events() -> None:
+    bridge = FakeBridge(events=[
+        {"kind": "user", "text": "hello"},
+        {"kind": "assistant", "text": "hi there"},
+        {"kind": "done"},
+    ])
+    app = _make_app(bridge)
+
+    async def run() -> None:
+        async with app.run_test(size=(100, 30)) as pilot:
+            inp = app.query_one(InputPanel)
+            inp.focus()
+            await pilot.press("h", "i")
+            await pilot.press("enter")
+            await pilot.pause(0.3)
+            chat = app.query_one(ChatPanel)
+            text = _log_text(chat)
+            assert "hello" in text
+            assert "hi there" in text
+
+    _run(run())
+
+
+def test_render_error_event_does_not_crash() -> None:
+    bridge = FakeBridge(events=[{"kind": "error", "text": "boom"}])
+    app = _make_app(bridge)
+
+    async def run() -> None:
+        async with app.run_test(size=(100, 30)) as pilot:
+            inp = app.query_one(InputPanel)
+            inp.focus()
+            await pilot.press("x")
+            await pilot.press("enter")
+            await pilot.pause(0.1)
+            chat = app.query_one(ChatPanel)
+            assert "boom" in _log_text(chat)
+
+    _run(run())
+
+
+# ============================================================
+# 状态栏
+# ============================================================
+
+def test_status_bar_shows_mode_and_workspace() -> None:
+    app = _make_app()
+
+    async def run() -> None:
+        async with app.run_test(size=(100, 30)) as pilot:
+            await pilot.pause(0.1)
+            sb = app.query_one(StatusBar)
+            rendered = str(sb.render())
+            assert "agent" in rendered
+            assert "workspace" in rendered
+
+    _run(run())

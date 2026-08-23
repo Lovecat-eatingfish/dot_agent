@@ -113,8 +113,8 @@ def deserialize_messages(serialized: list[dict[str, Any]]) -> list[Any]:
             kwargs["id"] = item["id"]
         try:
             result.append(cls(**kwargs))
-        except Exception:
-            # 兜底：损坏条目降级为 HumanMessage
+        except Exception as exc:
+            logger.warning("failed to deserialize message (type=%s), degraded: %s", msg_type, exc)
             result.append(HumanMessage(content=str(kwargs.get("content", ""))))
     return result
 
@@ -185,6 +185,7 @@ class SessionPersistence:
             "replan_count": 0,
             "attempt_count": 0,
             "awaiting_intervention": False,
+            "run_mode": "agent",
         }
 
     # ----------------------------------------------------------
@@ -272,6 +273,7 @@ class SessionPersistence:
         meta["replan_count"] = graph_state.get("replan_count", 0)
         meta["attempt_count"] = graph_state.get("attempt_count", 0)
         meta["awaiting_intervention"] = bool(graph_state.get("awaiting_intervention", False))
+        meta["run_mode"] = graph_state.get("run_mode", "agent")
         if workspace is not None:
             meta["workspace"] = str(workspace)
         meta["updated_at"] = utc_now()
@@ -323,7 +325,12 @@ def persist_turn(session: Any, turn_id: int) -> None:
         "replan_count": session.replan_count,
         "attempt_count": session.attempt_count,
         "awaiting_intervention": session.awaiting_intervention,
+        "run_mode": getattr(session, "run_mode", "agent"),
     }
+    # 持久化压缩状态
+    cs = getattr(session, "compression_state", None)
+    if cs is not None and hasattr(cs, "to_dict"):
+        meta["compression_state"] = cs.to_dict()
     persistence.save_session_meta(session_id, meta)
 
     # agent 专用 git commit（用户项目目录快照，rewind 恢复代码用）
@@ -355,7 +362,7 @@ def _read_created_at(persistence: SessionPersistence, session_id: str) -> str:
 
 def _session_to_state(session: Any) -> dict[str, Any]:
     """从 Session 对象提取 graph state dict（用于快照）"""
-    return {
+    state = {
         "task": session.task,
         "task_plan": session.task_plan,
         "replan_count": session.replan_count,
@@ -365,7 +372,13 @@ def _session_to_state(session: Any) -> dict[str, Any]:
         "resume_action": session.resume_action,
         "plan_invalid": session.plan_invalid,
         "awaiting_intervention": bool(getattr(session, "awaiting_intervention", False)),
+        "run_mode": getattr(session, "run_mode", "agent"),
     }
+    # 持久化压缩状态
+    cs = getattr(session, "compression_state", None)
+    if cs is not None and hasattr(cs, "to_dict"):
+        state["compression_state"] = cs.to_dict()
+    return state
 
 
 def _serialize_state(state: dict[str, Any]) -> dict[str, Any]:

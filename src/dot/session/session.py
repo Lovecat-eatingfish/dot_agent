@@ -16,6 +16,7 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage
 
+from ..compress.state import CompressionState
 from ..core.log import get_logger
 from ..core.tool_result_budget import ToolResultBudget
 
@@ -60,6 +61,10 @@ class Session:
     _is_running_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
+    # 取消令牌：CLI 层 Ctrl+C 设置，graph stream worker 在节点边界检查并提前结束
+    _cancel_event: threading.Event = field(
+        default_factory=threading.Event, repr=False, compare=False
+    )
     replan_max: int = REPLAN_THRESHOLD
     max_attempt: int = MAX_ATTEMPT_DEFAULT
     current_turn_id: int = 0
@@ -73,6 +78,8 @@ class Session:
 
     # --- per-session 运行时状态（原 RuntimeState，直接平铺到 Session）---
     agent_mode: str = "auto"
+    # CLI 运行模式：agent（完整）/ chat（纯对话）/ code（代码专注）
+    run_mode: str = "agent"
     # MCP 渐进披露：已按需加载的工具名 → StructuredTool
     loaded_mcp_tools: dict[str, Any] = field(default_factory=dict)
     # Skill 渐进披露：已加载的 skill 名集合 + 累计注入正文
@@ -94,6 +101,9 @@ class Session:
     _message_seq_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
+
+    # --- 上下文压缩状态（跨 turn 持久，不随 reset_per_turn 清除）---
+    compression_state: CompressionState = field(default_factory=CompressionState)
 
     def reset_per_turn(self) -> None:
         """每轮执行前重置 per-turn 字段（messages / 运行时状态保留）"""

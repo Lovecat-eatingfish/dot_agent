@@ -17,6 +17,7 @@ dot — 新一代 Coding Agent 核心模块（独立实现，不依赖 mokioclaw
 """
 from __future__ import annotations
 
+from .compress import CompressionState, context_compress_node
 from .core import (
     HookEvent,
     HookPayload,
@@ -37,6 +38,9 @@ from dot.host.agent_host import AgentHost
 from .trace import Tracer, get_tracer, init_tracer
 
 __all__ = [
+    # compress
+    "CompressionState",
+    "context_compress_node",
     # session
     "Session",
     "SessionManager",

@@ -14,7 +14,7 @@ AgentHost — Agent 统一入口（对齐 doc/fix.md）
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
 
 from dot.core.log import get_logger
 from dot.constant.session import session_dir
@@ -112,7 +112,7 @@ class AgentHost:
 
     def rewind_to_turn(self, target_turn: int, session_id: str | None = None) -> dict[str, Any]:
         """回滚到指定 turn（对话 + 用户代码）"""
-        return self.session_manager.rewind_to_turn(session_id, target_turn)
+        return self.session_manager.rewind_to_turn(target_turn, session_id)
 
     # ============================================================
     # 执行
@@ -147,3 +147,97 @@ class AgentHost:
     def has_pending_intervention(self, session_id: str | None = None) -> bool:
         """是否有未处理的人工介入（含跨进程恢复场景）"""
         return self.session_manager.has_pending_intervention(session_id)
+
+    # ============================================================
+    # CLI 桥接扩展（CLI ↔ Agent Graph 适配面，仅调度，不实现业务）
+    # ============================================================
+
+    def request_cancel(self, session_id: str | None = None) -> bool:
+        """中断当前 turn（Ctrl+C 入口），委托 SessionManager 取消令牌"""
+        return self.session_manager.request_cancel(session_id)
+
+    def set_run_mode(self, mode: str, session_id: str | None = None) -> None:
+        """设置 CLI 运行模式（agent/chat/code），写入 session.run_mode，下一轮热生效"""
+        session = self.session_manager.get_or_create(session_id)
+        if session is not None:
+            session.run_mode = mode
+
+    def get_run_mode(self, session_id: str | None = None) -> str:
+        """读取当前运行模式"""
+        try:
+            session = self.session_manager.get_session(session_id)
+            return getattr(session, "run_mode", "agent") if session is not None else "agent"
+        except RuntimeError:
+            return "agent"
+
+    def get_token_status(self, session_id: str | None = None) -> dict[str, Any]:
+        """读取当前 Token 水位与压缩统计（供 TUI 状态栏展示，只读）"""
+        session = self.session_manager.get_session(session_id)
+        if session is None:
+            return {}
+        try:
+            from ..compress.budget import ContextBudgetAllocator
+
+            budget = ContextBudgetAllocator()
+            current = budget.estimate_tokens(list(session.messages))
+            info = budget.get_budget_info()
+            cs = getattr(session, "compression_state", None)
+            return {
+                "current_tokens": current,
+                "context_window": budget.context_window,
+                "water_level": round(current / max(budget.context_window, 1) * 100, 1),
+                "compression_threshold": info["compression_threshold"],
+                "l1_threshold": info["l1_threshold"],
+                "l2_threshold": info["l2_threshold"],
+                "l3_threshold": info["l3_threshold"],
+                "total_compressions": getattr(cs, "total_compressions", 0) if cs else 0,
+                "total_tokens_saved": getattr(cs, "total_tokens_saved", 0) if cs else 0,
+                "message_count": len(session.messages),
+            }
+        except Exception as exc:
+            logger.debug("[AgentHost] get_token_status failed: %s", exc)
+            return {"message_count": len(session.messages) if session else 0}
+
+    def get_mcp_status(self) -> dict[str, Any]:
+        """读取 MCP 连接状态（供 TUI 状态栏 / /mcp list，只读）"""
+        host = self.shared.mcp_host
+        if host is None:
+            return {"online": False, "servers": [], "tools": []}
+        try:
+            tools = host.get_all_tool_names()
+            servers = []
+            mgr = getattr(self.shared, "mcp_manager", None)
+            if mgr is not None:
+                servers = mgr.list_servers()
+            return {"online": len(tools) > 0, "servers": servers, "tools": tools}
+        except Exception as exc:
+            logger.debug("[AgentHost] get_mcp_status failed: %s", exc)
+            return {"online": False, "servers": [], "tools": []}
+
+    def restart_mcp(self) -> dict[str, Any]:
+        """重启 MCP（/mcp restart）：断开重连 + 重新发现工具，不销毁当前会话"""
+        try:
+            self.shared.mcp_host.close()
+        except Exception as exc:
+            logger.debug("[AgentHost] restart_mcp close: %s", exc)
+        try:
+            self.shared.mcp_manager.load_config_and_connect(force=True)
+            self.shared.mcp_host.discover_tools()
+        except Exception as exc:
+            logger.warning("[AgentHost] restart_mcp reconnect failed: %s", exc)
+        return self.get_mcp_status()
+
+    def save_current_session(self, name: str | None = None) -> str:
+        """保存当前会话（/save）：触发一次 session.json 全量落盘"""
+        session = self.session_manager.get_session()
+        if session is None:
+            raise RuntimeError("No active session to save")
+        if session.persistence is not None:
+            from ..session.persistence import persist_turn
+
+            persist_turn(session, session.current_turn_id or 1)
+        return session.session_id
+
+    def load_session_by_name(self, name: str):
+        """加载历史会话（/load）"""
+        return self.session_manager.get_or_create(name)

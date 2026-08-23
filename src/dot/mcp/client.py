@@ -142,8 +142,8 @@ class SdkClient:
     async def _safe_disconnect(self) -> None:
         try:
             await self.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("safe disconnect failed: %s", exc)
 
     # ============================================================
     # 工具操作

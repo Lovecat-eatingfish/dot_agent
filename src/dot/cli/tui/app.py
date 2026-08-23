@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -79,7 +80,9 @@ class DotTUI(App):
         self.set_interval(2.0, self._refresh_status)
         # 启动欢迎
         chat = self.query_one(ChatPanel)
-        chat.add_system("dot agent ready · 输入消息开始，/help 查看命令", level="info")
+        chat.write(Text("  dot agent", style="bold #58A6FF"))
+        chat.write(Text("  输入消息开始对话，/help 查看命令", style="dim #6E7681"))
+        chat.write(Text(""))
 
     # ============================================================
     # 快捷键 actions

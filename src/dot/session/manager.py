@@ -14,8 +14,11 @@ SessionManager — 单会话管理器（dot 版，自定义机制，不依赖 la
 """
 from __future__ import annotations
 
+import queue
+import threading
+import traceback as _traceback
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 from langchain_core.messages import HumanMessage
 
@@ -41,6 +44,14 @@ from ..skills.manager import SkillsManager
 logger = get_logger(__name__)
 
 
+class _RemoteException:
+    """跨线程携带异常（worker 线程异常包装后塞进事件队列，主线程 re-raise）。"""
+
+    def __init__(self, exc: BaseException, tb_str: str) -> None:
+        self.exc = exc
+        self.tb_str = tb_str
+
+
 class SessionManager:
     """单会话管理器
 
@@ -50,11 +61,21 @@ class SessionManager:
         session = mgr.get_or_create()               # 最新 or 新建
     """
 
-    def __init__(self, sessions_root: Path | str | None = None, workspace: Path | None = None) -> None:
+    def __init__(
+            self,
+            sessions_root: Path | str | None = None,
+            workspace: Path | None = None,
+            *,
+            shared: Any = None,
+    ) -> None:
         self._sessions_root = Path(sessions_root) if sessions_root else Path(session_dir)
         self._default_workspace = workspace or Path.cwd()
         self._sessions_root.mkdir(parents=True, exist_ok=True)
-        self._session: Session | None = None
+        # 多会话：dict 索引 + 活跃会话指针（切换不关闭其他）
+        self._sessions: dict[str, Session] = {}
+        self._active_session_id: str | None = None
+        # 共享设施（来自 AgentHost.SharedServices）；为 None 时退化为每会话自建
+        self._shared = shared
 
     # ============================================================
     # Public API
@@ -62,68 +83,94 @@ class SessionManager:
 
     @property
     def session(self) -> Session | None:
-        return self._session
+        """当前活跃 Session（按 _active_session_id 从 dict 取）"""
+        if self._active_session_id and self._active_session_id in self._sessions:
+            return self._sessions[self._active_session_id]
+        return None
 
     @property
     def sessions_root(self) -> Path:
         return self._sessions_root
 
     def get_or_create(self, session_id: str | None = None) -> Session:
-        """获取或创建会话
+        """获取/加载/创建会话（不关闭其他会话）
 
         优先级：
-          1. 内存已有且 id 匹配（或未指定 id）→ 直接返回
-          2. 指定 session_id → 从磁盘加载
-          3. 未指定 id → 加载最新的磁盘 session
-          4. 都没有 → 创建全新 session
+          1. 指定 id 且在内存 dict 中 → 直接返回并设为活跃
+          2. 未指定 id 且已有活跃会话 → 返回活跃
+          3. 指定 id 但不在内存 → 从磁盘加载入 dict
+          4. 未指定 id 且无活跃 → 加载最新磁盘 / 新建
         """
-        if self._session is not None:
-            if session_id is None or session_id == "" or self._session.session_id == session_id:
-                logger.info("[SessionManager] returning existing session: %s", self._session.session_id)
-                return self._session
-            # 切换 session：关闭旧连接并清理注册
-            self._shutdown_session_runtime(self._session)
-            logger.info("[SessionManager] switching from %s to %s", self._session.session_id, session_id)
-            self._session = None
-
-        target_id = session_id or None
-        if target_id is None:
+        if session_id:
+            # 指定 id 且在内存 dict 中 → 直接返回并设为活跃
+            if session_id in self._sessions:
+                self._active_session_id = session_id
+                logger.info("[SessionManager] returning in-memory session: %s", session_id)
+                return self._sessions[session_id]
+            # 不在，可能就是 /new 创建了一个会话，需要后面创建一个session
+            target_id = session_id
+        else:
+            # 没有传递sessionId ，到那时内存中友
+            if self.session is not None:
+                return self.session
             latest = self._find_latest_session_dir()
             target_id = latest.name if latest is not None else self._make_timestamp_id()
             logger.info("[SessionManager] no session_id specified, using: %s", target_id)
 
         session = self._load_or_create_session(target_id)
-        self._session = session
+        self._sessions[session.session_id] = session
+        self._active_session_id = session.session_id
         logger.info("[SessionManager] session ready: %s  (turns=%d, msgs=%d, awaiting_intervention=%s)",
-                     session.session_id, session.current_turn_id, len(session.messages),
-                     session.awaiting_intervention)
+                    session.session_id, session.current_turn_id, len(session.messages),
+                    session.awaiting_intervention)
         return session
 
     def get_session(self, session_id: str | None = None) -> Session:
-        """获取会话（不创建新）"""
-        if self._session is not None:
-            if not session_id or self._session.session_id == session_id:
-                return self._session
-        if session_id:
-            session = self._load_or_create_session(session_id)
-            self._session = session
+        """获取会话（不创建新；指定 id 不在内存则从磁盘加载，不设为活跃）"""
+        if not session_id:
+            session = self.session
+            if session is None:
+                raise RuntimeError("No active session. Call get_or_create() first.")
             return session
-        raise RuntimeError("No active session. Call get_or_create() first.")
+        if session_id in self._sessions:
+            return self._sessions[session_id]
+        return self._load_or_create_session(session_id)
 
-    def destroy_session(self) -> None:
-        """清理内存并关闭 MCP 连接"""
-        if self._session is not None:
-            self._shutdown_session_runtime(self._session)
-        self._session = None
+    def new_session(self) -> Session:
+        """创建全新空会话，加入 dict 并设为活跃（/new 命令入口）"""
+        session_id = self._make_timestamp_id()
+        session = self._load_or_create_session(session_id)
+        self._sessions[session.session_id] = session
+        self._active_session_id = session.session_id
+        logger.info("[SessionManager] new session: %s", session.session_id)
+        return session
+
+    def switch_to(self, session_id: str) -> Session:
+        """切换活跃会话（不关闭其他；不在内存则从磁盘加载）"""
+        if session_id not in self._sessions:
+            session = self._load_or_create_session(session_id)
+            self._sessions[session_id] = session
+        self._active_session_id = session_id
+        return self._sessions[session_id]
+
+    def destroy_session(self, session_id: str | None = None) -> None:
+        """清理指定/活跃会话的注册项（共享设施不随会话关闭）"""
+        sid = session_id or self._active_session_id
+        if sid and sid in self._sessions:
+            self._shutdown_session_runtime(self._sessions[sid])
+            del self._sessions[sid]
+            if self._active_session_id == sid:
+                self._active_session_id = None
+
+    def destroy_all(self) -> None:
+        """清理全部会话的注册项"""
+        for session in list(self._sessions.values()):
+            self._shutdown_session_runtime(session)
+        self._sessions.clear()
+        self._active_session_id = None
 
     def _shutdown_session_runtime(self, session: Session) -> None:
-        """关闭 session 级运行时资源（MCP 连接）并清理注册表"""
-        mcp_host = getattr(session, "mcp_host", None)
-        if mcp_host is not None:
-            try:
-                mcp_host.close()
-            except Exception as exc:
-                logger.debug("mcp host close: %s", exc)
+        """清理 session 级注册项（共享设施不随会话关闭，归 SharedServices.close）"""
         runtime_registry.clear(session.session_id)
 
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -147,7 +194,11 @@ class SessionManager:
 
     def list_available_turns(self, session_id: str | None = None) -> list[int]:
         """列出会话的所有 turn"""
-        sid = session_id or (self._session.session_id if self._session else None)
+        if not session_id:
+            active = self.session
+            sid = active.session_id if active else None
+        else:
+            sid = session_id
         if sid is None:
             return []
         persistence = self._get_persistence(sid)
@@ -184,17 +235,18 @@ class SessionManager:
     # ============================================================
 
     def apply_runtime_config(
-        self,
-        session: Session,
-        *,
-        workspace: Path | None = None,
-        max_attempts: int = 3,
-        agent_mode: str = "auto",
+            self,
+            session: Session,
+            *,
+            workspace: Path | None = None,
+            max_attempts: int = 3,
+            agent_mode: str = "auto",
     ) -> None:
         """应用运行时配置（权限由 PermissionManager 按 agent_mode 统一裁决）"""
         user_workspace = (
             workspace if workspace is not None
-            else (session.workspace if str(session.workspace) and session.workspace.exists() else self._default_workspace)
+            else (
+                session.workspace if str(session.workspace) and session.workspace.exists() else self._default_workspace)
         )
         session.workspace = user_workspace
         session.max_attempt = max_attempts
@@ -209,152 +261,175 @@ class SessionManager:
     # ============================================================
 
     def stream_session_events(
-        self,
-        session_id: str | None = None,
-        user_input: str | None = None,
-        *,
-        workspace: Path | None = None,
-        max_attempts: int = 3,
-        agent_mode: str = "edit",
+            self,
+            session_id: str | None = None,
+            user_input: str | None = None,
+            *,
+            workspace: Path | None = None,
+            max_attempts: int = 3,
+            agent_mode: str = "edit",
     ) -> Iterator[dict[str, Any]]:
         """驱动一轮图执行，yield 事件流
 
         流程：
         1. get_or_create 获取 session
-        2. 应用运行时配置
-        3. 重置 per-turn 字段（先重置，再追加用户输入）
-        4. graph.stream({"session": session})（持久化在 finally 节点内）
+        2. 主线程 session-state setup（apply_runtime_config / reset_per_turn / 追加用户输入）
+        3. worker 线程跑 graph.stream（contextvar per-thread 隔离，trace 不串）
+        4. 事件经 queue 桥接到主线程 yield（持久化在 finally 节点内）
         """
         session = self.get_or_create(session_id)
-        if session.is_running:
+        if not session.acquire_run():
             raise RuntimeError(f"Session {session.session_id} is already running")
 
         logger.info("[stream] session=%s, user_input=%r, agent_mode=%s", session.session_id, user_input, agent_mode)
 
-        # 链路追踪：turn span 是 trace 起点（trace_id 由此生成并贯穿全程）
-        from ..trace import activate_span, deactivate_span, get_tracer, set_session_context
-
-        # 把sessionId 放入线程上下文，方便后续 trace 分析
-        set_session_context(session.session_id)
-        # 创建 turn span，作为 trace 起点（trace_id 由此生成并贯穿全程）
-        turn_span = get_tracer().start_span(
-            "session", "turn",
-            tags={"agent_mode": agent_mode, "workspace": str(session.workspace)},
-            input_summary=user_input or "",
-        )
-
-        # todo： 可以去掉
+        # 主线程 session-state setup（worker 起来前就绪）
         self.apply_runtime_config(
             session,
             workspace=workspace,
             max_attempts=max_attempts,
             agent_mode=agent_mode,
         )
-
-        # 先重置: 每一轮都需要重置的东西，再追加用户输入
         session.reset_per_turn()
-
         if user_input:
             session.messages.append(HumanMessage(content=user_input))
             session.task = user_input
             logger.info("[stream] appended user input, messages=%d", len(session.messages))
 
         config = {"recursion_limit": 60}
-
-        session.is_running = True
         logger.info("[stream] graph stream starting...")
-        turn_token = activate_span(turn_span)
-        try:
+
+        def _body(session: Session, span: Any, emit: Callable[[Any], None]) -> None:
             for chunk in session.compiled_graph.stream({"session": session}, config=config):
-                yield chunk
-            turn_span.set_output_summary(
+                emit(chunk)
+            span.set_output_summary(
                 f"turn={session.current_turn_id} msgs={len(session.messages)} "
                 f"passed={session.validate_result.get('passed')} awaiting={session.awaiting_intervention}"
             )
-        except BaseException as exc:
-            turn_span.finish(exc)
-            raise
-        else:
-            turn_span.finish()
-        finally:
-            deactivate_span(turn_token)
-            session.is_running = False
+
+        yield from self._run_turn_worker(
+            session,
+            span_name="turn",
+            span_tags={"agent_mode": agent_mode, "workspace": str(session.workspace)},
+            input_summary=user_input or "",
+            body=_body,
+        )
 
     def resume_session(
-        self,
-        resume_action: str,
-        *,
-        session_id: str | None = None,
-        agent_mode: str = "auto",
+            self,
+            resume_action: str,
+            *,
+            session_id: str | None = None,
+            agent_mode: str = "auto",
     ) -> Iterator[dict[str, Any]]:
         """人工介入后恢复（自定义机制，不依赖 langgraph Command）
 
         Args:
             resume_action:
               - "continue"：清零计数后重新进图（从 plan 重新规划）
-              - "stop"：清除介入标记，本轮结束（不进图）
+              - "stop"：清除介入标记，本轮结束（不进图，不 yield 事件）
         """
         session = self.get_or_create(session_id)
-        if session.is_running:
+        if not session.acquire_run():
             raise RuntimeError(f"Session {session.session_id} is already running")
         if not session.awaiting_intervention:
+            session.release_run()
             logger.warning("[resume] session %s has no pending intervention", session.session_id)
             return
 
-        # 链路追踪：resume 是一条新 trace
-        from ..trace import activate_span, deactivate_span, get_tracer, set_session_context
-
-        set_session_context(session.session_id)
-        span = get_tracer().start_span(
-            "session", "resume_turn",
-            tags={"resume_action": resume_action, "agent_mode": agent_mode},
-            input_summary=f"resume after intervention ({session.session_id})",
-        )
-
+        # 主线程 session-state setup
         session.awaiting_intervention = False
         session.resume_action = resume_action
 
-        span_token = activate_span(span)
-
-        if resume_action == "stop":
-            # 结束：更新 session.json 里的介入标记即可
-            self._persist_meta_only(session)
-            logger.info("[resume] intervention stopped, session=%s", session.session_id)
-            span.set_output_summary("intervention stopped")
-            span.finish()
-            deactivate_span(span_token)
-            return
-
-        # continue：计数清零，从 plan 重新规划
-        session.replan_count = 0
-        session.attempt_count = 0
-        session.plan_invalid = False
-        session.need_human_intervene = False
-        session.resume_action = ""
-
-        self.apply_runtime_config(
-            session,
-            agent_mode=agent_mode,
-        )
-
         config = {"recursion_limit": 60}
-        session.is_running = True
-        logger.info("[resume] re-entering graph from plan_node")
-        try:
+
+        def _body(session: Session, span: Any, emit: Callable[[Any], None]) -> None:
+            if resume_action == "stop":
+                # 结束：更新 session.json 里的介入标记即可（不进图、不 emit）
+                self._persist_meta_only(session)
+                logger.info("[resume] intervention stopped, session=%s", session.session_id)
+                span.set_output_summary("intervention stopped")
+                return
+
+            # continue：计数清零，从 plan 重新规划
+            session.replan_count = 0
+            session.attempt_count = 0
+            session.plan_invalid = False
+            session.need_human_intervene = False
+            session.resume_action = ""
+
+            self.apply_runtime_config(session, agent_mode=agent_mode)
+            logger.info("[resume] re-entering graph from plan_node")
             for chunk in session.compiled_graph.stream({"session": session}, config=config):
-                yield chunk
+                emit(chunk)
             span.set_output_summary(
                 f"turn={session.current_turn_id} msgs={len(session.messages)} "
                 f"passed={session.validate_result.get('passed')} awaiting={session.awaiting_intervention}"
             )
-        except BaseException as exc:
-            span.finish(exc)
-            raise
-        else:
-            span.finish()
-        finally:
-            deactivate_span(span_token)
-            session.is_running = False
+
+        yield from self._run_turn_worker(
+            session,
+            span_name="resume_turn",
+            span_tags={"resume_action": resume_action, "agent_mode": agent_mode},
+            input_summary=f"resume after intervention ({session.session_id})",
+            body=_body,
+        )
+
+    def _run_turn_worker(
+            self,
+            session: Session,
+            *,
+            span_name: str,
+            span_tags: dict[str, Any],
+            input_summary: str,
+            body: Callable[[Session, Any, Callable[[Any], None]], None],
+    ) -> Iterator[dict[str, Any]]:
+        """在独立工作线程跑 body，主线程从事件队列 yield。
+
+        contextvar per-thread 隔离（trace 不串，无需碰 _begin/压栈 bug 站点）。
+        调用方先 acquire_run，worker finally 里 release_run。body(session, span, emit)：
+        emit(chunk) 塞事件入队；body 抛异常被捕获，包装成 _RemoteException 跨线程抛回主线程。
+        """
+        from ..trace import (activate_span, deactivate_span, get_tracer,
+                             reset_session_context, set_session_context)
+
+        event_queue: queue.Queue = queue.Queue()
+        _SENTINEL = object()
+
+        def _worker() -> None:
+            ctx_token = set_session_context(session.session_id)
+            span = get_tracer().start_span(
+                "session", span_name, tags=span_tags, input_summary=input_summary,
+            )
+            span_token = activate_span(span)
+            try:
+                body(session, span, event_queue.put)
+                span.finish()
+            except BaseException as exc:
+                span.set_output_summary(f"{type(exc).__name__}: {exc}")
+                span.finish(exc)
+                event_queue.put(_RemoteException(exc, _traceback.format_exc()))
+            finally:
+                try:
+                    deactivate_span(span_token)
+                except Exception:
+                    pass
+                reset_session_context(ctx_token)
+                session.release_run()
+                event_queue.put(_SENTINEL)
+
+        thread = threading.Thread(
+            target=_worker, daemon=True, name=f"dot-turn-{session.session_id}"
+        )
+        thread.start()
+
+        while True:
+            item = event_queue.get()
+            if item is _SENTINEL:
+                break
+            if isinstance(item, _RemoteException):
+                raise item.exc from None
+            yield item
 
     def has_pending_intervention(self, session_id: str | None = None) -> bool:
         """检查 session 是否有未处理的人工介入（含跨进程：读 session.json）"""
@@ -388,27 +463,36 @@ class SessionManager:
 
         meta = {} if is_new else persistence.load_session_meta(session_id)
 
-        # MCP / Skills hosts
         workspace = Path(meta.get("workspace", "")) if meta.get("workspace") else self._default_workspace
         if not workspace.exists():
             workspace = self._default_workspace
 
         logger.info("[SessionManager] workspace=%s", workspace)
 
-        mcp_host = self._build_mcp_host(workspace)
-        skill_host = self._build_skill_host(workspace)
+        # 共享设施来自 AgentHost 的 SharedServices（单份，全会话复用）；
+        # 无 shared（独立构造 SessionManager 的场景）退化为每会话自建。
+        if self._shared is not None:
+            mcp_host = self._shared.mcp_host
+            skill_host = self._shared.skill_host
+            hook_runner = self._shared.hook_runner
+            compiled_graph = self._shared.compiled_graph
+            # skills 是工作区磁盘数据，建会话时刷新一次以反映当前状态
+            # （MCP 工具走共享 server 连接，不在此重扫，保持 eager-once）
+            try:
+                skill_host.discover_skills()
+            except Exception as exc:
+                logger.debug("skill re-discover skipped: %s", exc)
+        else:
+            mcp_host = self._build_mcp_host(workspace)
+            skill_host = self._build_skill_host(workspace)
+            hook_runner = HookRunner()
+            try:
+                load_hooks_into_runner(hook_runner, workspace)
+            except Exception as exc:
+                logger.debug("hook load skipped: %s", exc)
+            from ..graph.coding_graph import compile_graph
 
-        # HookRunner
-        hook_runner = HookRunner()
-        try:
-            load_hooks_into_runner(hook_runner, workspace)
-        except Exception as exc:
-            logger.debug("hook load skipped: %s", exc)
-
-        # 图（延迟 import 断开 session↔graph 循环；无 checkpointer）
-        from ..graph.coding_graph import compile_graph
-
-        compiled_graph = compile_graph()
+            compiled_graph = compile_graph()
 
         session = Session(
             session_id=session_id,
@@ -427,14 +511,10 @@ class SessionManager:
 
         runtime = self._ensure_runtime(session)
 
-        # 注册运行时对象（供后续扩展/恢复挂载）
+        # 仅注册 per-session 易变对象；共享设施（mcp/skill/hook/graph）在 SharedServices，不入注册表
         runtime_registry.register(
             session_id,
-            compiled_graph=compiled_graph,
             persistence=persistence,
-            mcp_host=mcp_host,
-            skill_host=skill_host,
-            hook_runner=hook_runner,
             runtime=runtime,
         )
 
@@ -471,6 +551,7 @@ class SessionManager:
             logger.debug("Skill host init skipped: %s", exc)
             return SkillHost(SkillsManager(workspace=workspace))
 
+    # todo 代码重复，需要优化
     def _ensure_runtime(self, session: Session) -> RuntimeState:
         if session.runtime is None:
             session.runtime = RuntimeState(
@@ -492,9 +573,9 @@ class SessionManager:
         return candidates[0] if candidates else None
 
     def _get_persistence(self, session_id: str) -> SessionPersistence:
-        if self._session is not None and self._session.session_id == session_id:
-            if self._session.persistence is not None:
-                return self._session.persistence
+        session = self._sessions.get(session_id)
+        if session is not None and session.persistence is not None:
+            return session.persistence
         return SessionPersistence(sessions_root=self._sessions_root)
 
     def _make_timestamp_id(self) -> str:

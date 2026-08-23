@@ -35,7 +35,7 @@ class MCPHost:
     维护 mcp_ 前缀映射表、工具 schema 内存缓存、已加载工具集合。
     """
 
-    def __init__(self, mcp_manager: Any) -> None:
+    def __init__(self,  mcp_manager: Any) -> None:
         """初始化 MCP Host
 
         Args:
@@ -48,9 +48,7 @@ class MCPHost:
         self._server_map: dict[str, str] = {}
         # mcp_prefixed_name → 完整 schema 缓存
         self._schema_cache: dict[str, dict[str, Any]] = {}
-        # 已加载到 LLM tools 列表中的 mcp_ 工具名集合
-        self._loaded_tools: set[str] = set()
-        # 工具目录纯文本（system prompt 注入用）
+        # 工具目录纯文本（基础目录，无 [已加载] 标记；system prompt 注入用）
         self._catalog_text: str = ""
         # 所有可用 mcp_ 工具名列表（按发现顺序）
         self._all_tool_names: list[str] = []
@@ -68,6 +66,7 @@ class MCPHost:
         self._server_map.clear()
         self._schema_cache.clear()
         self._all_tool_names.clear()
+        self._catalog_text = ""
 
         try:
             mcp_tools = self._mcp_manager.list_tools()
@@ -96,9 +95,6 @@ class MCPHost:
         self._rebuild_catalog()
         return list(self._all_tool_names)
 
-    def get_loaded_tools(self) -> list[str]:
-        """获取当前已加载的 mcp_ 工具名列表"""
-        return sorted(self._loaded_tools)
 
     def get_all_tool_names(self) -> list[str]:
         """获取所有可用 mcp_ 工具名列表"""
@@ -110,12 +106,19 @@ class MCPHost:
         if callable(shutdown):
             shutdown()
 
-    def get_catalog_text(self) -> str:
-        """获取工具目录纯文本（用于注入 system prompt）"""
-        return self._catalog_text
+    def get_catalog_text(self, loaded_names: set[str] | None = None) -> str:
+        """获取工具目录纯文本（用于注入 system prompt）
+
+        Args:
+            loaded_names: 已加载工具名集合；None=基础目录（无 [已加载] 标记），
+                传入则返回带 [已加载] 标记的 per-session 视图。
+        """
+        if loaded_names is None:
+            return self._catalog_text
+        return self._build_catalog_with_marks(loaded_names)
 
     def load_tool_schema(self, tool_name: str) -> dict[str, Any]:
-        """加载指定工具的完整 schema，标记为已加载
+        """返回指定工具的完整 schema（共享，不追踪 per-session 加载状态）
 
         Args:
             tool_name: 带 mcp_ 前缀的工具名
@@ -128,22 +131,21 @@ class MCPHost:
         """
         if tool_name not in self._schema_cache:
             raise ValueError(f"工具 {tool_name} 不存在，请查看 skill 目录")
-        self._loaded_tools.add(tool_name)
         return self._schema_cache[tool_name]
-
-    def is_tool_loaded(self, tool_name: str) -> bool:
-        """检查工具是否已加载"""
-        return tool_name in self._loaded_tools
 
     def resolve_original_name(self, prefixed_name: str) -> str:
         """把 mcp_ 前缀名还原为原始工具名"""
         return self._name_map.get(prefixed_name, prefixed_name)
 
-    def get_loaded_schemas(self) -> list[dict[str, Any]]:
-        """获取所有已加载工具的完整 schema 列表（供 LLM tools 数组使用）"""
+    def get_loaded_schemas(self, loaded_names: set[str]) -> list[dict[str, Any]]:
+        """获取指定已加载工具的完整 schema 列表（供 LLM tools 数组使用）
+
+        Args:
+            loaded_names: per-session 已加载工具名集合
+        """
         result = []
         for name in self._all_tool_names:
-            if name in self._loaded_tools:
+            if name in loaded_names:
                 schema = self._schema_cache.get(name, {})
                 if schema:
                     result.append(schema)
@@ -186,7 +188,14 @@ class MCPHost:
     # ----------------------------------------------------------
 
     def _rebuild_catalog(self) -> None:
-        """重建工具目录纯文本"""
+        """重建基础工具目录纯文本（无 [已加载] 标记，共享）"""
+        self._catalog_text = self._render_catalog(loaded_names=None)
+
+    def _build_catalog_with_marks(self, loaded_names: set[str]) -> str:
+        """生成带 [已加载] 标记的 per-session 目录视图"""
+        return self._render_catalog(loaded_names=loaded_names)
+
+    def _render_catalog(self, *, loaded_names: set[str] | None) -> str:
         lines = ["可用 MCP 外部工具目录：", ""]
         for name in self._all_tool_names:
             schema = self._schema_cache.get(name, {})
@@ -194,11 +203,11 @@ class MCPHost:
             # 截断过长描述
             if len(desc) > 80:
                 desc = desc[:77] + "..."
-            loaded_mark = " [已加载]" if name in self._loaded_tools else ""
+            loaded_mark = " [已加载]" if (loaded_names and name in loaded_names) else ""
             lines.append(f"- {name}: {desc}{loaded_mark}")
         lines.append("")
         lines.append(self.get_system_prompt_rules())
-        self._catalog_text = "\n".join(lines)
+        return "\n".join(lines)
 
     def _build_tool_schema(
         self, tool: Any, original_name: str, prefixed_name: str
@@ -296,7 +305,7 @@ class MCPToolExecutor:
             tools.append({
                 "name": name,
                 "description": schema.get("description", "无描述"),
-                "loaded": name in self._host._loaded_tools,
+                "loaded": False,  # host 不再追踪 per-session loaded（此方法已废弃）
             })
         return {"ok": True, "tools": tools}
 

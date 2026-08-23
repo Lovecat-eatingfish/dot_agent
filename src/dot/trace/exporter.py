@@ -40,11 +40,21 @@ class LocalFileTraceExporter:
         """对外上报接口（非阻塞）"""
         self._queue.put(span)
 
-    def flush(self, timeout: float = 2.0) -> None:
-        """等待队列排空（测试 / 优雅退出用）"""
-        deadline = time.monotonic() + timeout
-        while not self._queue.empty() and time.monotonic() < deadline:
-            time.sleep(0.01)
+    # flush 栅栏：插入后等 daemon 处理到它（FIFO 保证栅栏前所有 span 已落盘）
+    _FLUSH_SENTINEL = object()
+
+    def flush(self, timeout: float = 5.0) -> None:
+        """等待所有已入队 span 落盘（测试 / 优雅退出用）
+
+        旧实现只查 queue.empty()，daemon 可能已 dequeue 但尚未写盘就返回，
+        导致紧时序下读不到刚 finish 的 span。改用栅栏：FIFO 保证栅栏前的
+        span 全部写完后 daemon 才处理栅栏、set 事件。
+        """
+        if not self._worker.is_alive():
+            return
+        done = threading.Event()
+        self._queue.put((self._FLUSH_SENTINEL, done))
+        done.wait(timeout=timeout)
 
     # ----------------------------------------------------------
     # Internal
@@ -52,8 +62,12 @@ class LocalFileTraceExporter:
 
     def _write_loop(self) -> None:
         while True:
-            span = self._queue.get()
+            item = self._queue.get()
             try:
+                if isinstance(item, tuple) and item and item[0] is self._FLUSH_SENTINEL:
+                    item[1].set()  # 通知 flush：栅栏前的 span 已全部写完
+                    continue
+                span = item
                 session_id = (span.get("tags") or {}).get("session_id") or "default"
                 date_str = time.strftime("%Y-%m-%d")
                 file_path = self.trace_dir / date_str / f"trace_{_safe_name(str(session_id))}.jsonl"

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -176,6 +177,8 @@ class PermissionManager:
         self._project = ProjectSecurityConfig()
         self._workspace: Optional[Path] = None
         self._approval_handler: Optional[Callable[[dict[str, Any]], bool]] = None
+        # ASK 审批串行锁（并发多会话时一次只处理一个审批，避免 input() 交错）
+        self._ask_lock = threading.Lock()
 
     # ============================================================
     # 初始化
@@ -291,7 +294,11 @@ class PermissionManager:
 
     def ask_user(self, tool_name: str, args: dict[str, Any], decision: PermissionDecision,
                  *, agent_mode: str = "") -> bool:
-        """发起人工审批；返回 True=确认（单次生效）"""
+        """发起人工审批；返回 True=确认（单次生效）。
+
+        全局串行：并发多会话同时 ASK 时一次只处理一个（CLI 单 stdin / 单用户），
+        避免提示交错。持锁者等用户输入（不等 waiter 资源，无死锁）。
+        """
         info = {
             "tool_name": tool_name,
             "agent_mode": agent_mode,
@@ -299,18 +306,19 @@ class PermissionManager:
             "reason": decision.reason,
             "args": dict(args),
         }
-        handler = self._approval_handler
-        if handler is None:
-            logger.info("[permission] ASK 无审批入口（无头环境），自动拦截: %s %s", tool_name, decision.reason)
-            return False
-        try:
-            return bool(handler(info))
-        except (EOFError, KeyboardInterrupt):
-            logger.info("[permission] 审批输入不可用，自动拦截: %s", tool_name)
-            return False
-        except Exception as exc:
-            logger.warning("[permission] 审批回调异常，自动拦截: %s", exc)
-            return False
+        with self._ask_lock:
+            handler = self._approval_handler
+            if handler is None:
+                logger.info("[permission] ASK 无审批入口（无头环境），自动拦截: %s %s", tool_name, decision.reason)
+                return False
+            try:
+                return bool(handler(info))
+            except (EOFError, KeyboardInterrupt):
+                logger.info("[permission] 审批输入不可用，自动拦截: %s", tool_name)
+                return False
+            except Exception as exc:
+                logger.warning("[permission] 审批回调异常，自动拦截: %s", exc)
+                return False
 
     # ============================================================
     # Internal

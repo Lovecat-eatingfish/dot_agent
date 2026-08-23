@@ -87,8 +87,8 @@ class AsyncMCPBridge:
                 old = self._clients.pop(name)
                 try:
                     self._submit(old.disconnect())
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.error("MCP server '%s' disconnect failed， error： %s", name, exc)
 
             # 推断传输类型
             if transport_type is None:

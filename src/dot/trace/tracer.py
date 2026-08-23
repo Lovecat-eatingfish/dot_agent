@@ -49,9 +49,18 @@ _current_span: ContextVar[Optional["Span"]] = ContextVar("dot_current_span", def
 _current_session_id: ContextVar[str] = ContextVar("dot_session_id", default="default")
 
 
-def set_session_context(session_id: str) -> None:
-    """设置当前 session 上下文（每轮 turn 开始时调用）"""
-    _current_session_id.set(session_id or "default")
+def set_session_context(session_id: str):
+    """设置当前 session 上下文（每轮 turn 开始时调用）
+
+    返回 token，配合 reset_session_context(token) 在 turn 结束时恢复，
+    避免线程池复用线程 / 并发场景下 session_id 泄漏到后续 turn。
+    """
+    return _current_session_id.set(session_id or "default")
+
+
+def reset_session_context(token) -> None:
+    """退出 session 上下文（与 set_session_context 配对，恢复压栈前的值）"""
+    _current_session_id.reset(token)
 
 
 def activate_span(span: "Span"):

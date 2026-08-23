@@ -18,6 +18,7 @@ from .tracer import (
     deactivate_span,
     get_tracer,
     init_tracer,
+    reset_session_context,
     reset_tracer,
     set_session_context,
 )
@@ -31,6 +32,7 @@ __all__ = [
     "init_tracer",
     "reset_tracer",
     "set_session_context",
+    "reset_session_context",
     "activate_span",
     "deactivate_span",
 ]

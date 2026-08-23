@@ -34,12 +34,8 @@ class SkillHost:
         self._skills_manager = skills_manager
         # skill_name → Skill 对象（含 full_content）
         self._skill_cache: dict[str, Any] = {}
-        # 已加载到上下文的 skill_name 集合
-        self._loaded_skills: set[str] = set()
-        # 目录纯文本（system prompt 注入用）
+        # 基础目录纯文本（无 [已加载] 标记；system prompt 注入用）
         self._catalog_text: str = ""
-        # 当前 system prompt 附加内容（已加载 skill 的 full_content 拼接）
-        self._active_content: str = ""
 
     def discover_skills(self) -> list[str]:
         """发现并缓存全部 Skill
@@ -48,8 +44,6 @@ class SkillHost:
             skill_name 列表
         """
         self._skill_cache.clear()
-        self._loaded_skills.clear()
-        self._active_content = ""
 
         # 从 SkillsManager 获取全部 Skills
         try:
@@ -66,21 +60,20 @@ class SkillHost:
         self._rebuild_catalog()
         return list(self._skill_cache.keys())
 
-    def get_loaded_skills(self) -> list[str]:
-        """获取已加载的 skill 名称列表"""
-        return sorted(self._loaded_skills)
-
     def get_all_skill_names(self) -> list[str]:
         """获取所有可用 skill 名称列表（带 skill_ 前缀，对齐 fix.md 命名约定）"""
         return sorted(f"skill_{name}" for name in self._skill_cache.keys())
 
-    def get_catalog_text(self) -> str:
-        """获取 Skill 目录纯文本（注入 system prompt）"""
-        return self._catalog_text
+    def get_catalog_text(self, loaded_names: set[str] | None = None) -> str:
+        """获取 Skill 目录纯文本（注入 system prompt）
 
-    def get_active_content(self) -> str:
-        """获取已加载 Skill 的完整内容拼接（追加到 system prompt）"""
-        return self._active_content
+        Args:
+            loaded_names: 已加载 skill 名集合；None=基础目录（无 [已加载] 标记），
+                传入则返回带 [已加载] 标记的 per-session 视图。
+        """
+        if loaded_names is None:
+            return self._catalog_text
+        return self._build_catalog_with_marks(loaded_names)
 
     def invoke_skill(self, skill_name: str) -> dict[str, Any]:
         """加载指定 Skill 完整内容，追加到系统上下文
@@ -114,9 +107,7 @@ class SkillHost:
             except Exception:
                 full_content = f"# {skill.name}\n{skill.description}"
 
-        self._loaded_skills.add(key)
-        self._active_content += f"\n\n--- Skill: {key} ---\n{full_content}\n--- End of {key} ---\n"
-
+        # per-session 的 loaded/active 状态由调用方写入 RuntimeState（host 仅返回数据）
         return {
             "ok": True,
             "skill_name": key,
@@ -163,15 +154,22 @@ Skill 是预定义的指令模板，统一以 skill_ 前缀命名，完整内容
     # ----------------------------------------------------------
 
     def _rebuild_catalog(self) -> None:
-        """重建 Skill 目录纯文本"""
+        """重建基础 Skill 目录纯文本（无 [已加载] 标记，共享）"""
+        self._catalog_text = self._render_catalog(loaded_names=None)
+
+    def _build_catalog_with_marks(self, loaded_names: set[str]) -> str:
+        """生成带 [已加载] 标记的 per-session 目录视图"""
+        return self._render_catalog(loaded_names=loaded_names)
+
+    def _render_catalog(self, *, loaded_names: set[str] | None) -> str:
         lines = ["可用 Skills 目录：", ""]
         for name in sorted(self._skill_cache.keys()):
             skill = self._skill_cache[name]
             desc = getattr(skill, "description", "") or "无描述"
             if len(desc) > 80:
                 desc = desc[:77] + "..."
-            loaded_mark = " [已加载]" if name in self._loaded_skills else ""
+            loaded_mark = " [已加载]" if (loaded_names and name in loaded_names) else ""
             lines.append(f"- skill_{name}: {desc}{loaded_mark}")
         lines.append("")
         lines.append(self.get_system_prompt_rules())
-        self._catalog_text = "\n".join(lines)
+        return "\n".join(lines)

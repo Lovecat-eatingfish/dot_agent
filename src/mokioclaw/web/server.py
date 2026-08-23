@@ -142,8 +142,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-logger = app.logger  # type: ignore[attr-defined]
-
 
 # ---------------------------------------------------------------------------
 # Helpers

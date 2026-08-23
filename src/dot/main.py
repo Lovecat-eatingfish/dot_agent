@@ -98,6 +98,21 @@ def _run_interactive(host: AgentHost) -> None:
         if user_input.startswith("/resume"):
             _resume_session(host, user_input)
             continue
+        if user_input == "/new":
+            session = host.new_session()
+            print(f"[dot] new session: {session.session_id}")
+            continue
+        if user_input.startswith("/switch"):
+            sid = user_input[len("/switch"):].strip()
+            if not sid:
+                print("[dot] usage: /switch <session_id>")
+                continue
+            try:
+                session = host.switch_session(sid)
+                print(f"[dot] switched to: {session.session_id}")
+            except Exception as exc:
+                print(f"[dot] switch failed: {exc}")
+            continue
         if user_input == "/turns":
             session = host.get_or_create_session()
             available = host.list_available_turns(session.session_id)

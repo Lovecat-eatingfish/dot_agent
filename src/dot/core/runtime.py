@@ -52,10 +52,6 @@ class RuntimeState:
     # 已读取文件的快照表，key 是文件绝对路径
     read_files: dict[Path, FileSnapshot] = field(default_factory=dict)
 
-    # （已废弃）审批统一由 core.permission.PermissionManager 管理；
-    # 字段保留仅为兼容旧引用，不再参与权限决策
-    approval_mode: str = "inline"
-
     # Agent 运行模式：auto / plan / approve / edit
     agent_mode: str = "auto"
 
@@ -70,11 +66,15 @@ class RuntimeState:
     message_seq: int = 0
     _message_seq_lock: threading.Lock = field(default_factory=threading.Lock, repr=False, compare=False)
 
-    # MCP 渐进披露：已按需加载的工具名 → StructuredTool
+    # MCP 渐进披露：已按需加载的工具名 → StructuredTool（per-session）
     loaded_mcp_tools: dict[str, Any] = field(default_factory=dict)
 
     # ToolSearch 延迟加载：已加载的延迟工具
     loaded_tools: dict[str, Any] = field(default_factory=dict)
+
+    # Skill 渐进披露：已加载的 skill 名集合 + 累计注入正文（per-session）
+    loaded_skills: set[str] = field(default_factory=set)
+    active_skill_content: str = ""
 
     # BashTool 可变更的工作目录（相对/绝对，须在 workspace 内）
     cwd: Path | None = None
@@ -102,6 +102,11 @@ class RuntimeState:
 
     # 工具输出预算，大输出自动落盘
     result_budget: ToolResultBudget = field(default_factory=ToolResultBudget)
+
+    # （已废弃）审批统一由 core.permission.PermissionManager 管理；
+    # 字段保留仅为兼容旧引用，不再参与权限决策
+    approval_mode: str = "inline"
+
 
     def __post_init__(self) -> None:
         self.agent_mode = normalize_agent_mode(self.agent_mode)

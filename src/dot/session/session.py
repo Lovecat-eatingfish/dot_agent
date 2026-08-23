@@ -8,6 +8,7 @@ Session 数据结构 — State IS Session
 """
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -35,13 +36,14 @@ class Session:
     节点通过 state["session"] 拿到同一个 Session 对象直接读写。
     """
 
+    # 绘会话内对象
     session_id: str
-    compiled_graph: Any = None  # CompiledGraph — 图只编译一次
     # --- 跨 turn 持久字段 ---
     messages: list[BaseMessage] = field(default_factory=list)
 
     # --- 每 turn 重置字段（执行前清空，节点写入）---
     task: str = ""
+    is_running: bool = False
     task_plan: dict = field(default_factory=dict)
     replan_count: int = 0
     attempt_count: int = 0
@@ -54,12 +56,18 @@ class Session:
     # 控制台据此提示 continue/stop；reset_per_turn 与 resume 时清除
     awaiting_intervention: bool = False
 
+
     # --- 会话级不变字段 ---
     workspace: Path = field(default_factory=Path.cwd)
-    is_running: bool = False
+    # 原子守卫 acquire_run/release_run（保证「每会话一次一个 turn」，并发是跨会话）
+    _is_running_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
     replan_max: int = REPLAN_THRESHOLD
     max_attempt: int = MAX_ATTEMPT_DEFAULT
     current_turn_id: int = 0
+    compiled_graph: Any = None  # CompiledGraph — 图只编译一次
+
 
     # --- 注入的管理器（会话级，持久化时排除，恢复时重新挂载）---
     persistence: Any = None  # SessionPersistence
@@ -73,6 +81,7 @@ class Session:
         """每轮执行前重置 per-turn 字段（messages 保留）"""
         logger.debug("[Session] reset_per_turn: session=%s", self.session_id)
         self.task = ""
+        self.is_running = False
         self.task_plan = {}
         self.replan_count = 0
         self.attempt_count = 0
@@ -81,3 +90,25 @@ class Session:
         self.resume_action = ""
         self.plan_invalid = False
         self.awaiting_intervention = False
+
+    # ----------------------------------------------------------
+    # 并发守卫（每会话一次一个 turn）
+    # ----------------------------------------------------------
+
+    def acquire_run(self) -> bool:
+        """原子地检查并占用 turn 执行权。
+
+        Returns:
+            True=占用成功（之前 is_running=False，现已置 True）；
+            False=已有 turn 在跑。
+        """
+        with self._is_running_lock:
+            if self.is_running:
+                return False
+            self.is_running = True
+            return True
+
+    def release_run(self) -> None:
+        """释放 turn 执行权（幂等）。"""
+        with self._is_running_lock:
+            self.is_running = False

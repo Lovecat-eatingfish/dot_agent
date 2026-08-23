@@ -21,13 +21,15 @@ MCP Host 渐进披露（Tool-Search 模式）
 """
 from __future__ import annotations
 
-import re
 from typing import Any, Optional
 
+from dot.core import get_logger
 
 # ============================================================
 # MCP Host
 # ============================================================
+logger = get_logger(__name__)
+
 
 class MCPHost:
     """MCP 工具渐进披露 Host
@@ -46,45 +48,87 @@ class MCPHost:
         self._name_map: dict[str, str] = {}
         # mcp_prefixed_name → 完整 schema 缓存
         self._schema_cache: dict[str, dict[str, Any]] = {}
+        # 所有可用 mcp_ 工具名列表（按发现顺序）
+        self._all_tool_names: list[str] = []
+        self._server_map: dict[str, str] = {}
         # 已加载到 LLM tools 列表中的 mcp_ 工具名集合
         self._loaded_tools: set[str] = set()
         # 工具目录纯文本（system prompt 注入用）
         self._catalog_text: str = ""
-        # 所有可用 mcp_ 工具名列表（按发现顺序）
-        self._all_tool_names: list[str] = []
 
-    def discover_tools(self) -> list[str]:
-        """发现所有 MCP 工具，建立前缀映射和 schema 缓存
+    #
+    # def discover_tools(self) -> list[str]:
+    #     """发现所有 MCP 工具，建立前缀映射和 schema 缓存
+    #
+    #     Returns:
+    #         带 mcp_ 前缀的工具名列表
+    #     """
+    #     self._name_map.clear()
+    #     self._schema_cache.clear()
+    #     self._all_tool_names.clear()
+    #
+    #     try:
+    #         mcp_tools = self._mcp_manager.list_tools()
+    #     except Exception:
+    #         mcp_tools = []
+    #
+    #     for tool in mcp_tools:
+    #         original_name = getattr(tool, "name", "") or ""
+    #         if not original_name:
+    #             continue
+    #         # 避免双重前缀
+    #         if original_name.startswith("mcp_"):
+    #             prefixed = original_name
+    #         else:
+    #             prefixed = f"mcp_{original_name}"
+    #         self._name_map[prefixed] = original_name
+    #         # 缓存完整 schema
+    #         schema = self._build_tool_schema(tool, original_name, prefixed)
+    #         self._schema_cache[prefixed] = schema
+    #         self._all_tool_names.append(prefixed)
+    #
+    #     self._rebuild_catalog()
+    #     return list(self._all_tool_names)
 
-        Returns:
-            带 mcp_ 前缀的工具名列表
-        """
-        self._name_map.clear()
-        self._schema_cache.clear()
-        self._all_tool_names.clear()
 
-        try:
-            mcp_tools = self._mcp_manager.list_tools()
-        except Exception:
-            mcp_tools = []
+def discover_tools(self) -> list[str]:
+    """发现所有 MCP 工具，建立前缀映射和 schema 缓存
+    每次调用都会重置全部映射、缓存，重新从mcp_manager拉取工具列表
+    """
+    # ✅全部重置逻辑写在 discover_tools 内部
+    self._name_map.clear()
+    self._server_map.clear()
+    self._schema_cache.clear()
+    self._all_tool_names.clear()
+    self._loaded_tools.clear()  # 重新扫描工具时，清空已加载状态
+    self._catalog_text = ""
 
-        for tool in mcp_tools:
-            original_name = getattr(tool, "name", "") or ""
-            if not original_name:
-                continue
-            # 避免双重前缀
-            if original_name.startswith("mcp_"):
-                prefixed = original_name
-            else:
-                prefixed = f"mcp_{original_name}"
-            self._name_map[prefixed] = original_name
-            # 缓存完整 schema
-            schema = self._build_tool_schema(tool, original_name, prefixed)
-            self._schema_cache[prefixed] = schema
-            self._all_tool_names.append(prefixed)
+    try:
+        mcp_tools = self._mcp_manager.list_tools()
+    except Exception as e:
+        logger.warning("discover mcp tools failed", exc_info=True)
+        mcp_tools = []
 
-        self._rebuild_catalog()
-        return list(self._all_tool_names)
+    for tool in mcp_tools:
+        original_name = getattr(tool, "name", "") or ""
+        server_name = getattr(tool, "server_name", "") or ""
+        if not original_name or not server_name:
+            continue
+
+        if original_name.startswith("mcp_"):
+            prefixed = original_name
+        else:
+            prefixed = f"mcp_{server_name}_{original_name}"
+
+        self._name_map[prefixed] = original_name
+        self._server_map[prefixed] = server_name
+
+        schema = self._build_tool_schema(tool, original_name, prefixed)
+        self._schema_cache[prefixed] = schema
+        self._all_tool_names.append(prefixed)
+
+    self._rebuild_catalog()
+    return list(self._all_tool_names)
 
     def get_loaded_tools(self) -> list[str]:
         """获取当前已加载的 mcp_ 工具名列表"""
@@ -197,7 +241,7 @@ class MCPHost:
         self._catalog_text = "\n".join(lines)
 
     def _build_tool_schema(
-        self, tool: Any, original_name: str, prefixed_name: str
+            self, tool: Any, original_name: str, prefixed_name: str
     ) -> dict[str, Any]:
         """从 MCPTool 构建标准工具 schema"""
         desc = getattr(tool, "description", "") or ""

@@ -11,29 +11,35 @@ SessionManager 初始化 session 时把它们挂进注册表，
 """
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 _REGISTRY: dict[str, dict[str, Any]] = {}
+_REGISTRY_LOCK = threading.Lock()
 
 
 def register(session_id: str, **objects: Any) -> None:
     """注册（合并）session 的运行时对象"""
-    _REGISTRY.setdefault(session_id, {}).update(objects)
+    with _REGISTRY_LOCK:
+        _REGISTRY.setdefault(session_id, {}).update(objects)
 
 
 def get(session_id: str) -> dict[str, Any]:
     """获取 session 注册的全部运行时对象"""
-    return dict(_REGISTRY.get(session_id, {}))
+    with _REGISTRY_LOCK:
+        return dict(_REGISTRY.get(session_id, {}))
 
 
 def clear(session_id: str) -> None:
     """清除 session 的注册项"""
-    _REGISTRY.pop(session_id, None)
+    with _REGISTRY_LOCK:
+        _REGISTRY.pop(session_id, None)
 
 
 def attach(session: Any) -> None:
     """把注册表里的运行时对象挂到 Session 上（已挂载的不覆盖）"""
-    objects = _REGISTRY.get(session.session_id)
+    with _REGISTRY_LOCK:
+        objects = _REGISTRY.get(session.session_id)
     if not objects:
         return
     for key, value in objects.items():

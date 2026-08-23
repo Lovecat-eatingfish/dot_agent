@@ -224,10 +224,14 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
     if static_context:
         logger.info("[node:coding_agent] loaded static_context (%d chars)", len(static_context))
 
-    # 动态上下文：MCP / Skills 目录（从 session 的 host 读取）
-    mcp_catalog = _safe_host_call(session.mcp_host, "get_catalog_text", "")
+    # 动态上下文：MCP / Skills 目录（共享 host 基础目录 + per-session loaded 视图）
+    mcp_loaded = set(runtime.loaded_mcp_tools) if runtime is not None else set()
+    skill_loaded = set(runtime.loaded_skills) if runtime is not None else set()
+
+    mcp_catalog = _safe_host_call(session.mcp_host, "get_catalog_text", "", mcp_loaded)
     mcp_rules = _safe_host_call(session.mcp_host, "get_system_prompt_rules", "")
-    skills_catalog = _safe_host_call(session.skill_host, "get_catalog_text", "")
+
+    skills_catalog = _safe_host_call(session.skill_host, "get_catalog_text", "", skill_loaded)
     skills_rules = _safe_host_call(session.skill_host, "get_system_prompt_rules", "")
     if mcp_catalog:
         logger.info("[node:coding_agent] mcp_catalog (%d tools)", len(mcp_catalog.split("\n")))
@@ -252,12 +256,13 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
     while loop_count < CODING_MAX_LOOPS:
         loop_count += 1
 
-        # Skill 内容可能在本轮中被 invoke_skill 加载 → 每轮重建 system prompt
-        skill_content = _safe_host_call(session.skill_host, "get_active_content", "")
+        # Skill 内容可能在本轮中被 invoke_skill 加载 → 每轮重建 system prompt（per-session 累积）
+        skill_content = runtime.active_skill_content if runtime is not None else ""
         system_prompt = base_system_prompt + (f"\n\n{skill_content}" if skill_content else "")
         agent_messages: list[Any] = [SystemMessage(content=system_prompt), *session.messages]
 
-        logger.info("[node:coding_agent] loop=%d/%d, messages_in_context=%d", loop_count, CODING_MAX_LOOPS, len(agent_messages))
+        logger.info("[node:coding_agent] loop=%d/%d, messages_in_context=%d", loop_count, CODING_MAX_LOOPS,
+                    len(agent_messages))
 
         try:
             response = _invoke_llm(agent_messages, node="coding_agent", tools=tools)
@@ -297,7 +302,8 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
     )
 
     if not plan_reasonable:
-        logger.warning("[node:coding_agent] plan INVALID: %s  (replan=%d/%d)", plan_issue, session.replan_count, session.replan_max)
+        logger.warning("[node:coding_agent] plan INVALID: %s  (replan=%d/%d)", plan_issue, session.replan_count,
+                       session.replan_max)
         session.messages.append(AIMessage(content=f"[Plan Issue] {plan_issue}"))
         if session.replan_count < session.replan_max:
             session.replan_count += 1
@@ -567,13 +573,13 @@ def compile_graph():
 # ============================================================
 
 def _run_tool_call(
-    session: Session,
-    runtime: Any,
-    tools: list[Any],
-    call: dict[str, Any],
-    writer: Any,
-    *,
-    prefix: str,
+        session: Session,
+        runtime: Any,
+        tools: list[Any],
+        call: dict[str, Any],
+        writer: Any,
+        *,
+        prefix: str,
 ) -> ToolMessage | None:
     """执行单个工具调用（对齐 fix.md / fix-权限控制.md）：
     0. 权限校验（最前）：三级拦截（系统黑名单→项目黑名单→模式规则）
@@ -612,7 +618,8 @@ def _run_tool_call(
             tool_name, args, agent_mode=agent_mode, workspace=session.workspace, approved=True,
         )
         if decision.decision is Decision.DENY:
-            writer({"type": "permission_denied", "name": tool_name, "source": decision.source, "reason": decision.reason})
+            writer(
+                {"type": "permission_denied", "name": tool_name, "source": decision.source, "reason": decision.reason})
             return ToolMessage(
                 content=decision.deny_message(),
                 tool_call_id=call.get("id", f"{prefix}-{tool_name}"),
@@ -658,11 +665,11 @@ def _run_tool_call(
 
 
 def _check_hook(
-    hook_runner: HookRunner,
-    session_id: str,
-    workspace: Any,
-    tool_name: str,
-    tool_args: dict[str, Any],
+        hook_runner: HookRunner,
+        session_id: str,
+        workspace: Any,
+        tool_name: str,
+        tool_args: dict[str, Any],
 ) -> HookResult:
     try:
         return hook_runner.run(
@@ -680,24 +687,101 @@ def _check_hook(
         return HookResult()
 
 
+#
+# def _evaluate_plan_quality(
+#     *,
+#     plan_description: str,
+#     subtasks: list[dict],
+#     tool_call_count: int,
+#     loop_count: int,
+#     summary: str,
+# ) -> tuple[bool, str]:
+#     """启发式 plan 质量评估（空 plan / 无产出 / 循环耗尽视为无效）"""
+#     if not plan_description and not subtasks:
+#         return False, "Plan is empty — no description or subtasks provided."
+#     if not subtasks:
+#         return False, "Plan has no subtasks — nothing to execute."
+#     if loop_count >= CODING_MAX_LOOPS and tool_call_count == 0:
+#         return False, "Agent exhausted all loops without making any tool calls."
+#     if not summary or summary == "(no result)":
+#         return False, "Agent produced no output after execution."
+#     return True, ""
+
+import json
+from typing import Any, Tuple
+
+
 def _evaluate_plan_quality(
-    *,
-    plan_description: str,
-    subtasks: list[dict],
-    tool_call_count: int,
-    loop_count: int,
-    summary: str,
-) -> tuple[bool, str]:
-    """启发式 plan 质量评估（空 plan / 无产出 / 循环耗尽视为无效）"""
+        *,
+        plan_description: str,
+        subtasks: list[dict],
+        tool_call_count: int,
+        loop_count: int,
+        summary: str,
+) -> Tuple[bool, str]:
+    """
+    LLM驱动评估计划执行质量。
+    兜底：完全空计划直接判定无效；其余交给LLM判断是否需要重规划。
+    返回 (is_reasonable: bool, issue: str)
+    """
+    # 兜底：完全空计划，不走LLM，节省token
     if not plan_description and not subtasks:
         return False, "Plan is empty — no description or subtasks provided."
-    if not subtasks:
-        return False, "Plan has no subtasks — nothing to execute."
-    if loop_count >= CODING_MAX_LOOPS and tool_call_count == 0:
-        return False, "Agent exhausted all loops without making any tool calls."
-    if not summary or summary == "(no result)":
-        return False, "Agent produced no output after execution."
-    return True, ""
+
+    eval_system = """
+You are a plan‑execution evaluator.
+Given original plan, execution statistics and agent output, judge whether the task execution is reasonable and finished.
+
+Rules:
+1. Return ONLY JSON object, no markdown, no extra text.
+2. Output schema:
+{
+  "is_reasonable": boolean,
+  "issue": string
+}
+- is_reasonable = true: execution matches plan, task is completed or can proceed to validation node.
+- is_reasonable = false: execution deviates from plan, stuck, meaningless loop, failed to complete subtasks → need replan.
+- issue: when is_reasonable=false, write concise reason; otherwise empty string.
+
+Evaluate from these dimensions:
+- Whether the agent followed the subtasks in the plan.
+- Whether stuck in useless loops, zero effective tool calls.
+- Whether output answers user request / coding objective.
+- For simple chat‑only tasks: no tool calls is acceptable, as long as meaningful answer produced.
+"""
+
+    eval_user_prompt = f"""
+=== Original Plan ===
+plan_description: {plan_description}
+subtasks: {json.dumps(subtasks, ensure_ascii=False)}
+
+=== Execution Statistic ===
+loop_count: {loop_count}
+tool_call_count: {tool_call_count}
+
+=== Agent Final Output Summary ===
+summary: {summary}
+
+Please evaluate this plan execution.
+"""
+    messages = [
+        {"role": "system", "content": eval_system},
+        {"role": "user", "content": eval_user_prompt},
+    ]
+
+    try:
+        # 调用现有统一LLM入口，node标记为plan_evaluate，不使用tools
+        resp = _invoke_llm(messages, node="plan_evaluate", tools=None)
+        raw_content = getattr(resp, "content", "")
+        parsed = json.loads(raw_content.strip())
+        is_reasonable = bool(parsed.get("is_reasonable", True))
+        issue = str(parsed.get("issue", ""))
+        return is_reasonable, issue
+
+    except Exception as e:
+        # LLM调用失败 / JSON解析失败，兜底放行，避免整个工作流卡死
+        logger.warning("_evaluate_plan_quality llm evaluate failed, fallback pass: %s", e, exc_info=True)
+        return True, ""
 
 
 def _parse_validation_result(messages: list[Any]) -> dict[str, Any]:
@@ -754,12 +838,12 @@ def _load_file_safe(path: Path) -> str:
     return ""
 
 
-def _safe_host_call(host: Any, method: str, default: str) -> str:
+def _safe_host_call(host: Any, method: str, default: str, *args: Any) -> str:
     """安全调用 host 方法，失败返回默认值"""
     if host is None:
         return default
     try:
-        result = getattr(host, method)()
+        result = getattr(host, method)(*args)
         return result if isinstance(result, str) else default
     except Exception as exc:
         logger.debug("host call %s failed: %s", method, exc)

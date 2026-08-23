@@ -59,7 +59,15 @@ class AgentHost:
         pm = get_permission_manager()
         pm.load_project(self.workspace)
         pm.set_approval_handler(make_console_approval_handler())
-        self.session_manager = SessionManager(sessions_root=root, workspace=self.workspace)
+
+        # 共享设施（per-workspace，单份，全会话复用：MCP/Skill/Hook/compiled_graph）
+        from dot.host.shared_services import SharedServices
+
+        self.shared = SharedServices(self.workspace)
+
+        self.session_manager = SessionManager(
+            sessions_root=root, workspace=self.workspace, shared=self.shared
+        )
         logger.info("[AgentHost] initialized, workspace=%s, sessions_root=%s", self.workspace, root)
 
     # ============================================================
@@ -78,6 +86,14 @@ class AgentHost:
     def get_or_create_session(self, session_id: str | None = None):
         """获取/恢复/创建会话（三级优先级）"""
         return self.session_manager.get_or_create(session_id)
+
+    def new_session(self):
+        """创建全新空会话并设为活跃（/new 命令入口）"""
+        return self.session_manager.new_session()
+
+    def switch_session(self, session_id: str):
+        """切换活跃会话（不关闭其他）"""
+        return self.session_manager.switch_to(session_id)
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """列出磁盘上的全部会话"""

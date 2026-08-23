@@ -48,13 +48,14 @@ def build_mcp_search_tool(session: Any) -> StructuredTool | None:
         runtime = getattr(session, "runtime", None)
         try:
             if not tool_name:
+                loaded = set(runtime.loaded_mcp_tools) if runtime is not None else set()
                 tools = []
                 for name in host.get_all_tool_names():
                     schema = host._schema_cache.get(name, {})
                     tools.append({
                         "name": name,
                         "description": schema.get("description", ""),
-                        "loaded": host.is_tool_loaded(name),
+                        "loaded": name in loaded,
                     })
                 return {"ok": True, "tools": tools}
             # 指定工具名 → 返回完整定义并注册可调用包装
@@ -93,6 +94,7 @@ def build_skill_search_tool(session: Any) -> StructuredTool | None:
 
     def skill_search(skill_name: str = "") -> dict[str, Any]:
         """获取指定 Skill 的完整指令内容"""
+        runtime = getattr(session, "runtime", None)
         try:
             if not skill_name:
                 return {
@@ -100,7 +102,16 @@ def build_skill_search_tool(session: Any) -> StructuredTool | None:
                     "skills": host.get_all_skill_names(),
                     "hint": "带 skill_name 参数获取完整内容",
                 }
-            return host.invoke_skill(skill_name)
+            result = host.invoke_skill(skill_name)
+            if result.get("ok") and runtime is not None:
+                key = result.get("skill_name", "")
+                content = result.get("content", "")
+                if key and key not in runtime.loaded_skills:
+                    runtime.loaded_skills.add(key)
+                    runtime.active_skill_content += (
+                        f"\n\n--- Skill: {key} ---\n{content}\n--- End of {key} ---\n"
+                    )
+            return result
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -141,7 +152,7 @@ def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | N
         runtime = getattr(session, "runtime", None)
         if host is None:
             return None
-        loaded = (runtime is not None and name in runtime.loaded_mcp_tools) or host.is_tool_loaded(name)
+        loaded = runtime is not None and name in runtime.loaded_mcp_tools
         if loaded:
             # 已加载：若 runtime 里还没有可调用包装则补注册，然后交回正常执行
             if runtime is not None and name not in runtime.loaded_mcp_tools:
@@ -157,7 +168,6 @@ def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | N
                 "available": available,
                 "hint": "先调用 mcp_search 查看工具目录",
             })
-        host._loaded_tools.add(name)
         if runtime is not None:
             runtime.loaded_mcp_tools[name] = _make_mcp_callable(session, name)
         return _tm({
@@ -171,9 +181,18 @@ def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | N
     # skill_ 前缀（元工具本身除外）：返回 skill 完整内容
     if name.startswith("skill_") and name != "skill_search":
         host = getattr(session, "skill_host", None)
+        runtime = getattr(session, "runtime", None)
         if host is None:
             return None
         result = host.invoke_skill(name)
+        if result.get("ok") and runtime is not None:
+            key = result.get("skill_name", "")
+            content = result.get("content", "")
+            if key and key not in runtime.loaded_skills:
+                runtime.loaded_skills.add(key)
+                runtime.active_skill_content += (
+                    f"\n\n--- Skill: {key} ---\n{content}\n--- End of {key} ---\n"
+                )
         return _tm(result)
 
     return None

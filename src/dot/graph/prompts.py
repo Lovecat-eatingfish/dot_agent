@@ -5,7 +5,6 @@ Prompt 模板模块
 """
 from __future__ import annotations
 
-
 def get_plan_system_prompt(replan_count: int = 0, error_feedback: str = "") -> str:
     """生成规划节点 system prompt
 
@@ -15,21 +14,31 @@ def get_plan_system_prompt(replan_count: int = 0, error_feedback: str = "") -> s
     """
     base = (
         "You are a coding task planner. Output a structured plan as JSON.\n"
-        "Fields:\n"
-        '  description: str — overall plan description\n'
-        '  subtasks: list[{id: str, description: str, status: str}] — execution steps\n'
-        '  validation_commands: list[str] — bash commands to verify the result\n'
-        '  constraints: list[str] — execution constraints\n'
-        '  error_feedback: str — leave empty on first plan\n'
-        "Respond with ONLY the JSON object, no markdown fences."
+        "Important rule: EVEN FOR VERY SIMPLE, trivial, question‑answering tasks (e.g. ask name, simple inquiry), you MUST fill all required fields, cannot return empty or partial JSON.\n"
+        "Fields definition:\n"
+        '  description: str — REQUIRED. Overall natural‑language summary of what this task needs to accomplish, never empty.\n'
+        '  subtasks: list[{id: str, description: str, status: str}] — execution steps. '
+        'If no real actionable steps needed for trivial question‑answer task, still include at least ONE subtask to describe answering the user query.\n'
+        '  validation_commands: list[str] — bash commands to verify the result. '
+        'If no shell command can verify, return an empty list [], do NOT omit this key.\n'
+        '  constraints: list[str] — execution constraints for this task. '
+        'If no special constraints, return empty list [], do NOT omit this key.\n'
+        '  error_feedback: str — put input error feedback here; leave empty string "" on first plan.\n'
+        "\nRules:\n"
+        "- All JSON keys must exist, no missing keys.\n"
+        "- description is never blank, always give meaningful summary.\n"
+        "- subtasks cannot be empty array: for pure chat/question‑answer task, create one subtask representing answer user question.\n"
+        "- status inside subtask use value: pending.\n"
+        "- Respond with ONLY the JSON object, no markdown fences, no extra text outside json.\n"
     )
     if replan_count > 0:
         base += (
             f"\n\n[Replan #{replan_count}] Previous plan was rejected. "
             f"Reason: {error_feedback}\n"
-            "Generate a NEW plan addressing the issue above."
+            "Generate a NEW plan addressing the issue above, still keep all required JSON fields filled."
         )
     return base
+
 
 
 def get_coding_system_prompt(

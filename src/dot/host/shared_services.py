@@ -10,10 +10,6 @@ MCP bridge 线程 / 重连 server / 重新扫描 skills。
   - HookRunner（无状态 handler，会话信息靠 payload.session_id 传入）
   - compiled_graph（无 checkpointer，节点状态全从 state["session"] 取，可重入）
   - Tracer / PermissionManager（本就是模块单例，此处引用便于 init 编排）
-
-与 runtime_registry 的分工：
-  - SharedServices：共享、init 后不可变的对象
-  - runtime_registry：每个 session 私有的易变对象（RuntimeState / persistence）
 """
 from __future__ import annotations
 

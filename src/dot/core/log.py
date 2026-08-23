@@ -3,6 +3,12 @@
 
 默认输出到 stderr（控制台调试可见），DEBUG 级别。
 可通过 DOT_LOG_LEVEL / MOKIO_LOG_LEVEL 环境变量调整。
+不同日志级别控制台区分颜色：
+- DEBUG: 青色
+- INFO: 绿色
+- WARNING: 黄色
+- ERROR: 红色
+- CRITICAL: 紫红色
 """
 from __future__ import annotations
 
@@ -10,6 +16,7 @@ import logging
 import os
 import sys
 from dotenv import load_dotenv
+import colorlog
 
 # ✅ 模块导入就加载 .env
 load_dotenv()
@@ -22,11 +29,7 @@ def _env(name: str, legacy_name: str) -> str | None:
 
 
 def setup_logging(level: str | None = None) -> None:
-    """初始化日志配置，输出到 stderr
-
-    Args:
-        level: 日志级别字符串，None 时读环境变量，默认 DEBUG（控制台调试模式）
-    """
+    """初始化日志配置，输出到 stderr，带控制台彩色"""
     global _initialized
     if _initialized:
         return
@@ -35,15 +38,27 @@ def setup_logging(level: str | None = None) -> None:
     resolved = (level or _env("DOT_LOG_LEVEL", "MOKIO_LOG_LEVEL") or "DEBUG").upper()
     log_level = getattr(logging, resolved, logging.DEBUG)
 
-    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    # 彩色格式
+    # log_color: 自动根据级别替换颜色；asctime无颜色
+    color_fmt = "%(log_color)s%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     datefmt = "%H:%M:%S"
 
-    # ✅ 使用 stderr
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter(fmt, datefmt=datefmt))
+    # 颜色配置
+    handler = colorlog.StreamHandler(stream=sys.stderr)
+    handler.setFormatter(colorlog.ColoredFormatter(
+        fmt=color_fmt,
+        datefmt=datefmt,
+        log_colors={
+            "DEBUG": "cyan",
+            "INFO": "green",
+            "WARNING": "yellow",
+            "ERROR": "red",
+            "CRITICAL": "bold_purple",
+        }
+    ))
 
     root = logging.getLogger()
-    # ✅ 安全删除，不要直接 clear()
+    # ✅ 安全删除旧handler
     for h in root.handlers[:]:
         root.removeHandler(h)
 
@@ -51,7 +66,7 @@ def setup_logging(level: str | None = None) -> None:
     root.setLevel(log_level)
 
     # 第三方库降噪
-    for noisy in ("httpx", "httpcore", "openai", "uvicorn", "asyncio"):
+    for noisy in ("httpx", "httpcore", "openai", "uvicorn", "asyncio", "httpx2", "mcp.client.streamable_http"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

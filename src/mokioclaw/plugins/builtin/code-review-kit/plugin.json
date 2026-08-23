@@ -1,8 +1,0 @@
-{
-  "name": "code-review-kit",
-  "version": "0.1.0",
-  "description": "Lightweight code review skill + /review-diff command for PR-style checks.",
-  "skills": true,
-  "commands": true,
-  "hooks": false
-}

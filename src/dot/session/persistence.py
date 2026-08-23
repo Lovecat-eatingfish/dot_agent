@@ -291,19 +291,19 @@ class SessionPersistence:
 # Turn 持久化（finally 节点调用）
 # ============================================================
 
-def persist_turn(
-    persistence: SessionPersistence,
-    session_id: str,
-    turn_id: int,
-    session: Any,  # Session — 避免循环 import
-) -> None:
+def persist_turn(session: Any, turn_id: int) -> None:
     """graph 运行结束后持久化（finally 节点内调用）
+
+    从 session 自动取 persistence / session_id / workspace，
+    调用方只需传 session 和 turn_id。
 
     步骤：
     1. 全量写入 session.json（messages + 元信息）
     2. agent 专用 git commit 用户项目目录（代码回滚锚点）
     3. 写入 turn 快照（含 git hash，供 rewind）
     """
+    persistence: SessionPersistence = session.persistence
+    session_id: str = session.session_id
     full_messages = list(session.messages)
     logger.info("[persist_turn] session=%s, turn=%d, messages=%d", session_id, turn_id, len(full_messages))
     span = get_tracer().start_span(
@@ -317,21 +317,20 @@ def persist_turn(
         "created_at": _read_created_at(persistence, session_id),
         "updated_at": utc_now(),
         "current_turn_id": turn_id,
-        "task": getattr(session, "task", ""),
-        "workspace": str(getattr(session, "workspace", "")),
+        "task": session.task,
+        "workspace": str(session.workspace),
         "messages": serialize_messages(full_messages),
         "replan_count": session.replan_count,
         "attempt_count": session.attempt_count,
-        "awaiting_intervention": bool(getattr(session, "awaiting_intervention", False)),
+        "awaiting_intervention": session.awaiting_intervention,
     }
     persistence.save_session_meta(session_id, meta)
 
     # agent 专用 git commit（用户项目目录快照，rewind 恢复代码用）
     git_hash = ""
-    workspace = getattr(session, "workspace", None)
-    if workspace is not None:
+    if session.workspace is not None:
         try:
-            git_hash = agent_git_commit(workspace, f"[dot] {session_id} turn {turn_id}")
+            git_hash = agent_git_commit(session.workspace, f"[dot] {session_id} turn {turn_id}")
             if git_hash:
                 logger.info("[persist_turn] git commit: %s", git_hash[:8])
         except Exception as exc:

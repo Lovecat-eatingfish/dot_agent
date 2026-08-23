@@ -13,9 +13,9 @@ from __future__ import annotations
 
 import difflib
 from pathlib import Path
+from typing import Any
 
 from ..core.path_security import PathAccessDeniedError, PathSecurityError, PathTraversalError
-from ..core.runtime import RuntimeState
 from ..core.utils import FileEditResult, FileReadResult, FileWriteResult
 
 # 单次读取的最大行数，防止读取超大文件导致内存溢出
@@ -53,7 +53,7 @@ def read_text_lossy(path: Path) -> str:
     return decode_text_lossy(path.read_bytes())
 
 
-def resolve_workspace_path(state: RuntimeState, file_path: str, operation: str = "read") -> Path:
+def resolve_workspace_path(state: Any, file_path: str, operation: str = "read") -> Path:
     """将相对路径解析为工作区内的绝对路径
 
     流程：去 workspace/ 前缀 → 展开 ~ → 拼 workspace → 安全检查
@@ -64,7 +64,7 @@ def resolve_workspace_path(state: RuntimeState, file_path: str, operation: str =
     return state.assert_workspace_path(raw, operation=operation)
 
 
-def display_path(state: RuntimeState, path: Path) -> str:
+def display_path(state: Any, path: Path) -> str:
     """获取用于显示的相对路径"""
     try:
         return str(path.resolve().relative_to(state.workspace.resolve()))
@@ -103,7 +103,7 @@ def _validate_edit_args(file_path: str, old_text: str, new_text: str) -> list[st
 
 
 def read_file(
-    state: RuntimeState,
+    state: Any,
     file_path: str,
     offset: int | str = 0,
     limit: int | str = MAX_READ_LINES,
@@ -153,7 +153,7 @@ def read_file(
     }
 
 
-def write_file(state: RuntimeState, file_path: str, content: str) -> FileWriteResult:
+def write_file(state: Any, file_path: str, content: str) -> FileWriteResult:
     """创建或重写文件
 
     安全机制：
@@ -218,7 +218,7 @@ def write_file(state: RuntimeState, file_path: str, content: str) -> FileWriteRe
     }
 
 
-def edit_file(state: RuntimeState, file_path: str, old_text: str, new_text: str) -> FileEditResult:
+def edit_file(state: Any, file_path: str, old_text: str, new_text: str) -> FileEditResult:
     """精确编辑文件，替换唯一的文本片段
 
     安全机制：

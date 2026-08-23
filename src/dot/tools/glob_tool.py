@@ -12,7 +12,6 @@ from pathlib import Path
 from typing import Any
 
 from ..core.path_security import PathSecurityError
-from ..core.runtime import RuntimeState
 from .file_tools import display_path, resolve_workspace_path
 
 # 递归搜索时跳过的目录（与 GrepTool 保持一致）
@@ -27,7 +26,7 @@ def _is_skipped(path: Path) -> bool:
 
 
 def glob_search(
-    state: RuntimeState,
+    state: Any,
     pattern: str,
     path: str = ".",
     path_type: str = "file",

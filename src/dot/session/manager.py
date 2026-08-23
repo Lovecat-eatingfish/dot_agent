@@ -1,10 +1,11 @@
 """
-SessionManager — 单会话管理器（dot 版，自定义机制，不依赖 langgraph checkpoint）
+SessionManager — 多会话管理器（dot 版，自定义机制，不依赖 langgraph checkpoint）
 
 职责：
-  - 只管理一个 Session（不维护 _sessions dict）
+  - 管理多个 Session（dict 索引 + 活跃指针）
   - get_or_create: 指定 id → 最新磁盘 → 全新
-  - 初始化：编译图、MCP/Skills hosts、HookRunner、RuntimeState
+  - 共享设施（MCP/Skill/Hook/compiled_graph）由 SharedServices 统一初始化，
+    SessionManager 只引用，不重复构建
   - stream_session_events: 驱动一轮图执行，yield 事件流
   - resume_session: 人工介入后恢复（continue 重新进图 / stop 结束）
   - rewind_to_turn: 磁盘 + 内存 + 用户代码一起恢复
@@ -23,20 +24,12 @@ from typing import Any, Callable, Iterator
 from langchain_core.messages import HumanMessage
 
 from ..constant.session import session_dir
-from ..core import runtime_registry
-from ..core.hook_loader import load_hooks_into_runner
-from ..core.hooks import HookRunner
 from ..core.log import get_logger
-from ..mcp.host import MCPHost
-from ..mcp.manager import MCPManager
-from ..core.runtime import RuntimeState
 from .session import Session
 from .persistence import (
     SessionPersistence,
     deserialize_messages,
 )
-from ..skills.host import SkillHost
-from ..skills.manager import SkillsManager
 
 # 注意：graph.coding_graph 必须延迟 import —— 它 import .session 模块，
 # 顶层导入会与 session 包的 __init__ 形成循环
@@ -53,12 +46,15 @@ class _RemoteException:
 
 
 class SessionManager:
-    """单会话管理器
+    """多会话管理器
 
-    使用方式：
-        mgr = SessionManager(sessions_root=workspace / ".dot" / "sessions")
-        session = mgr.get_or_create("my-session")   # 指定 ID
-        session = mgr.get_or_create()               # 最新 or 新建
+    共享设施（MCP/Skill/Hook/compiled_graph）由外部 SharedServices 提供，
+    SessionManager 只引用，不重复构建。
+
+    使用方式（由 AgentHost 构造）：
+        shared = SharedServices(workspace)
+        mgr = SessionManager(sessions_root, workspace, shared=shared)
+        session = mgr.get_or_create("my-session")
     """
 
     def __init__(
@@ -66,7 +62,7 @@ class SessionManager:
             sessions_root: Path | str | None = None,
             workspace: Path | None = None,
             *,
-            shared: Any = None,
+            shared: Any,
     ) -> None:
         self._sessions_root = Path(sessions_root) if sessions_root else Path(session_dir)
         self._default_workspace = workspace or Path.cwd()
@@ -74,7 +70,7 @@ class SessionManager:
         # 多会话：dict 索引 + 活跃会话指针（切换不关闭其他）
         self._sessions: dict[str, Session] = {}
         self._active_session_id: str | None = None
-        # 共享设施（来自 AgentHost.SharedServices）；为 None 时退化为每会话自建
+        # 共享设施（来自 AgentHost.SharedServices），全会话复用
         self._shared = shared
 
     # ============================================================
@@ -170,8 +166,8 @@ class SessionManager:
         self._active_session_id = None
 
     def _shutdown_session_runtime(self, session: Session) -> None:
-        """清理 session 级注册项（共享设施不随会话关闭，归 SharedServices.close）"""
-        runtime_registry.clear(session.session_id)
+        """清理 session 级资源（共享设施不随会话关闭，归 SharedServices.close）"""
+        pass
 
     def list_sessions(self) -> list[dict[str, Any]]:
         """列出磁盘上的所有 session 概要"""
@@ -204,7 +200,7 @@ class SessionManager:
         persistence = self._get_persistence(sid)
         return persistence.list_available_turns(sid)
 
-    def rewind_to_turn(self, session_id: str | None, target_turn_id: int) -> dict[str, Any]:
+    def rewind_to_turn(self, target_turn_id: int, session_id: str | None = None) -> dict[str, Any]:
         """回滚到指定 turn（磁盘 + 内存 + 用户代码一起恢复）"""
         session = self.get_session(session_id)
         if session.is_running:
@@ -231,30 +227,19 @@ class SessionManager:
         return graph_state
 
     # ============================================================
-    # Runtime config（写入 session.runtime）
+    # Runtime config（直接写 session 字段）
     # ============================================================
 
     def apply_runtime_config(
             self,
             session: Session,
             *,
-            workspace: Path | None = None,
-            max_attempts: int = 3,
             agent_mode: str = "auto",
     ) -> None:
         """应用运行时配置（权限由 PermissionManager 按 agent_mode 统一裁决）"""
-        user_workspace = (
-            workspace if workspace is not None
-            else (
-                session.workspace if str(session.workspace) and session.workspace.exists() else self._default_workspace)
-        )
-        session.workspace = user_workspace
-        session.max_attempt = max_attempts
-
-        runtime = self._ensure_runtime(session)
-        runtime.workspace = user_workspace
-        runtime.agent_mode = agent_mode
-        runtime.session_id = session.session_id
+        if not session.workspace or not session.workspace.exists():
+            session.workspace = self._default_workspace
+        session.agent_mode = agent_mode
 
     # ============================================================
     # Stream events（每轮图执行）
@@ -262,12 +247,10 @@ class SessionManager:
 
     def stream_session_events(
             self,
-            session_id: str | None = None,
             user_input: str | None = None,
             *,
-            workspace: Path | None = None,
-            max_attempts: int = 3,
-            agent_mode: str = "edit",
+            session_id: str | None = None,
+            agent_mode: str = "auto",
     ) -> Iterator[dict[str, Any]]:
         """驱动一轮图执行，yield 事件流
 
@@ -284,12 +267,7 @@ class SessionManager:
         logger.info("[stream] session=%s, user_input=%r, agent_mode=%s", session.session_id, user_input, agent_mode)
 
         # 主线程 session-state setup（worker 起来前就绪）
-        self.apply_runtime_config(
-            session,
-            workspace=workspace,
-            max_attempts=max_attempts,
-            agent_mode=agent_mode,
-        )
+        self.apply_runtime_config(session, agent_mode=agent_mode)
         session.reset_per_turn()
         if user_input:
             session.messages.append(HumanMessage(content=user_input))
@@ -469,53 +447,21 @@ class SessionManager:
 
         logger.info("[SessionManager] workspace=%s", workspace)
 
-        # 共享设施来自 AgentHost 的 SharedServices（单份，全会话复用）；
-        # 无 shared（独立构造 SessionManager 的场景）退化为每会话自建。
-        if self._shared is not None:
-            mcp_host = self._shared.mcp_host
-            skill_host = self._shared.skill_host
-            hook_runner = self._shared.hook_runner
-            compiled_graph = self._shared.compiled_graph
-            # skills 是工作区磁盘数据，建会话时刷新一次以反映当前状态
-            # （MCP 工具走共享 server 连接，不在此重扫，保持 eager-once）
-            try:
-                skill_host.discover_skills()
-            except Exception as exc:
-                logger.debug("skill re-discover skipped: %s", exc)
-        else:
-            mcp_host = self._build_mcp_host(workspace)
-            skill_host = self._build_skill_host(workspace)
-            hook_runner = HookRunner()
-            try:
-                load_hooks_into_runner(hook_runner, workspace)
-            except Exception as exc:
-                logger.debug("hook load skipped: %s", exc)
-            from ..graph.coding_graph import compile_graph
-
-            compiled_graph = compile_graph()
-
+        # 共享设施来自 SharedServices（单份，全会话复用，不在此重复构建）
+        shared = self._shared
         session = Session(
             session_id=session_id,
-            compiled_graph=compiled_graph,
+            compiled_graph=shared.compiled_graph,
             messages=deserialize_messages(meta.get("messages", [])) if meta.get("messages") else [],
             replan_count=int(meta.get("replan_count", 0)),
             attempt_count=int(meta.get("attempt_count", 0)),
             current_turn_id=int(meta.get("current_turn_id", 0)),
             persistence=persistence,
             workspace=workspace,
-            mcp_host=mcp_host,
-            skill_host=skill_host,
-            hook_runner=hook_runner,
+            mcp_host=shared.mcp_host,
+            skill_host=shared.skill_host,
+            hook_runner=shared.hook_runner,
             awaiting_intervention=bool(meta.get("awaiting_intervention", False)),
-        )
-
-        runtime = self._ensure_runtime(session)
-
-        # 仅注册 per-session 易变对象；共享设施（mcp/skill/hook/graph）在 SharedServices，不入注册表
-        runtime_registry.register(
-            session_id,
-            persistence=persistence,
-            runtime=runtime,
         )
 
         if is_new:
@@ -524,42 +470,6 @@ class SessionManager:
             persistence.save_session_meta(session_id, meta)
 
         return session
-
-    def _build_mcp_host(self, workspace: Path) -> MCPHost:
-        """构建 MCP host（渐进披露，基于官方 MCP SDK）
-
-        读取 .dot/mcp.json（全局 + 项目级）建立全部连接后拉取工具目录。
-        """
-        try:
-            manager = MCPManager(workspace=workspace)
-            connect = manager.load_config_and_connect()
-            host = MCPHost(manager)
-            host.discover_tools()
-            return host
-        except Exception as exc:
-            logger.warning("MCP host init failed: %s", exc)
-            return MCPHost(MCPManager(workspace=workspace))
-
-    def _build_skill_host(self, workspace: Path) -> SkillHost:
-        """构建 Skill host（渐进披露）"""
-        try:
-            manager = SkillsManager(workspace=workspace)
-            host = SkillHost(manager)
-            host.discover_skills()
-            return host
-        except Exception as exc:
-            logger.debug("Skill host init skipped: %s", exc)
-            return SkillHost(SkillsManager(workspace=workspace))
-
-    # todo 代码重复，需要优化
-    def _ensure_runtime(self, session: Session) -> RuntimeState:
-        if session.runtime is None:
-            session.runtime = RuntimeState(
-                workspace=session.workspace,
-                hook_runner=session.hook_runner,
-                session_id=session.session_id,
-            )
-        return session.runtime
 
     def _find_latest_session_dir(self) -> Path | None:
         """找到最近修改的会话目录"""

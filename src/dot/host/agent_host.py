@@ -45,6 +45,13 @@ class AgentHost:
         workspace: Path | None = None,
         sessions_root: Path | str | None = None,
     ) -> None:
+        """
+        初始化 AgentHost，加载全局组件并准备会话管理。
+        链路追踪，权限管控， mcp ，skill， hook，审批引擎
+
+        :param workspace: 工作空间目录，默认当前工作目录
+        :param sessions_root: 会话根目录，默认 <workspace>/.dot/sessions/
+        """
         self.workspace = workspace or Path.cwd()
         root = Path(sessions_root) if sessions_root else (self.workspace / session_dir)
 
@@ -122,7 +129,6 @@ class AgentHost:
         yield from self.session_manager.stream_session_events(
             session_id=session_id,
             user_input=user_input,
-            workspace=self.workspace,
             agent_mode=agent_mode,
         )
 

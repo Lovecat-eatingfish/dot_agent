@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 from ..core.path_security import PathSecurityError
-from ..core.runtime import RuntimeState
 from .file_tools import display_path, read_text_lossy, resolve_workspace_path
 
 SKIP_DIRS = {".git", ".mokioclaw", ".dot", ".venv", "__pycache__", ".pytest_cache", "node_modules", ".idea"}
@@ -62,7 +61,7 @@ def _coerce_int(value: Any, field: str) -> int | None:
 
 
 def grep(
-    state: RuntimeState,
+    state: Any,
     pattern: str,
     path: str = ".",
     glob: str | None = None,
@@ -113,7 +112,7 @@ def grep(
 
 def _grep_with_ripgrep(
     rg: str,
-    state: RuntimeState,
+    state: Any,
     root: Path,
     pattern: str,
     glob: str | None,
@@ -206,7 +205,7 @@ def _grep_with_ripgrep(
     }
 
 
-def _parse_ripgrep_content(stdout: str, state: RuntimeState, head_limit: int) -> list[dict[str, Any]]:
+def _parse_ripgrep_content(stdout: str, state: Any, head_limit: int) -> list[dict[str, Any]]:
     """解析 ripgrep 的 --line-number --no-heading 输出
 
     输出形如:
@@ -235,7 +234,7 @@ def _parse_ripgrep_content(stdout: str, state: RuntimeState, head_limit: int) ->
 
 
 def _grep_with_python(
-    state: RuntimeState,
+    state: Any,
     root: Path,
     pattern: str,
     glob: str | None,

@@ -23,7 +23,6 @@ from pathlib import Path
 from typing import Any
 
 from ..core.log import get_logger
-from ..core.runtime import RuntimeState
 from ..core.utils import BashResult, coerce_bool
 
 logger = get_logger(__name__)
@@ -193,7 +192,7 @@ def _normalize_command(command: str) -> str:
     )
 
 
-def _handle_tail_command(state: RuntimeState, command: str) -> BashResult | None:
+def _handle_tail_command(state: Any, command: str) -> BashResult | None:
     """处理 tail 命令，转换为 Python 实现，确保跨平台兼容"""
     match = re.fullmatch(r"\s*tail(?:\s+-n)?\s+(\d+)\s+(.+?)\s*", command)
     if not match:
@@ -220,7 +219,7 @@ def _handle_tail_command(state: RuntimeState, command: str) -> BashResult | None
     }
 
 
-def _handle_workspace_query(state: RuntimeState, command: str) -> BashResult | None:
+def _handle_workspace_query(state: Any, command: str) -> BashResult | None:
     if not re.fullmatch(r"\s*(?:cd|pwd)\s*", command, flags=re.IGNORECASE):
         return None
     cwd = _effective_cwd(state)
@@ -257,7 +256,7 @@ def _decode_output(output: bytes | str | None) -> str:
 
 
 def run_bash(
-    state: RuntimeState,
+    state: Any,
     command: str,
     timeout_seconds: int | str | float | None = None,
     run_in_background: bool | str = False,
@@ -348,7 +347,7 @@ def run_bash(
     }
 
 
-def _effective_cwd(state: RuntimeState) -> Path:
+def _effective_cwd(state: Any) -> Path:
     cwd = getattr(state, "cwd", None)
     if cwd is not None:
         try:
@@ -373,7 +372,7 @@ READ_ONLY_ALLOWED = {
 
 
 def run_bash_read_only(
-    state: RuntimeState,
+    state: Any,
     command: str,
     timeout_seconds: int | str | float | None = None,
     run_in_background: bool | str = False,
@@ -465,7 +464,7 @@ def run_bash_read_only(
     }
 
 
-def _state_int(state: RuntimeState, name: str, default: int) -> int:
+def _state_int(state: Any, name: str, default: int) -> int:
     try:
         value = int(getattr(state, name, default))
     except (TypeError, ValueError):
@@ -473,7 +472,7 @@ def _state_int(state: RuntimeState, name: str, default: int) -> int:
     return value if value > 0 else default
 
 
-def _build_env(state: RuntimeState) -> tuple[dict[str, str], str | None]:
+def _build_env(state: Any) -> tuple[dict[str, str], str | None]:
     env = os.environ.copy()
     env.setdefault("PYTHONIOENCODING", "utf-8")
     env.setdefault("PYTHONUTF8", "1")
@@ -492,7 +491,7 @@ def _build_env(state: RuntimeState) -> tuple[dict[str, str], str | None]:
     return env, None
 
 
-def _prepend_harness_paths(state: RuntimeState, env: dict[str, str]) -> None:
+def _prepend_harness_paths(state: Any, env: dict[str, str]) -> None:
     path_candidates = [
         _ensure_toolchain_shims(state),
         state.workspace / ".venv" / ("Scripts" if os.name == "nt" else "bin"),
@@ -510,7 +509,7 @@ def _prepend_harness_paths(state: RuntimeState, env: dict[str, str]) -> None:
         env.setdefault("VIRTUAL_ENV", sys.prefix)
 
 
-def _ensure_toolchain_shims(state: RuntimeState) -> Path:
+def _ensure_toolchain_shims(state: Any) -> Path:
     """创建 python/pip shim，保证命令用的是当前解释器"""
     shim_dir = state.workspace / ".dot" / "shims"
     shim_dir.mkdir(parents=True, exist_ok=True)
@@ -592,7 +591,7 @@ def _expand_env_value(value: str, env: dict[str, str]) -> str:
     return re.sub(r"\$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\}|\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*)", replace_var, value)
 
 
-def _format_captured_output(state: RuntimeState, stdout: str, stderr: str, max_output_chars: int) -> dict[str, str | bool]:
+def _format_captured_output(state: Any, stdout: str, stderr: str, max_output_chars: int) -> dict[str, str | bool]:
     output: dict[str, Any] = {}
     output_dir = state.workspace / ".dot" / "bash-outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -612,7 +611,7 @@ def _format_captured_output(state: RuntimeState, stdout: str, stderr: str, max_o
 
 
 def _run_background(
-    state: RuntimeState,
+    state: Any,
     command: str,
     env: dict[str, str],
 ) -> BashResult:

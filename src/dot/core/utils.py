@@ -186,40 +186,30 @@ def coerce_bool(value: Any, default: bool = False) -> bool:
 def execute_tool_by_name(
     tools: list[Any],
     call: dict[str, Any],
-    hook_runner: Any | None = None,
-    budget: Any | None = None,
-    workspace: Any | None = None,
-    runtime: Any | None = None,
+    session: Any | None = None,
 ) -> ToolMessage:
     """按名称查找并执行工具，返回 ToolMessage
 
     流程：
     1. PreToolUse Hook（可阻断 / 改参数）
-    2. 查找工具：tools 列表 → runtime.loaded_mcp_tools 回退（渐进披露刚加载的）
+    2. 查找工具：tools 列表 → session.loaded_mcp_tools 回退（渐进披露刚加载的）
     3. 执行
     4. PostToolUse / PostToolUseFailure Hook
-    5. 大输出落盘（budget）
+    5. 大输出落盘（session.result_budget）
 
     Args:
         tools: 工具列表（需有 .name 属性）
         call: 工具调用字典，包含 name, args, id
-        hook_runner: 可选 HookRunner
-        budget: 可选 ToolResultBudget
-        workspace: 工作区路径（budget 需要）
-        runtime: 可选 RuntimeState（loaded_mcp_tools 回退查找）
+        session: 可选 Session（hook_runner / loaded_mcp_tools / result_budget / workspace）
     """
     from .hooks import HookEvent, HookPayload, HookRunner
     from .tool_result_budget import ToolResultBudget
 
     name = call.get("name", "")
     args = call.get("args") or {}
-    runtime_obj = runtime or call.get("_runtime")
     tool_call_id = call.get("id") or f"{name}-call"
-    mid = (
-        runtime_obj.next_message_id()
-        if runtime_obj is not None and hasattr(runtime_obj, "next_message_id")
-        else None
-    )
+    mid = session.next_message_id() if session is not None else None
+    hook_runner = getattr(session, "hook_runner", None) if session is not None else None
 
     def _tm(payload: dict[str, Any]) -> ToolMessage:
         return ToolMessage(
@@ -244,10 +234,9 @@ def execute_tool_by_name(
 
     tools_map = {tool.name: tool for tool in tools}
     tool = tools_map.get(name)
-    # 渐进披露：mcp_search 刚加载的工具可能不在本轮 tools 列表，回退到 runtime
-    if tool is None and runtime_obj is not None:
-        loaded = getattr(runtime_obj, "loaded_mcp_tools", None) or {}
-        tool = loaded.get(name)
+    # 渐进披露：mcp_search 刚加载的工具可能不在本轮 tools 列表，回退到 session
+    if tool is None and session is not None:
+        tool = session.loaded_mcp_tools.get(name)
     error: Exception | None = None
     if tool is None:
         result = {"ok": False, "error": f"unknown tool: {name}"}
@@ -271,8 +260,10 @@ def execute_tool_by_name(
         hook_runner.run(post_event, post_payload)
 
     # L1 Tool-Result Budget：大输出落盘
-    if budget and isinstance(budget, ToolResultBudget) and workspace and not error:
-        result = budget.apply(result, name, workspace)
+    budget = getattr(session, "result_budget", None) if session is not None else None
+    ws = getattr(session, "workspace", None) if session is not None else None
+    if budget and isinstance(budget, ToolResultBudget) and ws and not error:
+        result = budget.apply(result, name, ws)
 
     return _tm(result if isinstance(result, dict) else {"ok": True, "result": result})
 

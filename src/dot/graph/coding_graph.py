@@ -205,28 +205,25 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
         session.replan_count, session.replan_max,
     )
 
-    # 构建工具（同时确保 session.runtime 就位）
+    # 构建工具
     try:
         tools = build_tools_for_session(session)
     except Exception as exc:
         logger.warning("coding_agent_node: tool build failed: %s", exc, exc_info=True)
         tools = []
 
-    runtime = session.runtime
-
     plan_description = task_plan.get("description", "")
     subtasks = task_plan.get("subtasks", [])
-    # 约束条件
     constraints = task_plan.get("constraints", [])
 
-    # 静态上下文（G6：用户自定义指令 + 记忆索引），只注入 coding_agent
-    static_context = _load_static_context(session.workspace)
+    # 静态上下文（用户自定义指令 + 记忆索引），只注入 coding_agent
+    static_context = _load_static_context(session)
     if static_context:
         logger.info("[node:coding_agent] loaded static_context (%d chars)", len(static_context))
 
-    # 动态上下文：MCP / Skills 目录（共享 host 基础目录 + per-session loaded 视图）
-    mcp_loaded = set(runtime.loaded_mcp_tools) if runtime is not None else set()
-    skill_loaded = set(runtime.loaded_skills) if runtime is not None else set()
+    # 动态上下文：MCP / Skills 目录（per-session loaded 视图）
+    mcp_loaded = set(session.loaded_mcp_tools)
+    skill_loaded = set(session.loaded_skills)
 
     mcp_catalog = _safe_host_call(session.mcp_host, "get_catalog_text", "", mcp_loaded)
     mcp_rules = _safe_host_call(session.mcp_host, "get_system_prompt_rules", "")
@@ -256,8 +253,8 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
     while loop_count < CODING_MAX_LOOPS:
         loop_count += 1
 
-        # Skill 内容可能在本轮中被 invoke_skill 加载 → 每轮重建 system prompt（per-session 累积）
-        skill_content = runtime.active_skill_content if runtime is not None else ""
+        # Skill 内容可能在本轮中被 invoke_skill 加载 → 每轮重建 system prompt
+        skill_content = session.active_skill_content
         system_prompt = base_system_prompt + (f"\n\n{skill_content}" if skill_content else "")
         agent_messages: list[Any] = [SystemMessage(content=system_prompt), *session.messages]
 
@@ -284,7 +281,7 @@ def coding_agent_node(state: DotAgentState) -> dict[str, Any]:
         for call in tool_calls:
             tool_name = call.get("name", "")
             logger.info("[node:coding_agent] -> tool: %s  args=%s", tool_name, _short_args(call.get("args")))
-            tool_msg = _run_tool_call(session, runtime, tools, call, writer, prefix="call")
+            tool_msg = _run_tool_call(session, tools, call, prefix="call")
             if tool_msg is not None:
                 session.messages.append(tool_msg)
 
@@ -339,7 +336,6 @@ def valid_node(state: DotAgentState) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("valid_node: tool build failed: %s", exc, exc_info=True)
         tools = []
-    runtime = session.runtime
 
     system_prompt = get_valid_system_prompt(
         plan_description=task_plan.get("description", ""),
@@ -375,7 +371,7 @@ def valid_node(state: DotAgentState) -> dict[str, Any]:
         writer({"type": "validation_tool_calls", "count": len(tool_calls), "loop": loop_count})
 
         for call in tool_calls:
-            tool_msg = _run_tool_call(session, runtime, tools, call, writer, prefix="val")
+            tool_msg = _run_tool_call(session, tools, call, prefix="val")
             if tool_msg is not None:
                 session.messages.append(tool_msg)
 
@@ -444,12 +440,7 @@ def finally_node(state: DotAgentState) -> dict[str, Any]:
         try:
             from ..session.persistence import persist_turn
 
-            persist_turn(
-                persistence=session.persistence,
-                session_id=session.session_id,
-                turn_id=turn_id,
-                session=session,
-            )
+            persist_turn(session, turn_id)
         except Exception as exc:
             logger.warning("[node:finally] persist_turn failed: %s", exc, exc_info=True)
 
@@ -574,10 +565,8 @@ def compile_graph():
 
 def _run_tool_call(
         session: Session,
-        runtime: Any,
         tools: list[Any],
         call: dict[str, Any],
-        writer: Any,
         *,
         prefix: str,
 ) -> ToolMessage | None:
@@ -588,15 +577,15 @@ def _run_tool_call(
        （mcp_ 未加载返回定义、已加载转发执行；skill_ 返回 skill 内容）
     2. 其余系统工具 → Hook 拦截 → execute_tool_by_name
     """
+    writer = _get_writer()
     tool_name = call.get("name", "")
+    args = call.get("args") or {}
 
     # ---- 权限校验（统一入口，所有工具必经）----
     from ..core.permission import Decision, get_permission_manager
 
     pm = get_permission_manager()
-    args = call.get("args") or {}
-    agent_mode = getattr(runtime, "agent_mode", "auto") if runtime is not None else "auto"
-    decision = pm.check(tool_name, args, agent_mode=agent_mode, workspace=session.workspace)
+    decision = pm.check(tool_name, args, agent_mode=session.agent_mode)
 
     if decision.decision is Decision.DENY:
         writer({"type": "permission_denied", "name": tool_name, "source": decision.source, "reason": decision.reason})
@@ -606,7 +595,7 @@ def _run_tool_call(
         )
 
     if decision.decision is Decision.ASK:
-        approved = pm.ask_user(tool_name, args, decision, agent_mode=agent_mode)
+        approved = pm.ask_user(tool_name, args, decision, agent_mode=session.agent_mode)
         if not approved:
             writer({"type": "permission_denied", "name": tool_name, "source": "user", "reason": "user rejected"})
             return ToolMessage(
@@ -615,7 +604,7 @@ def _run_tool_call(
             )
         # 确认后重走完整校验（黑名单依然拦截，模式层单次放行）
         decision = pm.check(
-            tool_name, args, agent_mode=agent_mode, workspace=session.workspace, approved=True,
+            tool_name, args, agent_mode=session.agent_mode, approved=True,
         )
         if decision.decision is Decision.DENY:
             writer(
@@ -632,29 +621,19 @@ def _run_tool_call(
 
     # PreToolUse Hook 拦截
     if session.hook_runner is not None:
-        hook_result = _check_hook(
-            session.hook_runner,
-            session.session_id,
-            session.workspace,
-            tool_name,
-            call.get("args") or {},
-        )
+        hook_result = _check_hook(session, tool_name, args)
         if hook_result.blocked:
-            err_msg = ToolMessage(
+            writer({"type": "tool_blocked", "name": tool_name, "reason": hook_result.feedback})
+            return ToolMessage(
                 content=hook_result.feedback or f"Blocked by hook: {tool_name}",
                 tool_call_id=call.get("id", f"{prefix}-{tool_name}"),
             )
-            writer({"type": "tool_blocked", "name": tool_name, "reason": hook_result.feedback})
-            return err_msg
 
     try:
         return execute_tool_by_name(
             tools=tools,
             call=call,
-            hook_runner=session.hook_runner,
-            budget=getattr(runtime, "result_budget", None) if runtime is not None else None,
-            workspace=session.workspace,
-            runtime=runtime,
+            session=session,
         )
     except Exception as exc:
         logger.warning("tool execution failed: %s", exc, exc_info=True)
@@ -664,22 +643,16 @@ def _run_tool_call(
         )
 
 
-def _check_hook(
-        hook_runner: HookRunner,
-        session_id: str,
-        workspace: Any,
-        tool_name: str,
-        tool_args: dict[str, Any],
-) -> HookResult:
+def _check_hook(session: Session, tool_name: str, tool_args: dict[str, Any]) -> HookResult:
     try:
-        return hook_runner.run(
+        return session.hook_runner.run(
             HookEvent.PreToolUse,
             HookPayload(
                 event=HookEvent.PreToolUse,
                 tool_name=tool_name,
                 tool_args=dict(tool_args),
-                session_id=session_id,
-                workspace=str(workspace) if workspace else "",
+                session_id=session.session_id,
+                workspace=str(session.workspace),
             ),
         )
     except Exception as exc:
@@ -824,9 +797,9 @@ def _extract_json_text(text: str) -> str:
     return text[start:]
 
 
-def _load_static_context(workspace: Path) -> str:
+def _load_static_context(session: Session) -> str:
     """加载静态上下文：.dot/memory/dot.md（用户行为偏好文件，对齐 fix.md）"""
-    return _load_file_safe(workspace / ".dot" / "memory" / "dot.md")
+    return _load_file_safe(session.workspace / ".dot" / "memory" / "dot.md")
 
 
 def _load_file_safe(path: Path) -> str:

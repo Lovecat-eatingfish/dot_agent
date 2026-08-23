@@ -22,7 +22,6 @@ from .core import (
     HookPayload,
     HookResult,
     HookRunner,
-    RuntimeState,
     create_model,
     execute_tool_by_name,
 )
@@ -55,7 +54,6 @@ __all__ = [
     "HookPayload",
     "HookResult",
     "HookRunner",
-    "RuntimeState",
     "create_model",
     "execute_tool_by_name",
     # tools

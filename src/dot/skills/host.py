@@ -107,7 +107,7 @@ class SkillHost:
             except Exception:
                 full_content = f"# {skill.name}\n{skill.description}"
 
-        # per-session 的 loaded/active 状态由调用方写入 RuntimeState（host 仅返回数据）
+        # per-session 的 loaded/active 状态由调用方写入 Session（host 仅返回数据）
         return {
             "ok": True,
             "skill_name": key,

@@ -5,6 +5,7 @@ Session 数据结构 — State IS Session
   - Session 是内存唯一权威源，所有字段直接挂在 Session 对象上
   - messages 是唯一跨 turn 的字段，其余每 turn reset
   - 节点直接读写 session.xxx，返回值仅用于事件流（路由也读 session）
+  - 不再需要 RuntimeState 中间层，per-session 运行时状态直接在 Session 上
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ from typing import Any
 from langchain_core.messages import BaseMessage
 
 from ..core.log import get_logger
+from ..core.tool_result_budget import ToolResultBudget
 
 logger = get_logger(__name__)
 
@@ -36,8 +38,8 @@ class Session:
     节点通过 state["session"] 拿到同一个 Session 对象直接读写。
     """
 
-    # 绘会话内对象
     session_id: str
+
     # --- 跨 turn 持久字段 ---
     messages: list[BaseMessage] = field(default_factory=list)
 
@@ -50,35 +52,51 @@ class Session:
     validate_result: dict = field(default_factory=dict)
     need_human_intervene: bool = False
     resume_action: str = ""
-    # coding_agent 判定 plan 无效时置位；plan_node 生成新 plan 后清除
     plan_invalid: bool = False
-    # 自定义人工介入：human_intervene 节点置位并随本轮 finally 持久化，
-    # 控制台据此提示 continue/stop；reset_per_turn 与 resume 时清除
     awaiting_intervention: bool = False
 
-
-    # --- 会话级不变字段 ---
+    # --- 会话级字段（跨 turn 持久，不随 reset_per_turn 清除）---
     workspace: Path = field(default_factory=Path.cwd)
-    # 原子守卫 acquire_run/release_run（保证「每会话一次一个 turn」，并发是跨会话）
     _is_running_lock: threading.Lock = field(
         default_factory=threading.Lock, repr=False, compare=False
     )
     replan_max: int = REPLAN_THRESHOLD
     max_attempt: int = MAX_ATTEMPT_DEFAULT
     current_turn_id: int = 0
-    compiled_graph: Any = None  # CompiledGraph — 图只编译一次
 
+    # --- 共享设施（由 SharedServices 注入，全会话复用）---
+    compiled_graph: Any = None
+    persistence: Any = None
+    mcp_host: Any = None
+    skill_host: Any = None
+    hook_runner: Any = None
 
-    # --- 注入的管理器（会话级，持久化时排除，恢复时重新挂载）---
-    persistence: Any = None  # SessionPersistence
-    mcp_host: Any = None     # MCPHost（渐进披露，有状态）
-    skill_host: Any = None   # SkillHost（渐进披露，有状态）
-    authorizer: Any = None   # 审批引擎（预留）
-    hook_runner: Any = None  # HookRunner
-    runtime: Any = None      # RuntimeState（工具执行运行时）
+    # --- per-session 运行时状态（原 RuntimeState，直接平铺到 Session）---
+    agent_mode: str = "auto"
+    # MCP 渐进披露：已按需加载的工具名 → StructuredTool
+    loaded_mcp_tools: dict[str, Any] = field(default_factory=dict)
+    # Skill 渐进披露：已加载的 skill 名集合 + 累计注入正文
+    loaded_skills: set[str] = field(default_factory=set)
+    active_skill_content: str = ""
+    # 文件快照：追踪已读取文件状态，防止覆盖并发修改
+    read_files: dict = field(default_factory=dict)  # dict[Path, FileSnapshot]
+    # 工具输出预算，大输出自动落盘
+    result_budget: Any = field(default_factory=ToolResultBudget)
+    # BashTool 配置
+    cwd: Path | None = None
+    bash_default_timeout_seconds: int = 120
+    bash_max_timeout_seconds: int = 600
+    bash_max_output_chars: int = 6000
+    bash_env_file: Path | None = None
+    extra_env: dict[str, str] = field(default_factory=dict)
+    # 消息序号（并行工具调用时加锁）
+    _message_seq: int = 0
+    _message_seq_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False, compare=False
+    )
 
     def reset_per_turn(self) -> None:
-        """每轮执行前重置 per-turn 字段（messages 保留）"""
+        """每轮执行前重置 per-turn 字段（messages / 运行时状态保留）"""
         logger.debug("[Session] reset_per_turn: session=%s", self.session_id)
         self.task = ""
         self.is_running = False
@@ -91,17 +109,18 @@ class Session:
         self.plan_invalid = False
         self.awaiting_intervention = False
 
+    def next_message_id(self) -> str:
+        """生成递增消息序号（线程安全）"""
+        with self._message_seq_lock:
+            self._message_seq += 1
+            return f"msg-{self._message_seq:05d}"
+
     # ----------------------------------------------------------
     # 并发守卫（每会话一次一个 turn）
     # ----------------------------------------------------------
 
     def acquire_run(self) -> bool:
-        """原子地检查并占用 turn 执行权。
-
-        Returns:
-            True=占用成功（之前 is_running=False，现已置 True）；
-            False=已有 turn 在跑。
-        """
+        """原子地检查并占用 turn 执行权。"""
         with self._is_running_lock:
             if self.is_running:
                 return False

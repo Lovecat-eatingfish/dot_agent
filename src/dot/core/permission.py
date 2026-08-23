@@ -203,13 +203,12 @@ class PermissionManager:
         args: dict[str, Any],
         *,
         agent_mode: str = "auto",
-        workspace: Path | None = None,
         approved: bool = False,
     ) -> PermissionDecision:
         """三级权限校验（approved=True 表示人工已确认，仅跳过模式层）"""
         span = self._start_span(tool_name, args, agent_mode)
         try:
-            decision = self._check_inner(tool_name, args, agent_mode, workspace, approved)
+            decision = self._check_inner(tool_name, args, agent_mode, approved)
         except Exception as exc:
             logger.warning("[permission] check error: %s", exc, exc_info=True)
             decision = PermissionDecision(Decision.ALLOW, "system", "check-internal-error-pass")
@@ -221,14 +220,13 @@ class PermissionManager:
         tool_name: str,
         args: dict[str, Any],
         agent_mode: str,
-        workspace: Path | None,
         approved: bool,
     ) -> PermissionDecision:
         # MCP / Skill / 元工具：本期不做权限校验（用户决策）
         if tool_name.startswith(("mcp_", "skill_")) or tool_name in ("mcp_search", "skill_search"):
             return PermissionDecision(Decision.ALLOW, "mode", "mcp/skill not gated this phase")
 
-        ws = workspace or self._workspace or Path.cwd()
+        ws = self._workspace or Path.cwd()
 
         # ---- 1. 系统内置黑名单（最高优先级，人工确认也不可放行）----
         if tool_name == "BashTool":

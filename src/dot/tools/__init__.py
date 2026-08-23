@@ -13,7 +13,6 @@ from typing import Any
 
 from langchain_core.tools import StructuredTool
 
-from ..core.runtime import RuntimeState
 from .bash_tool import bash_tool_description, run_bash, run_bash_read_only
 from .file_tools import edit_file, read_file, write_file
 from .glob_tool import glob_search
@@ -52,17 +51,17 @@ def is_tool_concurrency_safe(name: str) -> bool:
     return False
 
 
-def build_tools(state: RuntimeState) -> list[StructuredTool]:
+def build_tools(state: Any) -> list[StructuredTool]:
     """构建完整基础工具集（读 + 写）"""
     return _build_base_tools(state, read_only=False)
 
 
-def build_read_only_tools(state: RuntimeState) -> list[StructuredTool]:
+def build_read_only_tools(state: Any) -> list[StructuredTool]:
     """构建只读工具集（verifier 专用）"""
     return _build_base_tools(state, read_only=True)
 
 
-def _build_base_tools(state: RuntimeState, *, read_only: bool) -> list[StructuredTool]:
+def _build_base_tools(state: Any, *, read_only: bool) -> list[StructuredTool]:
     def _bash(command, timeout_seconds=None, run_in_background=False):
         if read_only:
             return run_bash_read_only(state, command, timeout_seconds, run_in_background)

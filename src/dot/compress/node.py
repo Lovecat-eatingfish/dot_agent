@@ -18,7 +18,7 @@ from langchain_core.messages import SystemMessage
 
 from ..core.hooks import HookEvent, HookPayload
 from ..core.log import get_logger
-from .budget import ContextBudgetAllocator
+from .budget import ContextBudgetAllocator, DEFAULT_CONTEXT_WINDOW
 from .l1_extract import extract_key_facts
 from .l2_summarize import summarize_window
 from .l3_semantic import semantic_compress
@@ -26,9 +26,6 @@ from .planner import CompressionPlanner
 from .state import CompressionState
 
 logger = get_logger(__name__)
-
-# 默认 context window（tokens）
-DEFAULT_CONTEXT_WINDOW = 128_000
 
 
 def context_compress_node(state: dict[str, Any]) -> dict[str, Any]:
@@ -38,6 +35,7 @@ def context_compress_node(state: dict[str, Any]) -> dict[str, Any]:
     直接替换 session.messages。触发前发 PreCompact Hook。
     """
     session = state["session"]
+    ctx = state.get("context")
     writer = _get_writer()
     messages = list(session.messages)
 
@@ -74,7 +72,8 @@ def context_compress_node(state: dict[str, Any]) -> dict[str, Any]:
     )
 
     # PreCompact Hook
-    _fire_precompact_hook(session, trigger="auto")
+    _fire_precompact_hook(session.session_id, session.workspace,
+                          getattr(ctx, "hook_runner", None) if ctx else None, trigger="auto")
 
     # 执行压缩
     compressed_messages = messages
@@ -160,18 +159,18 @@ def _inject_l1_facts(messages: list[Any], facts: str) -> list[Any]:
     return result
 
 
-def _fire_precompact_hook(session: Any, trigger: str) -> None:
+def _fire_precompact_hook(session_id: str, workspace: Path, hook_runner: Any, trigger: str) -> None:
     """触发 PreCompact Hook"""
-    if session.hook_runner is None:
+    if hook_runner is None:
         return
     try:
-        session.hook_runner.run(
+        hook_runner.run(
             HookEvent.PreCompact,
             HookPayload(
                 event=HookEvent.PreCompact,
                 compact_trigger=trigger,
-                session_id=session.session_id,
-                workspace=str(session.workspace),
+                session_id=session_id,
+                workspace=str(workspace),
             ),
         )
     except Exception as exc:

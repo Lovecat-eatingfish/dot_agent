@@ -38,28 +38,10 @@ DEFAULT_TIMEOUT_SECONDS = 120      # 单次命令默认超时（秒）
 DEFAULT_MAX_TIMEOUT_SECONDS = 600  # 最大允许超时（秒）
 DEFAULT_MAX_OUTPUT_CHARS = 6000    # 输出截断阈值（字符）
 
-# ========== 危险命令模式列表 ==========
-DANGEROUS_PATTERNS = [
-    r"\brm\s+(?:-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\b",  # Unix 递归强制删除（-rf/-fr/-rvf 等组合标志）
-    r"\brm\b(?=[^|;&]*\s-[a-zA-Z]*r)(?=[^|;&]*\s-[a-zA-Z]*f)",  # rm 分离标志 -r ... -f 任意顺序
-    r"\brm\b(?=[^|;&]*--recursive)(?=[^|;&]*--force)",   # rm --recursive ... --force 任意顺序
-    r"\bRemove-Item\b.*\b-Recurse\b.*\b-Force\b",       # PowerShell 递归删除
-    r"\b(?:del|rmdir)\s+/[sq]\b",                       # Windows 静默删除（含 rmdir /s /q）
-    r"\bformat\s+(?:[a-zA-Z]:|/q)",                     # 格式化磁盘（需盘符或 /q，避免误伤 --pretty=format:）
-    r"\bshutdown\b",                                     # 关机
-    r"\breboot\b",                                       # 重启
-    r"(?:^|[^0-9])>\s*(?:[A-Za-z]:\\|/(?!dev/null\b))", # 重定向到非 /dev/null
-    r"\bmkfs\b",                                         # 创建文件系统
-    r"\bdd\s+",                                          # 磁盘镜像写入
-    r"\bchmod\s+777\b",                                  # 全开权限
-    r"\bchown\b",                                        # 修改所有者
-    r"\bkill\s+-9\b",                                    # 强制杀进程
-    r"\bpkill\b",                                        # 按名杀进程
-    r"\biptables\b",                                     # 防火墙操作
-    r"(?:^|[;&|])\s*eval\s",                             # eval 执行
-    r"(?:^|[;&|])\s*exec\s",                             # exec 替换进程
-    r"\|\s*(?:ba|z|da|k)?sh\b",                          # pipe 到任意 shell（bash/zsh/dash/ksh）
-]
+# ========== 危险命令检测（委托给 security.py）============
+# 统一安全边界：危险命令检测在 security.py，不在工具实现里。
+# bash_tool.py 只负责执行，检测逻辑不重复。
+from ..core.security import looks_dangerous as _looks_dangerous_impl
 
 
 def _validate_bash_args(command: str, timeout_seconds: int | None = None) -> list[str]:
@@ -234,12 +216,7 @@ def _handle_workspace_query(state: Any, command: str) -> BashResult | None:
     }
 
 
-def _looks_dangerous(command: str) -> str | None:
-    """检查命令是否匹配危险模式"""
-    for pattern in DANGEROUS_PATTERNS:
-        if re.search(pattern, command, re.IGNORECASE):
-            return pattern
-    return None
+# _looks_dangerous 已移除：统一委托给 security.looks_dangerous
 
 
 def _decode_output(output: bytes | str | None) -> str:
@@ -296,7 +273,7 @@ def run_bash(
     if handled is not None:
         return handled
 
-    blocked = _looks_dangerous(normalized_command)
+    blocked = _looks_dangerous_impl(normalized_command)
     if blocked:
         return {"ok": False, "error": f"blocked potentially dangerous command pattern: {blocked}"}
 

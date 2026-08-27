@@ -36,7 +36,8 @@ class DisplayEvent(TypedDict, total=False):
     content: str
     plan: Any
     passed: bool
-    answer: str
+    summary: str  # final 事件：本次任务总结
+    answer: str   # final 事件：最终答复文本
     reason: str
     node: str
 
@@ -55,8 +56,9 @@ class SessionBridge:
             tui.render(ev)
     """
 
-    def __init__(self, host: AgentHost) -> None:
+    def __init__(self, host: AgentHost, config: "CLIConfig | None" = None) -> None:
         self.host = host
+        self.config = config  # CLIConfig 实例，供 slash 命令使用
         self._run_mode: str = "agent"
         # 输入历史（↑/↓ 回溯）
         self._history: list[str] = []
@@ -375,7 +377,8 @@ class SessionBridge:
                 continue
             if node_name == "finally_node":
                 answer = str(update.get("final_answer", ""))
-                return self._ev("final", answer=answer)
+                summary = str(update.get("summary", ""))
+                return self._ev("final", answer=answer, text=summary)
             if node_name == "human_intervene":
                 return self._ev("intervention", reason="replan_or_attempt_exhausted")
             # 其它节点：作为进度提示（去重由 TUI 处理）

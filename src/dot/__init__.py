@@ -32,7 +32,7 @@ from .graph.prompts import (
     get_plan_system_prompt,
     get_valid_system_prompt,
 )
-from .session import Session, SessionManager, SessionPersistence, persist_turn
+from .session import Session, SessionManager, SessionPersistence, persist_turn, TurnState, AgentContext
 from .tools.meta import build_tools_for_session
 from dot.host.agent_host import AgentHost
 from .trace import Tracer, get_tracer, init_tracer
@@ -43,6 +43,8 @@ __all__ = [
     "context_compress_node",
     # session
     "Session",
+    "TurnState",
+    "AgentContext",
     "SessionManager",
     "SessionPersistence",
     "persist_turn",

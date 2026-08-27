@@ -9,9 +9,12 @@
 - WARNING: 黄色
 - ERROR: 红色
 - CRITICAL: 紫红色
+
+REPL/TUI 场景使用 quiet=True（不写 stderr，由 SidebarLogHandler 统一捕获）。
 """
 from __future__ import annotations
 
+import io
 import logging
 import os
 import sys
@@ -31,6 +34,9 @@ class AnsiColor:
 load_dotenv()
 
 _initialized = False
+# REPL 静默模式时替换的 stderr 缓冲（供恢复用）
+_quiet_buffer: io.StringIO | None = None
+_old_stderr: object | None = None
 
 
 class ColoredFormatter(logging.Formatter):
@@ -45,7 +51,6 @@ class ColoredFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         color = self.LEVEL_COLORS.get(record.levelno, "")
         msg = super().format(record)
-        # 仅终端输出才加颜色；非TTY输出不输出ANSI码
         if sys.stderr.isatty():
             return f"{color}{msg}{AnsiColor.RESET}"
         return msg
@@ -55,8 +60,32 @@ def _env(name: str, legacy_name: str) -> str | None:
     return os.environ.get(name) or os.environ.get(legacy_name)
 
 
-def setup_logging(level: str | None = None) -> None:
-    """初始化日志配置，输出到 stderr，带控制台彩色（纯标准库）"""
+def enter_quiet_mode() -> None:
+    """切换到静默模式：stderr 重定向到缓冲区（REPL 启动前调用）"""
+    global _quiet_buffer, _old_stderr
+    if _quiet_buffer is not None:
+        return
+    _old_stderr = sys.stderr
+    _quiet_buffer = io.StringIO()
+    sys.stderr = _quiet_buffer
+
+
+def exit_quiet_mode() -> None:
+    """恢复 stderr（REPL 退出时调用）"""
+    global _quiet_buffer, _old_stderr
+    if _quiet_buffer is None:
+        return
+    sys.stderr = _old_stderr
+    _quiet_buffer = None
+    _old_stderr = None
+
+
+def setup_logging(level: str | None = None, quiet: bool = False) -> None:
+    """初始化日志配置
+
+    Args:
+        quiet: True 时 stderr 重定向到缓冲区（REPL/TUI 使用）；False 时输出到终端。
+    """
     global _initialized
     if _initialized:
         return
@@ -64,6 +93,10 @@ def setup_logging(level: str | None = None) -> None:
 
     resolved = (level or _env("DOT_LOG_LEVEL", "MOKIO_LOG_LEVEL") or "DEBUG").upper()
     log_level = getattr(logging, resolved, logging.DEBUG)
+
+    # 静默模式：捕获所有日志但不污染终端
+    if quiet:
+        enter_quiet_mode()
 
     fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     datefmt = "%H:%M:%S"

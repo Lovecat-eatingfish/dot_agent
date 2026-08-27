@@ -313,19 +313,13 @@ def persist_turn(session: Any, turn_id: int) -> None:
         tags={"turn_id": turn_id, "messages": len(full_messages)},
     )
 
-    # 全量 session.json
+    # 全量 session.json（使用 session.to_snapshot() 获取基础数据）
+    snapshot = session.to_snapshot()
     meta = {
-        "session_id": session_id,
+        **snapshot,
         "created_at": _read_created_at(persistence, session_id),
-        "updated_at": utc_now(),
         "current_turn_id": turn_id,
-        "task": session.task,
-        "workspace": str(session.workspace),
         "messages": serialize_messages(full_messages),
-        "replan_count": session.replan_count,
-        "attempt_count": session.attempt_count,
-        "awaiting_intervention": session.awaiting_intervention,
-        "run_mode": getattr(session, "run_mode", "agent"),
     }
     # 持久化压缩状态
     cs = getattr(session, "compression_state", None)
@@ -362,17 +356,18 @@ def _read_created_at(persistence: SessionPersistence, session_id: str) -> str:
 
 def _session_to_state(session: Any) -> dict[str, Any]:
     """从 Session 对象提取 graph state dict（用于快照）"""
+    snapshot = session.to_snapshot()
     state = {
-        "task": session.task,
-        "task_plan": session.task_plan,
-        "replan_count": session.replan_count,
-        "attempt_count": session.attempt_count,
-        "validate_result": session.validate_result,
-        "need_human_intervene": session.need_human_intervene,
-        "resume_action": session.resume_action,
-        "plan_invalid": session.plan_invalid,
-        "awaiting_intervention": bool(getattr(session, "awaiting_intervention", False)),
-        "run_mode": getattr(session, "run_mode", "agent"),
+        "task": snapshot.get("task", ""),
+        "task_plan": session.get_plan(),
+        "replan_count": snapshot.get("replan_count", 0),
+        "attempt_count": snapshot.get("attempt_count", 0),
+        "validate_result": session.get_validate_result(),
+        "need_human_intervene": session.need_human_intervene(),
+        "resume_action": session.get_resume_action() if session.get_resume_action() in ("continue", "stop") else "",
+        "plan_invalid": session.is_plan_invalid(),
+        "awaiting_intervention": snapshot.get("awaiting_intervention", False),
+        "run_mode": snapshot.get("run_mode", "agent"),
     }
     # 持久化压缩状态
     cs = getattr(session, "compression_state", None)

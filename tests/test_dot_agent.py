@@ -11,6 +11,8 @@ from pathlib import Path
 import pytest
 
 import dot.graph.coding_graph as cg
+import dot.graph.helpers as gh
+import dot.core.llm as llm_module
 from dot.host.agent_host import AgentHost
 from dot.core.runtime import RuntimeState
 from dot.tools.meta import build_tools_for_session, dispatch_special_tool
@@ -22,11 +24,11 @@ from dot.tools.meta import build_tools_for_session, dispatch_special_tool
 
 @pytest.fixture()
 def no_llm(monkeypatch):
-    """把 coding_graph 的 create_model 替换为抛异常的 fake（不触网）"""
+    """把 core.llm 的 create_model 替换为抛异常的 fake（不触网）"""
     def fake_model():
         raise RuntimeError("no llm in test")
 
-    monkeypatch.setattr(cg, "create_model", fake_model)
+    monkeypatch.setattr(llm_module, "create_model", fake_model)
     return fake_model
 
 
@@ -78,8 +80,8 @@ class TestCustomIntervention:
         assert final, "finally_node should emit final_answer"
 
         session = env.get_or_create_session()
-        assert session.awaiting_intervention is True
-        assert session.replan_count >= session.replan_max
+        assert session.turn.awaiting_intervention is True
+        assert session.turn.replan_count >= session.replan_max
         assert session.current_turn_id == 1
 
         # 持久化校验（finally 节点内完成）
@@ -102,7 +104,7 @@ class TestCustomIntervention:
         for _ in env.resume_intervention("stop"):
             pass
 
-        assert session.awaiting_intervention is False
+        assert session.turn.awaiting_intervention is False
         assert session.current_turn_id == before
         assert env.has_pending_intervention(sid) is False
 
@@ -119,7 +121,7 @@ class TestCustomIntervention:
                     final = update.get("final_answer", "")
 
         assert session.current_turn_id == 2
-        assert session.awaiting_intervention is True  # 无 LLM 再次介入
+        assert session.turn.awaiting_intervention is True  # 无 LLM 再次介入
         assert final
 
     def test_intervention_survives_process_restart(self, env):
@@ -188,7 +190,7 @@ class TestTurnState:
     def test_task_survives_reset(self, env):
         """回归：reset_per_turn 在 append 之后执行会把 task 清空"""
         _run(env, "my important task")
-        assert env.get_or_create_session().task == "my important task"
+        assert env.get_or_create_session().turn.task == "my important task"
 
     def test_no_empty_session_id_dir(self, env):
         """回归：旧版 session_id='' 会创建空目录 session"""
@@ -242,14 +244,14 @@ class TestAgentModes:
         """fix-权限控制.md：plan 也注册写工具，写操作由权限层 ASK 拦截"""
         session = env.get_or_create_session()
         env.session_manager.apply_runtime_config(session, agent_mode="plan")
-        names = {t.name for t in build_tools_for_session(session)}
+        names = {t.name for t in build_tools_for_session(session, env.context)}
         assert {"FileWriteTool", "FileEditTool", "FileReadTool", "BashTool"} <= names
         assert "skill_search" in names
 
     def test_auto_mode_full_tools(self, env):
         session = env.get_or_create_session()
         env.session_manager.apply_runtime_config(session, agent_mode="auto")
-        names = {t.name for t in build_tools_for_session(session)}
+        names = {t.name for t in build_tools_for_session(session, env.context)}
         assert {"FileWriteTool", "FileEditTool", "FileReadTool", "BashTool"} <= names
 
 
@@ -399,7 +401,7 @@ class TestPermissionManager:
 
         session = Session(session_id="perm-test", workspace=pm._workspace)
         runtime = RuntimeState(workspace=pm._workspace, agent_mode="plan")
-        msg = cg._run_tool_call(session, runtime, [], {"name": "BashTool", "args": {"command": "echo hi"}, "id": "c1"}, lambda e: None, prefix="t")
+        msg = gh.run_tool_call(session, runtime, [], {"name": "BashTool", "args": {"command": "echo hi"}, "id": "c1"}, lambda e: None, prefix="t")
         assert "运行模式" in msg.content or "模式" in msg.content
 
     def test_run_tool_call_ask_rejected(self, pm):
@@ -409,7 +411,7 @@ class TestPermissionManager:
         pm.set_approval_handler(lambda info: False)
         session = Session(session_id="perm-test2", workspace=pm._workspace)
         runtime = RuntimeState(workspace=pm._workspace, agent_mode="plan")
-        msg = cg._run_tool_call(
+        msg = gh.run_tool_call(
             session, runtime, [],
             {"name": "FileWriteTool", "args": {"file_path": "src/a.py", "content": "x"}, "id": "c2"},
             lambda e: None, prefix="t",
@@ -424,7 +426,7 @@ class TestPermissionManager:
         pm.set_approval_handler(lambda info: True)
         session = Session(session_id="perm-test3", workspace=pm._workspace)
         runtime = RuntimeState(workspace=pm._workspace, agent_mode="plan")
-        msg = cg._run_tool_call(
+        msg = gh.run_tool_call(
             session, runtime, [],
             {"name": "NoSuchTool", "args": {}, "id": "c3"},
             lambda e: None, prefix="t",
@@ -446,28 +448,29 @@ class TestProgressiveDisclosure:
             "---\nname: demo\ndescription: a demo skill\n---\nDo the demo thing.",
             encoding="utf-8",
         )
-        # 重建 session 让 host 重新扫描
+        # 重新发现 skill（skill_host 在 AgentHost 初始化时已扫描过）
         env.session_manager.destroy_session()
+        env.context.skill_host.discover_skills()
         session = env.get_or_create_session()
 
-        assert "skill_demo" in session.skill_host.get_all_skill_names()
-        assert "skill_demo" in session.skill_host.get_catalog_text()
+        assert "skill_demo" in env.context.skill_host.get_all_skill_names()
+        assert "skill_demo" in env.context.skill_host.get_catalog_text()
 
-        msg = dispatch_special_tool(session, {"name": "skill_demo", "args": {}, "id": "c1"})
+        msg = dispatch_special_tool(session, env.context, {"name": "skill_demo", "args": {}, "id": "c1"})
         assert msg is not None
         assert "Do the demo thing" in msg.content
 
     def test_mcp_dispatch_unknown_tool(self, env):
         """mcp_ 前缀未知工具 → 返回错误 + 可用目录提示"""
         session = env.get_or_create_session()
-        msg = dispatch_special_tool(session, {"name": "mcp_nope_missing", "args": {}, "id": "c2"})
+        msg = dispatch_special_tool(session, env.context, {"name": "mcp_nope_missing", "args": {}, "id": "c2"})
         assert msg is not None
         assert "unknown mcp tool" in msg.content
 
     def test_system_tool_not_intercepted(self, env):
         """系统工具（无前缀）不被特殊分发拦截"""
         session = env.get_or_create_session()
-        msg = dispatch_special_tool(session, {"name": "FileReadTool", "args": {}, "id": "c3"})
+        msg = dispatch_special_tool(session, env.context, {"name": "FileReadTool", "args": {}, "id": "c3"})
         assert msg is None
 
 
@@ -500,7 +503,7 @@ class TestToolGuards:
     def test_dangerous_command_blocked(self, tmp_path):
         from dot.tools import build_tools
 
-        state = RuntimeState(workspace=tmp_path, approval_mode="auto")
+        state = RuntimeState(workspace=tmp_path)
         tools = {t.name: t for t in build_tools(state)}
         result = tools["BashTool"].invoke({"command": "rm -rf /"})
         assert result["ok"] is False

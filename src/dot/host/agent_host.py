@@ -1,43 +1,42 @@
 """
-AgentHost — Agent 统一入口（对齐 doc/fix.md）
+AgentHost — Agent 进程入口
 
-初始化全局组件并对外提供统一调用面：
-  - SessionManager（内含 SessionPersistence 编排）
-  - MCP host（启动时与 server 建连，拉取全部工具列表缓存）
-  - Skill host（启动时扫描 .dot/skills 加载全部 skill 元数据）
-  - HookRunner（启动时加载 .dot/hooks.json 全部 hook）
-  - 审批引擎（预留位置：Session.authorizer + 工具调用前后挂点）
+一个 Agent 进程 = 一个工作空间 = 一组进程级组件 + 一个 Session。
 
-控制台 / 未来的 CLI / TUI 都通过 AgentHost 驱动 agent，
-不直接触碰 SessionManager 内部。
+进程级组件（AgentContext）：
+  - MCP host（外部工具连接）
+  - Skill host（Skill 发现与加载）
+  - Hook runner（生命周期 Hook）
+  - Permission manager（三级权限管控）
+  - Tracer（链路追踪）
+  - compiled graph（LangGraph 编译产物）
+
+Session 只持有会话状态（消息、turn 状态、压缩状态、持久化），
+不持有进程级组件引用。
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
-from dot.core.log import get_logger
-from dot.constant.session import session_dir
-from dot.session.manager import SessionManager
+from ..core.log import get_logger
+from ..constant.session import session_dir
+from ..session.agent_context import AgentContext
+from ..session.manager import SessionManager
+from .context_builder import ContextBuilder
 
 logger = get_logger(__name__)
 
 
 class AgentHost:
-    """Agent 统一入口
+    """Agent 进程入口
 
     使用方式：
         host = AgentHost(workspace=Path.cwd())
         for chunk in host.run("写一个快速排序"):
             ...
-        # 人工介入后恢复
         for chunk in host.resume_intervention("continue"):
             ...
-
-        trace: 跟着session走，每个turn都有一个span，span之间有parent关系
-        session的state跟着session走
-        mcp ，skill，hook，权限控制 这些都是各个对话共享的
-        一个workspace 的所有会话共享一个workspace，mcp ，skill，hook，权限控制 这些都是各个对话共享的
     """
 
     def __init__(
@@ -45,35 +44,19 @@ class AgentHost:
         workspace: Path | None = None,
         sessions_root: Path | str | None = None,
     ) -> None:
-        """
-        初始化 AgentHost，加载全局组件并准备会话管理。
-        链路追踪，权限管控， mcp ，skill， hook，审批引擎
-
-        :param workspace: 工作空间目录，默认当前工作目录
-        :param sessions_root: 会话根目录，默认 <workspace>/.dot/sessions/
-        """
         self.workspace = workspace or Path.cwd()
+        # session root 路径
         root = Path(sessions_root) if sessions_root else (self.workspace / session_dir)
 
-        # 链路追踪初始化（DOT_TRACE_ENABLED=0 关闭；落盘 <workspace>/.dot/traces/）
-        from dot.trace import init_tracer
+        # 构建进程级组件容器（使用 ContextBuilder）
+        builder = ContextBuilder(self.workspace)
+        self.context = builder.build()
 
-        init_tracer(self.workspace)
-
-        # 权限系统初始化：加载 .agent-security.json + 默认控制台 Y/N 审批
-        from dot.core.permission import get_permission_manager, make_console_approval_handler
-
-        pm = get_permission_manager()
-        pm.load_project(self.workspace)
-        pm.set_approval_handler(make_console_approval_handler())
-
-        # 共享设施（per-workspace，单份，全会话复用：MCP/Skill/Hook/compiled_graph）
-        from dot.host.shared_services import SharedServices
-
-        self.shared = SharedServices(self.workspace)
-
+        # 会话管理器（单会话）
         self.session_manager = SessionManager(
-            sessions_root=root, workspace=self.workspace, shared=self.shared
+            sessions_root=root,
+            workspace=self.workspace,
+            context=self.context,
         )
         logger.info("[AgentHost] initialized, workspace=%s, sessions_root=%s", self.workspace, root)
 
@@ -91,7 +74,7 @@ class AgentHost:
     # ============================================================
 
     def get_or_create_session(self, session_id: str | None = None):
-        """获取/恢复/创建会话（三级优先级）"""
+        """获取/恢复/创建会话"""
         return self.session_manager.get_or_create(session_id)
 
     def new_session(self):
@@ -99,7 +82,7 @@ class AgentHost:
         return self.session_manager.new_session()
 
     def switch_session(self, session_id: str):
-        """切换活跃会话（不关闭其他）"""
+        """切换活跃会话"""
         return self.session_manager.switch_to(session_id)
 
     def list_sessions(self) -> list[dict[str, Any]]:
@@ -145,19 +128,19 @@ class AgentHost:
         )
 
     def has_pending_intervention(self, session_id: str | None = None) -> bool:
-        """是否有未处理的人工介入（含跨进程恢复场景）"""
+        """是否有未处理的人工介入"""
         return self.session_manager.has_pending_intervention(session_id)
 
     # ============================================================
-    # CLI 桥接扩展（CLI ↔ Agent Graph 适配面，仅调度，不实现业务）
+    # CLI 桥接扩展
     # ============================================================
 
     def request_cancel(self, session_id: str | None = None) -> bool:
-        """中断当前 turn（Ctrl+C 入口），委托 SessionManager 取消令牌"""
+        """中断当前 turn（Ctrl+C 入口）"""
         return self.session_manager.request_cancel(session_id)
 
     def set_run_mode(self, mode: str, session_id: str | None = None) -> None:
-        """设置 CLI 运行模式（agent/chat/code），写入 session.run_mode，下一轮热生效"""
+        """设置 CLI 运行模式"""
         session = self.session_manager.get_or_create(session_id)
         if session is not None:
             session.run_mode = mode
@@ -171,13 +154,12 @@ class AgentHost:
             return "agent"
 
     def get_token_status(self, session_id: str | None = None) -> dict[str, Any]:
-        """读取当前 Token 水位与压缩统计（供 TUI 状态栏展示，只读）"""
+        """读取当前 Token 水位与压缩统计"""
         session = self.session_manager.get_session(session_id)
         if session is None:
             return {}
         try:
             from ..compress.budget import ContextBudgetAllocator
-
             budget = ContextBudgetAllocator()
             current = budget.estimate_tokens(list(session.messages))
             info = budget.get_budget_info()
@@ -199,14 +181,14 @@ class AgentHost:
             return {"message_count": len(session.messages) if session else 0}
 
     def get_mcp_status(self) -> dict[str, Any]:
-        """读取 MCP 连接状态（供 TUI 状态栏 / /mcp list，只读）"""
-        host = self.shared.mcp_host
+        """读取 MCP 连接状态"""
+        host = self.context.mcp_host
         if host is None:
             return {"online": False, "servers": [], "tools": []}
         try:
             tools = host.get_all_tool_names()
             servers = []
-            mgr = getattr(self.shared, "mcp_manager", None)
+            mgr = self.context.mcp_manager
             if mgr is not None:
                 servers = mgr.list_servers()
             return {"online": len(tools) > 0, "servers": servers, "tools": tools}
@@ -215,29 +197,48 @@ class AgentHost:
             return {"online": False, "servers": [], "tools": []}
 
     def restart_mcp(self) -> dict[str, Any]:
-        """重启 MCP（/mcp restart）：断开重连 + 重新发现工具，不销毁当前会话"""
+        """重启 MCP"""
         try:
-            self.shared.mcp_host.close()
+            self.context.mcp_host.close()
         except Exception as exc:
             logger.debug("[AgentHost] restart_mcp close: %s", exc)
         try:
-            self.shared.mcp_manager.load_config_and_connect(force=True)
-            self.shared.mcp_host.discover_tools()
+            self.context.mcp_manager.load_config_and_connect(force=True)
+            self.context.mcp_host.discover_tools()
         except Exception as exc:
             logger.warning("[AgentHost] restart_mcp reconnect failed: %s", exc)
         return self.get_mcp_status()
 
     def save_current_session(self, name: str | None = None) -> str:
-        """保存当前会话（/save）：触发一次 session.json 全量落盘"""
+        """保存当前会话"""
         session = self.session_manager.get_session()
         if session is None:
             raise RuntimeError("No active session to save")
         if session.persistence is not None:
             from ..session.persistence import persist_turn
-
             persist_turn(session, session.current_turn_id or 1)
         return session.session_id
 
     def load_session_by_name(self, name: str):
-        """加载历史会话（/load）"""
+        """加载历史会话"""
         return self.session_manager.get_or_create(name)
+
+    # ============================================================
+    # 审批配置（由 UI 层调用）
+    # ============================================================
+
+    def set_approval_handler(self, handler: Callable[[dict[str, Any]], bool] | None) -> None:
+        """设置 ASK 审批回调（UI 层根据交互模式决定使用哪个 handler）
+
+        - 控制台/TUI: 传入 console approval handler
+        - 非交互 (run): 传 None，ASK 自动降级 DENY
+        """
+        if self.context.permission_manager is not None:
+            self.context.permission_manager.set_approval_handler(handler)
+
+    def close(self) -> None:
+        """关闭进程级组件"""
+        try:
+            self.context.mcp_host.close()
+        except Exception as exc:
+            logger.debug("[AgentHost] close mcp: %s", exc)

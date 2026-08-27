@@ -126,6 +126,34 @@ def _cmd_exit(bridge: "SessionBridge", args: str) -> SlashResult:
     return SlashResult(kind="quit")
 
 
+def _cmd_config(bridge: "SessionBridge", args: str) -> SlashResult:
+    """查看/修改运行时配置"""
+    parts = args.strip().split(None, 2)
+    config = getattr(bridge, "config", None)
+    if config is None:
+        return SlashResult(kind="toast", level="error", text="配置未加载")
+
+    if not parts:
+        # /config — 显示全部配置
+        masked = config.masked()
+        lines = ["[config]"]
+        for k, v in masked.items():
+            lines.append(f"  {k}: {v}")
+        return SlashResult(kind="message", text="\n".join(lines))
+
+    if parts[0] == "set" and len(parts) >= 3:
+        # /config set key value
+        key = parts[1]
+        value = parts[2]
+        config.set(key, value)
+        return SlashResult(kind="toast", level="info", text=f"已设置 {key} = {value}（下轮生效）")
+
+    return SlashResult(
+        kind="toast", level="error",
+        text=f"用法: /config 或 /config set key value",
+    )
+
+
 # ============================================================
 # 命令注册表
 # ============================================================
@@ -134,6 +162,7 @@ _COMMANDS: list[SlashCommand] = [
     SlashCommand("help", "/help", "展示全部快捷键、斜杠命令帮助", _cmd_help),
     SlashCommand("clear", "/clear", "清空聊天界面 UI，保留内存会话数据", _cmd_clear),
     SlashCommand("reset", "/reset", "重建全新 Session，清空消息/归档/压缩状态", _cmd_reset),
+    SlashCommand("config", "/config [set key value]", "查看/修改运行时配置", _cmd_config),
     SlashCommand("mode", "/mode [agent|chat|code]", "查看/切换运行模式", _cmd_mode),
     SlashCommand("compact", "/compact force|status", "手动强制压缩 / 查看压缩状态", _cmd_compact),
     SlashCommand("workspace", "/workspace [path]", "查看/切换工作目录", _cmd_workspace),
@@ -217,3 +246,20 @@ def build_help_text() -> str:
     for c in _COMMANDS:
         lines.append(f"  {c.usage:<28} {c.description}")
     return "\n".join(lines)
+
+
+def render_for_repl(result: "SlashResult") -> str:
+    """把 SlashResult 转成 ANSI 字符串，供 DotREPL 主栏渲染"""
+    from .renderer import RichRenderer
+
+    renderer = RichRenderer(width=100)
+    kind = result.kind
+    text = result.text or ""
+    if kind == "message":
+        return renderer.render_markdown(text)
+    if kind == "toast":
+        style = "bold red" if result.level == "error" else "bold yellow" if result.level == "warn" else "bold cyan"
+        return renderer.render_text(text, style=style)
+    if kind == "clear_screen":
+        return ""
+    return ""

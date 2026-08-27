@@ -1,0 +1,36 @@
+# 内置 Provider/Model 目录
+# 用户可放 ~/.dot/catalog.toml 覆盖或添加自定义 Provider
+
+[providers.openai]
+type = "openai"
+base_url = "https://api.openai.com/v1"
+
+[providers.openai.models.gpt-4o]
+context_window = 128000
+max_output = 16384
+
+[providers.openai.models.gpt-4o-mini]
+context_window = 128000
+max_output = 16384
+
+[providers.openai.models.o3-mini]
+context_window = 200000
+max_output = 100000
+supports_thinking = true
+
+[providers.anthropic]
+type = "anthropic"
+base_url = "https://api.anthropic.com"
+
+[providers.anthropic.models.claude-sonnet-4-20250514]
+context_window = 200000
+max_output = 8192
+supports_thinking = true
+
+[providers.anthropic.models.claude-haiku-4-5-20251001]
+context_window = 200000
+max_output = 8192
+
+[providers.openrouter]
+type = "openai-compatible"
+base_url = "https://openrouter.ai/api/v1"

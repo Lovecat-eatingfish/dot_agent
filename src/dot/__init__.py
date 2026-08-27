@@ -1,72 +1,82 @@
 """
-dot — 新一代 Coding Agent 核心模块（独立实现，不依赖 mokioclaw）
+dot — Coding Agent 三层架构
 
 包结构：
-  core/     基础设施（日志 / LLM / hooks / 审批 / 路径安全 / 预算 / 运行时）
-  tools/    基础工具（file / bash / glob / grep）+ 渐进披露元工具
-  mcp/      MCP 协议栈 + 渐进披露
-  skills/   Skill 发现与渐进披露
-  session/  会话域（Session / 持久化 / SessionManager，自定义介入与回滚）
-  graph/    LangGraph 图编排 + 节点提示词
+  dot.ai      Provider 抽象层（LLM 调用、流式响应、配置目录）
+  dot.agent   Agent 核心（消息循环、工具系统、事件流）
+  dot.coding  Coding 应用层（CLI、扩展、MCP、Skills、会话管理）
 
-设计原则（doc/architecture-design.md）：
-  - Session IS State：节点通过 state["session"] 直接读写，无独立 state dict
-  - 消息手动管理：session.messages.append() / session.messages = compressed_list
-  - 单会话 SessionManager：get_or_create 三级优先级
-  - 自定义人工介入：不依赖 langgraph interrupt/checkpoint，靠 session.json 持久化状态
+设计原则：
+  - 三层严格单向依赖：coding → agent → ai
+  - 零 langchain/langgraph/chromadb 依赖
+  - AgentTool frozen dataclass + callable（零继承）
+  - 双循环架构：外层 workflow + 内层 agent loop
+  - 三层事件系统：ProviderEvent → AgentEvent → CodingEvent
 """
 from __future__ import annotations
 
-from .compress import CompressionState, context_compress_node
-from .core import (
-    HookEvent,
-    HookPayload,
-    HookResult,
-    HookRunner,
-    create_model,
-    execute_tool_by_name,
+# Layer 1: Provider 抽象
+from .ai import (
+    ModelProvider,
+    ProviderEvent,
+    canonicalize_provider_stream,
+    ProviderCatalog,
+    estimate_context_tokens,
 )
-from .graph import DotAgentState, build_graph, compile_graph
-from .graph.prompts import (
-    get_coding_system_prompt,
-    get_plan_system_prompt,
-    get_valid_system_prompt,
+
+# Layer 2: Agent 核心
+from .agent import (
+    AgentTool,
+    AgentToolResult,
+    AgentEvent,
+    AgentHarness,
+    run_agent_loop,
+    AgentLoopResult,
+    execute_tool_safely,
+    repair_tool_history,
 )
-from .session import Session, SessionManager, SessionPersistence, persist_turn, TurnState, AgentContext
-from .tools.meta import build_tools_for_session
-from dot.host.agent_host import AgentHost
-from .trace import Tracer, get_tracer, init_tracer
+
+# Layer 3: Coding 应用
+from .coding import (
+    run_workflow,
+    WorkflowPhase,
+    WorkflowContext,
+    ValidationResult,
+    PermissionManager,
+    get_permission_manager,
+    AgentMode,
+    CommandRegistry,
+    get_command_registry,
+    SlashResult,
+    CodingHost,
+)
 
 __all__ = [
-    # compress
-    "CompressionState",
-    "context_compress_node",
-    # session
-    "Session",
-    "TurnState",
-    "AgentContext",
-    "SessionManager",
-    "SessionPersistence",
-    "persist_turn",
-    # graph
-    "DotAgentState",
-    "build_graph",
-    "compile_graph",
-    "get_plan_system_prompt",
-    "get_coding_system_prompt",
-    "get_valid_system_prompt",
-    # core
-    "HookEvent",
-    "HookPayload",
-    "HookResult",
-    "HookRunner",
-    "create_model",
-    "execute_tool_by_name",
-    # tools
-    "build_tools_for_session",
-    "AgentHost",
-    # trace
-    "Tracer",
-    "get_tracer",
-    "init_tracer",
+    # ai
+    "ModelProvider",
+    "ProviderEvent",
+    "canonicalize_provider_stream",
+    "ProviderCatalog",
+    "estimate_context_tokens",
+    # agent
+    "AgentTool",
+    "AgentToolResult",
+    "AgentEvent",
+    "AgentHarness",
+    "run_agent_loop",
+    "AgentLoopResult",
+    "execute_tool_safely",
+    "repair_tool_history",
+    # coding
+    "run_workflow",
+    "WorkflowPhase",
+    "WorkflowContext",
+    "ValidationResult",
+    "PermissionManager",
+    "get_permission_manager",
+    "AgentMode",
+    "CommandRegistry",
+    "get_command_registry",
+    "SlashResult",
+    "CodingHost",
 ]

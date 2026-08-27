@@ -15,3 +15,12 @@ docs/
 .doc/
 /src/mokioclaw/
 /pi_src/
+.idea/
+.specify/
+specs/
+doc/
+todo/
+PROJECT_SUMMARY.md
+package.json
+package-lock.json
+python

@@ -22,12 +22,16 @@ agent 工作模式（fix.md）：
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import ToolMessage
 from langchain_core.tools import StructuredTool
 
 from ..core.log import get_logger
+
+if TYPE_CHECKING:
+    from ..core.tool_context import ToolContext
+    from ..session.agent_context import AgentContext
 
 logger = get_logger(__name__)
 
@@ -36,9 +40,9 @@ logger = get_logger(__name__)
 # 元工具构建
 # ============================================================
 
-def build_mcp_search_tool(session: Any) -> StructuredTool | None:
-    """构建 mcp_search 元工具（session.mcp_host 为 None 时返回 None）"""
-    host = getattr(session, "mcp_host", None)
+def build_mcp_search_tool(session: ToolContext, ctx: AgentContext | None = None) -> StructuredTool | None:
+    """构建 mcp_search 元工具（ctx.mcp_host 为 None 时返回 None）"""
+    host = ctx.mcp_host if ctx else None
     if host is None:
         return None
 
@@ -46,7 +50,7 @@ def build_mcp_search_tool(session: Any) -> StructuredTool | None:
         """搜索 MCP 工具：无参数返回目录；带 tool_name 返回完整定义并加载"""
         try:
             if not tool_name:
-                loaded = set(session.loaded_mcp_tools)
+                loaded = set(ctx.loaded_mcp_tools)
                 tools = []
                 for name in host.get_all_tool_names():
                     schema = host._schema_cache.get(name, {})
@@ -61,8 +65,8 @@ def build_mcp_search_tool(session: Any) -> StructuredTool | None:
                 schema = host.load_tool_schema(tool_name)
             except ValueError as exc:
                 return {"ok": False, "error": str(exc)}
-            if tool_name not in session.loaded_mcp_tools:
-                session.loaded_mcp_tools[tool_name] = _make_mcp_callable(session, tool_name)
+            if tool_name not in ctx.loaded_mcp_tools:
+                ctx.loaded_mcp_tools[tool_name] = _make_mcp_callable(session, ctx, tool_name)
             return {
                 "ok": True,
                 "tool_name": tool_name,
@@ -84,9 +88,9 @@ def build_mcp_search_tool(session: Any) -> StructuredTool | None:
     )
 
 
-def build_skill_search_tool(session: Any) -> StructuredTool | None:
-    """构建 skill_search 元工具（session.skill_host 为 None 时返回 None）"""
-    host = getattr(session, "skill_host", None)
+def build_skill_search_tool(session: ToolContext, ctx: AgentContext | None = None) -> StructuredTool | None:
+    """构建 skill_search 元工具（ctx.skill_host 为 None 时返回 None）"""
+    host = getattr(ctx, "skill_host", None) if ctx else getattr(session, "skill_host", None)
     if host is None:
         return None
 
@@ -103,9 +107,9 @@ def build_skill_search_tool(session: Any) -> StructuredTool | None:
             if result.get("ok"):
                 key = result.get("skill_name", "")
                 content = result.get("content", "")
-                if key and key not in session.loaded_skills:
-                    session.loaded_skills.add(key)
-                    session.active_skill_content += (
+                if key and key not in ctx.loaded_skills:
+                    ctx.loaded_skills.add(key)
+                    ctx.active_skill_content += (
                         f"\n\n--- Skill: {key} ---\n{content}\n--- End of {key} ---\n"
                     )
             return result
@@ -126,7 +130,7 @@ def build_skill_search_tool(session: Any) -> StructuredTool | None:
 # 特殊分发（mcp_ / skill_ 前缀）
 # ============================================================
 
-def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | None:
+def dispatch_special_tool(session: ToolContext, ctx: AgentContext, call: dict[str, Any]) -> ToolMessage | None:
     """渐进披露特殊分发（对齐 fix.md 的执行规则）
 
     Returns:
@@ -145,10 +149,10 @@ def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | N
 
     # mcp_ 前缀（元工具本身除外）
     if name.startswith("mcp_") and name != "mcp_search":
-        host = getattr(session, "mcp_host", None)
+        host = ctx.mcp_host if ctx else None
         if host is None:
             return None
-        if name in session.loaded_mcp_tools:
+        if name in ctx.loaded_mcp_tools:
             return None
         # 未加载：返回工具定义（不报错），模型看到定义后按 schema 重新调用
         schema = host._schema_cache.get(name)
@@ -160,7 +164,7 @@ def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | N
                 "available": available,
                 "hint": "先调用 mcp_search 查看工具目录",
             })
-        session.loaded_mcp_tools[name] = _make_mcp_callable(session, name)
+        ctx.loaded_mcp_tools[name] = _make_mcp_callable(session, ctx, name)
         return _tm({
             "ok": True,
             "tool_name": name,
@@ -171,16 +175,16 @@ def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | N
 
     # skill_ 前缀（元工具本身除外）：返回 skill 完整内容
     if name.startswith("skill_") and name != "skill_search":
-        host = getattr(session, "skill_host", None)
+        host = ctx.skill_host if ctx else None
         if host is None:
             return None
         result = host.invoke_skill(name)
         if result.get("ok"):
             key = result.get("skill_name", "")
             content = result.get("content", "")
-            if key and key not in session.loaded_skills:
-                session.loaded_skills.add(key)
-                session.active_skill_content += (
+            if key and key not in ctx.loaded_skills:
+                ctx.loaded_skills.add(key)
+                ctx.active_skill_content += (
                     f"\n\n--- Skill: {key} ---\n{content}\n--- End of {key} ---\n"
                 )
         return _tm(result)
@@ -188,7 +192,7 @@ def dispatch_special_tool(session: Any, call: dict[str, Any]) -> ToolMessage | N
     return None
 
 
-def _make_mcp_callable(session: Any, tool_name: str) -> StructuredTool:
+def _make_mcp_callable(session: ToolContext, ctx: AgentContext, tool_name: str) -> StructuredTool:
     """为已加载的 mcp_ 工具创建可调用包装（转发 MCPToolExecutor）
 
     关键：把 MCP 工具的 input_schema 传给 StructuredTool 的 args_schema，
@@ -196,16 +200,22 @@ def _make_mcp_callable(session: Any, tool_name: str) -> StructuredTool:
     """
     from ..mcp.host import MCPToolExecutor
 
-    host = session.mcp_host
+    host = ctx.mcp_host
     executor = MCPToolExecutor(host)
     schema = host._schema_cache.get(tool_name, {})
     desc = schema.get("description", "") or f"MCP tool {tool_name}"
     input_schema = schema.get("input_schema", {})
 
     def _invoke(**kwargs: Any) -> dict[str, Any]:
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
         try:
-            result = executor.execute({"name": tool_name, "args": kwargs})
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future = pool.submit(executor.execute, {"name": tool_name, "args": kwargs})
+                result = future.result(timeout=60)
             return result if isinstance(result, dict) else {"ok": True, "result": result}
+        except FuturesTimeoutError:
+            return {"ok": False, "is_error": True, "error": "MCP tool call timed out after 60s"}
         except Exception as exc:
             return {"ok": False, "is_error": True, "error": f"{type(exc).__name__}: {exc}"}
 
@@ -218,7 +228,7 @@ def _make_mcp_callable(session: Any, tool_name: str) -> StructuredTool:
     return StructuredTool.from_function(name=tool_name, func=_invoke, description=desc)
 
 
-def _build_args_schema(tool_name: str, input_schema: dict) -> Any:
+def _build_args_schema(tool_name: str, input_schema: dict) -> type | None:
     """从 MCP input_schema 构建 pydantic model（供 StructuredTool.args_schema 使用）
 
     input_schema 格式示例：
@@ -252,7 +262,7 @@ def _build_args_schema(tool_name: str, input_schema: dict) -> Any:
 # 会话工具集构建（按 agent_mode 选择）
 # ============================================================
 
-def build_tools_for_session(session: Any) -> list[StructuredTool]:
+def build_tools_for_session(session: ToolContext, ctx: AgentContext | None = None) -> list[StructuredTool]:
     """为 session 构建工具列表（按 run_mode 管控工具权限）
 
     run_mode（CLI 运行模式，存于 session.run_mode，热生效）：
@@ -279,10 +289,10 @@ def build_tools_for_session(session: Any) -> list[StructuredTool]:
         return tools
 
     # agent 完整模式：全量基础工具 + MCP/Skill 元工具 + 子Agent工具
-    mcp_tool = build_mcp_search_tool(session)
+    mcp_tool = build_mcp_search_tool(session, ctx)
     if mcp_tool is not None:
         tools.append(mcp_tool)
-    skill_tool = build_skill_search_tool(session)
+    skill_tool = build_skill_search_tool(session, ctx)
     if skill_tool is not None:
         tools.append(skill_tool)
 

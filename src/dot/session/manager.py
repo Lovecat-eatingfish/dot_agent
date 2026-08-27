@@ -18,21 +18,21 @@ from __future__ import annotations
 import queue
 import threading
 import traceback as _traceback
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from langchain_core.messages import HumanMessage
 
+from ..compress.state import CompressionState
 from ..constant.session import session_dir
 from ..core.log import get_logger
+from ..trace import activate_span, deactivate_span, get_tracer, reset_session_context, set_session_context
 from .session import Session
 from .persistence import (
     SessionPersistence,
     deserialize_messages,
 )
-
-# 注意：graph.coding_graph 必须延迟 import —— 它 import .session 模块，
-# 顶层导入会与 session 包的 __init__ 形成循环
 
 logger = get_logger(__name__)
 
@@ -62,7 +62,7 @@ class SessionManager:
             sessions_root: Path | str | None = None,
             workspace: Path | None = None,
             *,
-            shared: Any,
+            context: Any = None,
     ) -> None:
         self._sessions_root = Path(sessions_root) if sessions_root else Path(session_dir)
         self._default_workspace = workspace or Path.cwd()
@@ -70,8 +70,10 @@ class SessionManager:
         # 多会话：dict 索引 + 活跃会话指针（切换不关闭其他）
         self._sessions: dict[str, Session] = {}
         self._active_session_id: str | None = None
-        # 共享设施（来自 AgentHost.SharedServices），全会话复用
-        self._shared = shared
+        # 进程级组件容器
+        self._context = context
+        # 取消令牌：Ctrl+C 设置，graph stream worker 在节点边界检查
+        self._cancel_event = threading.Event()
 
     # ============================================================
     # Public API
@@ -118,7 +120,7 @@ class SessionManager:
         self._active_session_id = session.session_id
         logger.info("[SessionManager] session ready: %s  (turns=%d, msgs=%d, awaiting_intervention=%s)",
                     session.session_id, session.current_turn_id, len(session.messages),
-                    session.awaiting_intervention)
+                    session.is_awaiting_intervention())
         return session
 
     def get_session(self, session_id: str | None = None) -> Session:
@@ -203,7 +205,7 @@ class SessionManager:
     def rewind_to_turn(self, target_turn_id: int, session_id: str | None = None) -> dict[str, Any]:
         """回滚到指定 turn（磁盘 + 内存 + 用户代码一起恢复）"""
         session = self.get_session(session_id)
-        if session.is_running:
+        if session.is_turn_running():
             raise RuntimeError(f"Session {session.session_id} is running, cannot rewind")
 
         persistence = session.persistence
@@ -213,17 +215,13 @@ class SessionManager:
         # 内存恢复：messages + per-turn 字段
         raw_messages = snapshot.get("full_messages", [])
         session.messages = deserialize_messages(raw_messages) if raw_messages else []
-        session.task_plan = dict(graph_state.get("task_plan", {}))
-        session.replan_count = int(graph_state.get("replan_count", 0))
-        session.attempt_count = int(graph_state.get("attempt_count", 0))
-        session.validate_result = dict(graph_state.get("validate_result", {}))
-        session.need_human_intervene = bool(graph_state.get("need_human_intervene", False))
-        session.resume_action = graph_state.get("resume_action", "")
-        session.plan_invalid = bool(graph_state.get("plan_invalid", False))
-        session.awaiting_intervention = bool(graph_state.get("awaiting_intervention", False))
+        # 校验 resume_action 合法值后恢复
+        _ra = graph_state.get("resume_action", "")
+        if _ra not in ("continue", "stop"):
+            graph_state["resume_action"] = ""
+        session.restore_turn(graph_state)
         session.current_turn_id = target_turn_id
         # 恢复压缩状态
-        from ..compress.state import CompressionState
         cs_data = graph_state.get("compression_state")
         session.compression_state = CompressionState.from_dict(cs_data) if cs_data else CompressionState()
 
@@ -253,9 +251,9 @@ class SessionManager:
         不侵入 graph 节点逻辑。返回是否成功设置（会话存在且正在运行）。
         """
         session = self.get_session(session_id)
-        if session is None or not session.is_running:
+        if session is None or not session.is_turn_running():
             return False
-        session._cancel_event.set()
+        self._cancel_event.set()
         logger.info("[SessionManager] cancel requested: %s", session.session_id)
         return True
 
@@ -287,10 +285,10 @@ class SessionManager:
         # 主线程 session-state setup（worker 起来前就绪）
         self.apply_runtime_config(session, agent_mode=agent_mode)
         session.reset_per_turn()
-        session._cancel_event.clear()
+        self._cancel_event.clear()
         if user_input:
             session.messages.append(HumanMessage(content=user_input))
-            session.task = user_input
+            session.set_task(user_input)
             logger.info("[stream] appended user input, messages=%d", len(session.messages))
 
         config = {"recursion_limit": 60}
@@ -298,14 +296,15 @@ class SessionManager:
 
         def _body(session: Session, span: Any, emit: Callable[[Any], None]) -> None:
             cancelled = False
-            for chunk in session.compiled_graph.stream({"session": session}, config=config):
-                if session._cancel_event.is_set():
+            graph_input = {"session": session, "context": self._context}
+            for chunk in self._context.compiled_graph.stream(graph_input, config=config):
+                if self._cancel_event.is_set():
                     cancelled = True
                     break
                 emit(chunk)
             span.set_output_summary(
                 f"turn={session.current_turn_id} msgs={len(session.messages)} "
-                f"passed={session.validate_result.get('passed')} awaiting={session.awaiting_intervention}"
+                f"passed={session.get_validate_result().get('passed')} awaiting={session.is_awaiting_intervention()}"
                 f" cancelled={cancelled}"
             )
             if cancelled:
@@ -336,14 +335,14 @@ class SessionManager:
         session = self.get_or_create(session_id)
         if not session.acquire_run():
             raise RuntimeError(f"Session {session.session_id} is already running")
-        if not session.awaiting_intervention:
+        if not session.is_awaiting_intervention():
             session.release_run()
             logger.warning("[resume] session %s has no pending intervention", session.session_id)
             return
 
         # 主线程 session-state setup
-        session.awaiting_intervention = False
-        session.resume_action = resume_action
+        session.set_awaiting_intervention(False)
+        session.set_resume_action(resume_action)
 
         config = {"recursion_limit": 60}
 
@@ -356,19 +355,16 @@ class SessionManager:
                 return
 
             # continue：计数清零，从 plan 重新规划
-            session.replan_count = 0
-            session.attempt_count = 0
-            session.plan_invalid = False
-            session.need_human_intervene = False
-            session.resume_action = ""
+            session.reset_turn()
 
             self.apply_runtime_config(session, agent_mode=agent_mode)
             logger.info("[resume] re-entering graph from plan_node")
-            for chunk in session.compiled_graph.stream({"session": session}, config=config):
+            graph_input = {"session": session, "context": self._context}
+            for chunk in self._context.compiled_graph.stream(graph_input, config=config):
                 emit(chunk)
             span.set_output_summary(
                 f"turn={session.current_turn_id} msgs={len(session.messages)} "
-                f"passed={session.validate_result.get('passed')} awaiting={session.awaiting_intervention}"
+                f"passed={session.get_validate_result().get('passed')} awaiting={session.is_awaiting_intervention()}"
             )
 
         yield from self._run_turn_worker(
@@ -394,9 +390,6 @@ class SessionManager:
         调用方先 acquire_run，worker finally 里 release_run。body(session, span, emit)：
         emit(chunk) 塞事件入队；body 抛异常被捕获，包装成 _RemoteException 跨线程抛回主线程。
         """
-        from ..trace import (activate_span, deactivate_span, get_tracer,
-                             reset_session_context, set_session_context)
-
         event_queue: queue.Queue = queue.Queue()
         _SENTINEL = object()
 
@@ -438,7 +431,7 @@ class SessionManager:
     def has_pending_intervention(self, session_id: str | None = None) -> bool:
         """检查 session 是否有未处理的人工介入（含跨进程：读 session.json）"""
         session = self.get_or_create(session_id)
-        if session.awaiting_intervention:
+        if session.is_awaiting_intervention():
             return True
         if session.persistence is None:
             return False
@@ -454,7 +447,7 @@ class SessionManager:
         if session.persistence is None:
             return
         meta = session.persistence.load_session_meta(session.session_id)
-        meta["awaiting_intervention"] = session.awaiting_intervention
+        meta["awaiting_intervention"] = session.is_awaiting_intervention()
         meta["updated_at"] = meta.get("updated_at", "")
         session.persistence.save_session_meta(session.session_id, meta)
 
@@ -473,30 +466,29 @@ class SessionManager:
 
         logger.info("[SessionManager] workspace=%s", workspace)
 
-        # 共享设施来自 SharedServices（单份，全会话复用，不在此重复构建）
-        shared = self._shared
-
         # 恢复压缩状态
-        from ..compress.state import CompressionState
         cs_data = meta.get("compression_state")
         compression_state = CompressionState.from_dict(cs_data) if cs_data else CompressionState()
 
         session = Session(
             session_id=session_id,
-            compiled_graph=shared.compiled_graph,
             messages=deserialize_messages(meta.get("messages", [])) if meta.get("messages") else [],
-            replan_count=int(meta.get("replan_count", 0)),
-            attempt_count=int(meta.get("attempt_count", 0)),
             current_turn_id=int(meta.get("current_turn_id", 0)),
             persistence=persistence,
             workspace=workspace,
-            mcp_host=shared.mcp_host,
-            skill_host=shared.skill_host,
-            hook_runner=shared.hook_runner,
-            awaiting_intervention=bool(meta.get("awaiting_intervention", False)),
             compression_state=compression_state,
             run_mode=meta.get("run_mode", "agent"),
         )
+        # TurnState 字段通过代理方法设置
+        restore_data = {}
+        if "replan_count" in meta:
+            restore_data["replan_count"] = int(meta["replan_count"])
+        if "attempt_count" in meta:
+            restore_data["attempt_count"] = int(meta["attempt_count"])
+        if "awaiting_intervention" in meta:
+            restore_data["awaiting_intervention"] = bool(meta["awaiting_intervention"])
+        if restore_data:
+            session.restore_turn(restore_data)
 
         if is_new:
             meta = persistence._empty_session_meta(session_id)
@@ -523,8 +515,6 @@ class SessionManager:
         return SessionPersistence(sessions_root=self._sessions_root)
 
     def _make_timestamp_id(self) -> str:
-        from datetime import datetime
-
         base = datetime.now().strftime("%Y%m%d-%H%M%S")
         session_id = base
         suffix = 2

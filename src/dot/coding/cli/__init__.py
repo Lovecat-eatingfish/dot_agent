@@ -8,5 +8,6 @@ from __future__ import annotations
 
 from .app import app, main
 from .config import CLIConfig
+from .tui import DotTUI
 
-__all__ = ["app", "main", "CLIConfig"]
+__all__ = ["app", "main", "CLIConfig", "DotTUI"]

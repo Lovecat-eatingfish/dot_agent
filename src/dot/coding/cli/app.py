@@ -74,9 +74,13 @@ def console_cmd(
 
 def _launch_tui(workspace_str: str, mode: str) -> None:
     """启动 TUI 交互模式"""
-    console.print(f"[bold green]dot agent TUI[/bold green] workspace={workspace_str} mode={mode}")
-    # TODO: 集成新的 TUI
-    console.print("[yellow]⚠ 新架构 TUI 待集成[/yellow]")
+    from dot.coding.cli.tui.app import DotTUI
+    from dot.coding.modes import AgentMode
+
+    workspace = Path(workspace_str)
+    agent_mode = AgentMode.from_str(mode)
+    tui = DotTUI(workspace=workspace, mode=agent_mode)
+    tui.run()
 
 
 def main() -> None:

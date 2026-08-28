@@ -5,3 +5,8 @@ dot.coding.cli — CLI 入口
 支持斜杠命令（/mode, /skill:name, /reload 等）。
 """
 from __future__ import annotations
+
+from .app import app, main
+from .config import CLIConfig
+
+__all__ = ["app", "main", "CLIConfig"]

@@ -5,3 +5,7 @@ dot.ai.providers — 具体 Provider 实现
 负责将自身的 SSE 格式解析为统一的 ProviderEvent 流。
 """
 from __future__ import annotations
+
+from .openai import OpenAIProvider
+
+__all__ = ["OpenAIProvider"]

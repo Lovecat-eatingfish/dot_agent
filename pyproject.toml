@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.scripts]
-agent     = "dot.cli.app:app"
+agent     = "dot.coding.cli.app:main"
 
 [dependency-groups]
 dev = [

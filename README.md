@@ -54,7 +54,7 @@ class AgentTool:
 三层事件，Pydantic discriminated union：
 
 | 层 | 事件 | 用途 |
-|---|---|---|
+| --- | --- | --- |
 | `ProviderEvent` | TextDelta / ToolCallStart/End / Done | LLM 流式响应 |
 | `AgentEvent` | TurnStart/End / MessageStart/End / ToolExec... | Agent 生命周期 |
 | `CodingEvent` | Compaction / SessionInfoChanged | 编码会话 |
@@ -72,7 +72,7 @@ class AgentTool:
 ### 三级压缩
 
 | 级别 | 阈值 | 操作 | 需要 LLM |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | L1 | ≥50% | 去掉可恢复 tool 结果（read_file），保留路径 | ❌ |
 | L2 | ≥70% | 删除老旧 tool 调用（bash/grep 输出） | ❌ |
 | L3 | ≥85% | LLM 生成结构化摘要 | ✅ |
@@ -144,7 +144,7 @@ src/dot/
 ## 关键实体
 
 | 实体 | 所在层 | 说明 |
-|---|---|---|
+| --- | --- | --- |
 | `ModelProvider` | ai | Protocol，单方法 `stream_response` |
 | `ProviderEvent` | ai | LLM 流式事件 discriminated union |
 | `AgentTool` | agent | frozen dataclass，工具定义 |

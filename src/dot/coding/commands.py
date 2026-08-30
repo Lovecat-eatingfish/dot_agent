@@ -6,9 +6,14 @@ dot.coding.commands — 斜杠命令系统
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
+
+from dot.ai.types import SkillMessage
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -110,10 +115,12 @@ class CommandRegistry:
         self.register(SlashCommand("clear", "/clear", "clear screen", self._cmd_clear))
         self.register(SlashCommand("exit", "/exit", "exit", self._cmd_exit))
         self.register(SlashCommand("skill", "/skill <name>", "expand skill content", self._cmd_skill))
+        self.register(SlashCommand("skilllist", "/skilllist", "list all skills", self._cmd_skilllist))
         self.register(SlashCommand("reload", "/reload", "reload extensions", self._cmd_reload))
         self.register(SlashCommand("compact", "/compact", "trigger compaction", self._cmd_compact))
         self.register(SlashCommand("sessions", "/sessions", "list saved sessions", self._cmd_sessions))
         self.register(SlashCommand("resume", "/resume <id>", "switch to a saved session", self._cmd_resume))
+        self.register(SlashCommand("trace", "/trace [on|off]", "show or toggle tracing", self._cmd_trace))
 
     def _cmd_help(self, args: str) -> SlashResult:
         return SlashResult(kind="message", text=self.build_help_text())
@@ -139,20 +146,65 @@ class CommandRegistry:
         return SlashResult(kind="quit")
 
     def _cmd_skill(self, args: str) -> SlashResult:
-        """展开 skill 内容为 XML 注入"""
-        name = args.strip()
-        if not name:
-            return SlashResult(kind="toast", level="warn", text="Usage: /skill <name>")
+        """展开 skill 内容 + 用户指令，注入到 agent 对话"""
+        parts = args.strip().split(None, 1)
+        if not parts:
+            return SlashResult(kind="toast", level="warn", text="Usage: /skill <name> [task]")
+        skill_name = parts[0]
+        user_task = parts[1] if len(parts) > 1 else ""
+        log.info(f"展开 skill 内容: {skill_name}, task: {user_task[:50]}")
         try:
             from .skills.manager import SkillManager
+            from dot.ai.types import UserMessage
+
+            skill_dir = self._get_skill_dir()
             mgr = SkillManager()
-            mgr.scan_directory(Path.cwd())
-            expanded = mgr.expand_skill(name)
+            if skill_dir:
+                mgr.scan_directory(skill_dir)
+            expanded = mgr.expand_skill(skill_name)
             if expanded.startswith("Skill '") and "not found" in expanded:
                 return SlashResult(kind="toast", level="error", text=expanded)
-            return SlashResult(kind="message", text=expanded)
+
+            # 拼接 skill 内容 + 用户指令，注入到 harness
+            content = f"这个是一个{skill_name}的技能描述: {expanded}"
+            log.info(f"注入 skill 内容: {content[:50]}")
+            self._host._harness.append_message(UserMessage(content=content))
+
+            # if self._host is not None and hasattr(self._host, "_harness") and self._host._harness is not None:
+            #     self._host._harness.follow_up_message(
+            #         UserMessage(content=content)
+            #     )
+            #     return SlashResult(kind="toast", level="info", text=f"Skill '{skill_name}' loaded")
+            return SlashResult(kind="toast", level="warn", text="No active session to inject skill into")
         except Exception as exc:
             return SlashResult(kind="toast", level="error", text=f"/skill error: {exc}")
+
+    def _cmd_skilllist(self, args: str) -> SlashResult:
+        """列出所有可用 skill"""
+        try:
+            from .skills.manager import SkillManager
+
+            skill_dir = self._get_skill_dir()
+            mgr = SkillManager()
+            if skill_dir:
+                mgr.scan_directory(skill_dir)
+            skills = mgr.list_skills()
+            if not skills:
+                return SlashResult(kind="toast", level="warn", text="No skills found. Create SKILL.md files in .dot/skills/")
+            lines = [f"[bold]Skills ({len(skills)})[/bold]"]
+            for s in skills:
+                lines.append(f"  /{s.name:<20} {s.description}")
+            return SlashResult(kind="message", text="\n".join(lines))
+        except Exception as exc:
+            return SlashResult(kind="toast", level="error", text=f"/skilllist error: {exc}")
+
+    def _get_skill_dir(self) -> Path | None:
+        """获取 skill 目录：优先 workspace/.dot/skills/，回退到 cwd"""
+        if self._host is not None and hasattr(self._host, "workspace"):
+            skill_dir = self._host.workspace / ".dot" / "skills"
+            if skill_dir.is_dir():
+                return skill_dir
+        return Path.cwd()
 
     def _cmd_reload(self, args: str) -> SlashResult:
         """重载扩展（teardown 旧扩展 → 使旧 generation 失效 → 重新加载并同步 harness）"""
@@ -198,6 +250,22 @@ class CommandRegistry:
         count = len(self._host.session.messages) if hasattr(self._host, "session") else 0
         return SlashResult(kind="toast", level="info",
                            text=f"resumed {sid} ({count} messages restored)")
+
+    def _cmd_trace(self, args: str) -> SlashResult:
+        """查看/切换链路追踪"""
+        arg = args.strip().lower()
+        if arg in ("on", "off"):
+            if self._host is None or not hasattr(self._host, "set_trace_enabled"):
+                return SlashResult(kind="toast", level="error", text="/trace requires host context")
+            self._host.set_trace_enabled(arg == "on")
+        if self._host is None or not hasattr(self._host, "trace_info"):
+            return SlashResult(kind="toast", level="error", text="/trace requires host context")
+        info = self._host.trace_info()
+        status = "on" if info["enabled"] else "off"
+        return SlashResult(
+            kind="message",
+            text=f"tracing: {status}  (session {info['session_id']})\noutput: {info['output_dir']}",
+        )
 
     def _cmd_compact(self, args: str) -> SlashResult:
         """触发上下文压缩"""

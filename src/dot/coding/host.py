@@ -7,7 +7,7 @@ dot.coding.host — CodingHost（新架构组装层）
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 
 from dot.agent.events import AgentEvent
@@ -78,6 +78,8 @@ class CodingHost:
         # 当前 Harness
         self._harness: AgentHarness | None = None
         self._base_system = ""
+        self._trace_unsub: Callable[[], None] | None = None
+        self._trace_collector = None
 
     def _init_tools(self) -> None:
         """初始化内置工具"""
@@ -127,7 +129,48 @@ class CodingHost:
         config.before_tool_call = before_hook
         config.after_tool_call = after_hook
         self._harness = AgentHarness(config, messages=self._session.messages)
+        self._attach_trace()
         return self._harness
+
+    # ============================================================
+    # 链路追踪
+    # ============================================================
+
+    def _attach_trace(self) -> None:
+        """为当前 harness 订阅 TraceCollector（DOT_TRACE_ENABLED=0 时为 Noop）"""
+        from .trace import make_trace_collector
+
+        self._detach_trace()
+        self._trace_collector = make_trace_collector(self.workspace, self._session.session_id)
+        if self._harness is not None:
+            self._trace_unsub = self._harness.subscribe(self._trace_collector.on_event)
+
+    def _detach_trace(self) -> None:
+        if self._trace_unsub is not None:
+            self._trace_unsub()
+            self._trace_unsub = None
+
+    def set_trace_enabled(self, enabled: bool) -> None:
+        """运行时开关链路追踪（重挂 collector）"""
+        import os
+
+        os.environ["DOT_TRACE_ENABLED"] = "1" if enabled else "0"
+        self._attach_trace()
+
+    def trace_info(self) -> dict:
+        """追踪状态与落盘目录"""
+        from .trace import trace_enabled as _enabled
+
+        return {
+            "enabled": _enabled(),
+            "session_id": self._session.session_id,
+            "output_dir": self.workspace / ".dot" / "traces",
+        }
+
+    def flush_trace(self) -> None:
+        """进程退出前兜底落盘未结束的 span"""
+        if self._trace_collector is not None:
+            self._trace_collector.flush()
 
     def _compose_system(self, base: str) -> str:
         """基础 system prompt + 扩展注册的 prompt sections"""

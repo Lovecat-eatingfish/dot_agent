@@ -10,7 +10,6 @@ import asyncio
 import contextlib
 import logging
 import os
-import sys
 from pathlib import Path
 
 from dot import AgentHarness
@@ -33,7 +32,7 @@ def run_console(
 
     agent_mode = AgentMode.from_str(mode)
 
-    # 构建 host 对象
+    # 整个agent 最大 / 最核心 的一个对象，包含了所有其他对象： 权限管理，模型，工具，扩展，会话，trace span，agent harness
     host = CodingHost(
         workspace=workspace,
         mode=agent_mode,
@@ -87,6 +86,9 @@ def run_console(
         with contextlib.redirect_stderr(_devnull):
             _cleanup_loop(loop, harness)
         _devnull.close()
+        # 退出前兜底落盘未结束的 trace span（中断的 turn 标记为 interrupted）
+        if hasattr(host, "flush_trace"):
+            host.flush_trace()
     return 0
 
 
@@ -116,10 +118,11 @@ def _log_available_commands(commands, host) -> None:
     ext_cmds = host.extensions.commands
     parts = [f"/{c.name}" for c in builtins]
     parts.extend(f"/{name}" for name in ext_cmds)
-    log.info("可用命令: [%s]", ", ".join(parts))
+    # log.info("可用命令: [%s]", ", ".join(parts))
+    print(f"可用命令: {', '.join(parts)}")
 
 
-async def _console_loop(harness, host) -> None:
+async def _console_loop(harness: AgentHarness, host: CodingHost) -> None:
     """Async REPL loop — runs entirely inside one event loop"""
     from dot.coding.commands import get_command_registry
 
@@ -130,7 +133,7 @@ async def _console_loop(harness, host) -> None:
         try:
             # 打印可用命令
             _log_available_commands(commands, host)
-            user_input = input().strip()
+            user_input = input("you> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("bye")
             return
@@ -149,7 +152,6 @@ async def _console_loop(harness, host) -> None:
                 print(result.text)
             continue
 
-        print(f"you> {user_input}")
         try:
             await _run_turn(harness, user_input)
             host.save_session()
@@ -162,7 +164,7 @@ async def _console_loop(harness, host) -> None:
 
 async def _run_turn(harness: AgentHarness, user_input: str) -> None:
     """Run one agent turn, buffer text deltas, print assistant message when done"""
-    log.info("User: %s", user_input[:200])
+    log.info("用户输入的内容: %s", user_input[:200])
 
     buffer: list[str] = []
     thinking_buffer: list[str] = []

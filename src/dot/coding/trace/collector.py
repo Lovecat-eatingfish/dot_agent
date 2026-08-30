@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .exporter import LocalFileTraceExporter
+
 from dot.agent.events import (
     AgentEndEvent,
     AgentEvent,
@@ -87,17 +89,28 @@ class TraceCollector:
     """事件驱动的链路追踪收集器
 
     订阅 AgentEvent 流，自动生成 span 树。
-    存储为本地 JSONL（.dot/traces/）。
+    通过 LocalFileTraceExporter 落盘：
+    <output_dir>/<YYYY-MM-DD>/trace_{session_id}.jsonl（按天 + 会话分文件，追加写入）。
     """
 
-    def __init__(self, output_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        output_dir: Path | None = None,
+        *,
+        session_id: str = "",
+        exporter: "LocalFileTraceExporter | None" = None,
+    ) -> None:
         self._output_dir = output_dir
+        self._session_id = session_id
+        self._exporter = exporter or (LocalFileTraceExporter(output_dir) if output_dir else None)
         self._trace_id: str = ""
         self._span_stack: list[Span] = []
         self._spans: list[Span] = []
 
-        if output_dir:
-            output_dir.mkdir(parents=True, exist_ok=True)
+    @property
+    def output_dir(self) -> Path | None:
+        """当前落盘目录（未启用时为 None）"""
+        return self._exporter.dir if self._exporter else None
 
     def on_event(self, event: AgentEvent) -> None:
         """处理 Agent 事件，自动生成 span"""
@@ -134,6 +147,15 @@ class TraceCollector:
                 span.finish()
             self._flush()
 
+    def flush(self) -> None:
+        """兜底落盘：未结束的 span（如中断）标记为 interrupted 后写出，并等待写完"""
+        for span in self._span_stack:
+            span.finish(status="interrupted")
+        self._span_stack.clear()
+        self._flush()
+        if self._exporter is not None and hasattr(self._exporter, "wait_flushed"):
+            self._exporter.wait_flushed()
+
     def _push_span(self, service: str, name: str) -> Span:
         parent_id = self._span_stack[-1].span_id if self._span_stack else ""
         span = Span(
@@ -143,6 +165,8 @@ class TraceCollector:
             service=service,
             name=name,
         )
+        if self._session_id:
+            span.tags["session_id"] = self._session_id
         self._span_stack.append(span)
         self._spans.append(span)
         return span
@@ -151,16 +175,11 @@ class TraceCollector:
         return self._span_stack.pop() if self._span_stack else None
 
     def _flush(self) -> None:
-        """将 spans 写入 JSONL 文件"""
-        if not self._output_dir or not self._spans:
+        """将 spans 通过 exporter 写出"""
+        if not self._exporter or not self._spans:
             return
-        try:
-            path = self._output_dir / f"{self._trace_id}.jsonl"
-            with open(path, "a", encoding="utf-8") as f:
-                for span in self._spans:
-                    f.write(json.dumps(span.to_dict(), ensure_ascii=False) + "\n")
-        except OSError as exc:
-            logger.warning("[trace] Failed to flush: %s", exc)
+        for span in self._spans:
+            self._exporter.export(span.to_dict())
         self._spans.clear()
 
 
@@ -168,4 +187,7 @@ class NoopTraceCollector:
     """空实现，关闭追踪时零开销"""
 
     def on_event(self, event: AgentEvent) -> None:
+        pass
+
+    def flush(self) -> None:
         pass

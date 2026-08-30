@@ -23,6 +23,9 @@ from .permission import PermissionManager, get_permission_manager
 from .modes import AgentMode
 from .commands import CommandRegistry, get_command_registry, SlashResult
 from .host import CodingHost
+from .events import CodingEvent
+from .session import SessionState, ToolContext
+from .extensions import ExtensionRuntime, ExtensionLoader, ExtensionAPI, ExtensionGeneration
 
 __all__ = [
     # workflow
@@ -41,4 +44,14 @@ __all__ = [
     "SlashResult",
     # host
     "CodingHost",
+    # events
+    "CodingEvent",
+    # session
+    "SessionState",
+    "ToolContext",
+    # extensions
+    "ExtensionRuntime",
+    "ExtensionLoader",
+    "ExtensionAPI",
+    "ExtensionGeneration",
 ]

@@ -30,6 +30,10 @@ class SessionManager:
         self._active: Session | None = None
 
     @property
+    def session_storage(self) -> SessionStorage:
+        return self._storage
+
+    @property
     def session(self) -> Session | None:
         return self._active
 
@@ -52,17 +56,19 @@ class SessionManager:
         return session
 
     def restore(self, session_id: str) -> Session:
-        """恢复历史会话"""
+        """恢复历史会话（含消息历史）"""
         data = self._storage.load(session_id)
         if data is None:
             logger.warning("[session] Not found: %s, creating new", session_id)
             return self.create(session_id)
-        session = Session(
-            session_id=session_id,
-            workspace=self._workspace,
-        )
+        try:
+            session = Session.from_snapshot(data)
+        except Exception:
+            logger.exception("[session] Failed to restore %s, creating new", session_id)
+            return self.create(session_id)
+        session.workspace = self._workspace
         self._active = session
-        logger.info("[session] Restored: %s", session_id)
+        logger.info("[session] Restored: %s (%d messages)", session_id, len(session.messages))
         return session
 
     def switch_to(self, session_id: str) -> Session:

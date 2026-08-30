@@ -22,6 +22,7 @@ from .ai import (
     canonicalize_provider_stream,
     ProviderCatalog,
     estimate_context_tokens,
+    OpenAISettings,
 )
 
 # Layer 2: Agent 核心
@@ -49,6 +50,13 @@ from .coding import (
     get_command_registry,
     SlashResult,
     CodingHost,
+    CodingEvent,
+    SessionState,
+    ToolContext,
+    ExtensionRuntime,
+    ExtensionLoader,
+    ExtensionAPI,
+    ExtensionGeneration,
 )
 
 __all__ = [
@@ -58,6 +66,7 @@ __all__ = [
     "canonicalize_provider_stream",
     "ProviderCatalog",
     "estimate_context_tokens",
+    "OpenAISettings",
     # agent
     "AgentTool",
     "AgentToolResult",
@@ -79,4 +88,11 @@ __all__ = [
     "get_command_registry",
     "SlashResult",
     "CodingHost",
+    "CodingEvent",
+    "SessionState",
+    "ToolContext",
+    "ExtensionRuntime",
+    "ExtensionLoader",
+    "ExtensionAPI",
+    "ExtensionGeneration",
 ]

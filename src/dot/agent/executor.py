@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Mapping
+from typing import TYPE_CHECKING
 
 from dot.ai.types import TextContent
 
 from .tools import AgentTool, AgentToolResult
+
+if TYPE_CHECKING:
+    from .cancel import ToolCancellationToken
 
 DEFAULT_TIMEOUT = 30  # 秒
 

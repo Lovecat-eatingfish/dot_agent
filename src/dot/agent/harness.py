@@ -6,6 +6,7 @@ dot.agent.harness — AgentHarness 状态管理器
 """
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
@@ -17,8 +18,9 @@ from dot.ai.types import AgentMessage, AssistantMessage, TextContent, ToolResult
 
 from .cancel import SimpleCancellationToken
 from .events import AgentEvent, MessageEndEvent, MessageStartEvent
-from .loop import run_agent_loop
+from .loop import AfterToolCall, BeforeToolCall, run_agent_loop
 from .tools import AgentTool
+from ..ai.providers import OpenAIProvider
 
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
 QueueMode = Literal["one_at_a_time", "all"]
@@ -36,13 +38,15 @@ class QueuedMessages:
 
 @dataclass(slots=True)
 class AgentHarnessConfig:
-    provider: object  # ModelProvider
+    provider: OpenAIProvider  # ModelProvider
     model: str
     system: str
     tools: list[AgentTool] = field(default_factory=list)
     max_turns: int | None = None
     queue_mode: QueueMode = "one_at_a_time"
     session_id: str | None = None
+    before_tool_call: BeforeToolCall | None = None
+    after_tool_call: AfterToolCall | None = None
 
 
 class AgentHarness:
@@ -91,6 +95,10 @@ class AgentHarness:
     def replace_messages(self, messages: Sequence[AgentMessage]) -> None:
         self._messages = list(messages)
 
+    def set_tools(self, tools: Sequence[AgentTool]) -> None:
+        """热更新可用工具（扩展 /reload 后刷新当前 harness）"""
+        self._config.tools = list(tools)
+
     def subscribe(self, listener: EventListener) -> Callable[[], None]:
         """订阅事件，返回 unsubscribe 函数"""
         self._listeners.append(listener)
@@ -125,30 +133,31 @@ class AgentHarness:
         self._follow_up_queue.clear()
         return snapshot
 
-    def prompt_message(self, message: AgentMessage) -> AsyncIterator[AgentEvent]:
+    def prompt_message(self, message: AgentMessage, *, system: str | None = None) -> AsyncIterator[AgentEvent]:
         self._ensure_not_running()
         self._running = True
-        return self._run(prompts=(message,))
+        return self._run(prompts=(message,), system_override=system)
 
-    def prompt(self, content: str) -> AsyncIterator[AgentEvent]:
-        return self.prompt_message(UserMessage(content=content))
+    def prompt(self, content: str, *, system: str | None = None) -> AsyncIterator[AgentEvent]:
+        return self.prompt_message(UserMessage(content=content), system=system)
 
     def continue_(self) -> AsyncIterator[AgentEvent]:
         self._ensure_not_running()
         self._running = True
         return self._run()
 
-    async def _run(self, *, prompts: Sequence[AgentMessage] = ()) -> AsyncIterator[AgentEvent]:
+    async def _run(self, *, prompts: Sequence[AgentMessage] = (), system_override: str | None = None) -> AsyncIterator[AgentEvent]:
         signal = SimpleCancellationToken()
         self._current_signal = signal
         try:
             repaired_from = len(self._messages)
             self._append_interrupted_tool_results()
             repairs = self._messages[repaired_from:]
+            system = system_override if system_override is not None else self._config.system
             async for event in run_agent_loop(
                 provider=self._config.provider,
                 model=self._config.model,
-                system=self._config.system,
+                system=system,
                 messages=self._messages,
                 prompts=prompts,
                 prelude_messages=repairs,
@@ -158,10 +167,19 @@ class AgentHarness:
                 session_id=self._config.session_id,
                 get_steering_messages=self._drain_steering_messages,
                 get_follow_up_messages=self._drain_follow_up_messages,
+                before_tool_call=self._config.before_tool_call,
+                after_tool_call=self._config.after_tool_call,
             ):
                 await self._notify(event)
                 yield event
         finally:
+            # asyncio.shield 保护资源清理任务不被外层取消
+            # 外层被取消时 cleanup task 不被取消，保证资源清理完整性
+            await self._shielded_cleanup(signal)
+
+    async def _shielded_cleanup(self, signal: SimpleCancellationToken) -> None:
+        """受 shield 保护的清理逻辑"""
+        async def _cleanup() -> None:
             if signal.is_cancelled():
                 repaired_from = len(self._messages)
                 self._append_interrupted_tool_results()
@@ -172,6 +190,12 @@ class AgentHarness:
             if self._current_signal is signal:
                 self._current_signal = None
             self._running = False
+
+        try:
+            await asyncio.shield(_cleanup())
+        except asyncio.CancelledError:
+            # 即使外层被取消，清理也已在 shield 中完成
+            pass
 
     async def _notify(self, event: AgentEvent) -> None:
         # 拷贝监听器列表，防止回调中取消订阅时的"迭代中修改集合"异常

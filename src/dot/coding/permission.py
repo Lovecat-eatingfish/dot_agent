@@ -46,10 +46,10 @@ class PermissionDecision:
 
     def deny_message(self) -> str:
         if self.source == "system":
-            return f"该操作被系统内置安全规则禁止: {self.reason}"
+            return f"Blocked by system security rule: {self.reason}"
         if self.source == "project":
-            return f"该操作被本项目 {SECURITY_CONFIG_FILE} 自定义规则禁止: {self.reason}"
-        return f"该操作被当前运行模式禁止: {self.reason}"
+            return f"Blocked by project {SECURITY_CONFIG_FILE} rule: {self.reason}"
+        return f"Blocked by current mode: {self.reason}"
 
 
 @dataclass

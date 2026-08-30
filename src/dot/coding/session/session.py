@@ -12,7 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from pydantic import TypeAdapter
+
 from dot.ai.types import AgentMessage
+
+_message_list_adapter: TypeAdapter[list[AgentMessage]] = TypeAdapter(list[AgentMessage])
 
 
 @dataclass
@@ -99,4 +103,20 @@ class Session:
             "workspace": str(self.workspace),
             "message_count": len(self.messages),
             "agent_mode": self.config.agent_mode,
+            "messages": [m.model_dump() for m in self.messages],
         }
+
+    @classmethod
+    def from_snapshot(cls, data: dict[str, Any]) -> Session:
+        """从快照字典反序列化（含消息历史）"""
+        session = cls(
+            session_id=data["session_id"],
+            workspace=Path(data.get("workspace", Path.cwd())),
+        )
+        mode = data.get("agent_mode")
+        if mode:
+            session.config.agent_mode = mode
+        raw_messages = data.get("messages") or []
+        session.messages = _message_list_adapter.validate_python(raw_messages)
+        session._message_seq = len(session.messages)
+        return session

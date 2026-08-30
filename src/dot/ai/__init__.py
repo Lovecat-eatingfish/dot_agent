@@ -16,6 +16,7 @@ from .provider import ModelProvider, ProviderCancellationToken
 from .events import ProviderEvent
 from .stream import canonicalize_provider_stream
 from .catalog import ProviderCatalog, ProviderConfig, ModelConfig
+from .config import OpenAISettings
 from .limits import estimate_context_tokens, ContextWindowInfo
 
 __all__ = [
@@ -30,6 +31,8 @@ __all__ = [
     "ProviderCatalog",
     "ProviderConfig",
     "ModelConfig",
+    # config
+    "OpenAISettings",
     # limits
     "estimate_context_tokens",
     "ContextWindowInfo",

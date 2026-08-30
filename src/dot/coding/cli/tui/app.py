@@ -1,41 +1,30 @@
 """
 dot.coding.cli.tui.app — TUI 交互应用
 
-基于 prompt_toolkit 的多轮对话终端 UI。
-消费 AgentEvent 流，逐 token 渲染 assistant 输出。
+基于 prompt_toolkit + rich 的终端 UI。
+使用 TuiState + TuiEventAdapter 模式消费 AgentEvent。
 """
 from __future__ import annotations
 
 import asyncio
-import sys
 from pathlib import Path
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.text import Text
 
-from dot.agent.events import (
-    AgentEndEvent,
-    AgentEvent,
-    AgentStartEvent,
-    MessageEndEvent,
-    MessageStartEvent,
-    MessageUpdateEvent,
-    ToolExecutionEndEvent,
-    ToolExecutionStartEvent,
-    TurnEndEvent,
-    TurnStartEvent,
-)
+from dot.agent.events import AgentEvent
 from dot.coding.commands import CommandRegistry, SlashResult, get_command_registry
 from dot.coding.host import CodingHost
 from dot.coding.modes import AgentMode
 
-console = Console()
+from .adapter import TuiEventAdapter
+from .state import ChatItem, TuiState
+
+console = Console(force_terminal=False)
 
 
 class DotTUI:
@@ -51,7 +40,17 @@ class DotTUI:
         self.mode = mode
         self.host = CodingHost(workspace=self.workspace, mode=self.mode)
         self.commands = get_command_registry()
+        self.commands.set_host(self.host)
         self._running = False
+
+        # TUI 状态
+        self.state = TuiState()
+        self.adapter = TuiEventAdapter(self.state)
+
+        # 共享 harness：多轮对话消息历史累积
+        self._harness = self.host.create_harness(
+            system="You are a helpful coding assistant.",
+        )
 
         # prompt_toolkit history
         history_path = self.workspace / ".dot" / "history"
@@ -61,26 +60,43 @@ class DotTUI:
         )
 
     def run(self) -> None:
-        """启动 TUI 主循环"""
+        """启动 TUI — 纯异步循环，用 asyncio.run 驱动"""
+        # 统一日志：stderr + .dot/logs/dot.log
+        from dot.coding.logging_config import setup as setup_logging
+        setup_logging(workspace=self.workspace, level="INFO")
+
         self._running = True
+
         console.print(Panel(
             "[bold green]dot agent TUI[/bold green]\n"
             f"workspace: {self.workspace}\n"
             f"mode: {self.mode.label}\n"
-            "输入 /help 查看命令，Ctrl+C 退出",
+            "Type /help for commands, Ctrl+C to quit",
             border_style="green",
         ))
 
+        try:
+            asyncio.run(self._async_loop())
+        except KeyboardInterrupt:
+            console.print("\n[dim]bye[/dim]")
+
+    async def _async_loop(self) -> None:
+        """纯异步主循环 — prompt_async + agent 处理都在同一事件循环中"""
         with patch_stdout():
             while self._running:
+                current_mode = self.host.mode
                 try:
-                    user_input = self._session.prompt(
-                        f"[{self.mode.label}] > ",
-                    ).strip()
-                except (EOFError, KeyboardInterrupt):
-                    console.print("\n[dim]再见[/dim]")
+                    user_input = await self._session.prompt_async(
+                        f"[{current_mode.label}] > ",
+                    )
+                except KeyboardInterrupt:
+                    console.print("\n[dim]bye[/dim]")
+                    break
+                except EOFError:
+                    console.print("\n[dim]bye[/dim]")
                     break
 
+                user_input = user_input.strip()
                 if not user_input:
                     continue
 
@@ -93,87 +109,72 @@ class DotTUI:
                     continue
 
                 # 普通消息 → Agent
-                self._run_agent_turn(user_input)
+                await self._run_agent_turn_async(user_input)
 
-    def _run_agent_turn(self, user_input: str) -> None:
-        """执行一轮 Agent 对话"""
-        harness = self.host.create_harness(
-            system="You are a helpful coding assistant.",
-        )
-
+    async def _run_agent_turn_async(self, user_input: str) -> None:
+        """执行一轮 Agent 对话（异步）"""
         # 设置权限审批
         self.host.permission.set_approval_handler(self._make_approval_handler())
 
-        # 收集 assistant 文本用于最终渲染
-        assistant_text = ""
-        tool_calls_info: list[str] = []
-
         try:
-            for event in harness.prompt(user_input):
-                assistant_text, tool_calls_info = self._handle_event(
-                    event, assistant_text, tool_calls_info,
-                )
+            async for event in self._harness.prompt(user_input):
+                self.adapter.apply(event)
+                self._render_latest()
+            self.host.save_session()
         except KeyboardInterrupt:
-            harness.cancel()
-            console.print("\n[bold red]✗ 已中断[/bold red]")
+            self._harness.cancel()
+            console.print("\n[bold red]x interrupted[/bold red]")
         except Exception as exc:
-            console.print(f"[bold red]✗ 错误: {exc}[/bold red]")
+            console.print(f"\n[bold red]x error: {exc}[/bold red]")
 
-    def _handle_event(
-        self,
-        event: AgentEvent,
-        assistant_text: str,
-        tool_calls_info: list[str],
-    ) -> tuple[str, list[str]]:
-        """处理 Agent 事件，更新渲染状态"""
-        if isinstance(event, AgentStartEvent):
-            pass
+        # 清空 assistant buffer
+        self.state.assistant_buffer = ""
 
-        elif isinstance(event, TurnStartEvent):
-            pass
+    def _render_latest(self) -> None:
+        """渲染最新的状态变更"""
+        items = self.state.items
+        if not items:
+            return
 
-        elif isinstance(event, MessageStartEvent):
-            if hasattr(event.message, "role") and event.message.role == "user":
-                console.print(f"[bold cyan]you>[/bold cyan] {event.message.text}")
+        item = items[-1]
+        self._render_item(item)
 
-        elif isinstance(event, MessageUpdateEvent):
-            # 逐 token 渲染
-            if hasattr(event.provider_event, "delta"):
-                delta = event.provider_event.delta
-                assistant_text += delta
-                # 实时打印 delta（不换行）
-                print(delta, end="", flush=True)
+    def _render_item(self, item: ChatItem) -> None:
+        """渲染单个 ChatItem"""
+        if item.role == "assistant":
+            if item.text:
+                console.print(Markdown(item.text))
 
-        elif isinstance(event, MessageEndEvent):
-            if hasattr(event.message, "role"):
-                if event.message.role == "assistant":
-                    if assistant_text:
-                        print()  # 换行
-                        # 如果有完整文本，用 markdown 渲染
-                        if len(assistant_text) > 50:
-                            console.print(Markdown(assistant_text))
-                    assistant_text = ""
+        elif item.role == "thinking":
+            if self.state.show_thinking and item.text:
+                console.print(f"[dim italic]> {item.text[:200]}[/dim italic]")
 
-        elif isinstance(event, ToolExecutionStartEvent):
-            info = f"⚙ {event.tool_name}"
-            tool_calls_info.append(info)
-            console.print(f"[yellow]{info}[/yellow]")
+        elif item.role == "tool":
+            # 工具调用
+            if item.tool_result_text is None:
+                # 正在执行
+                elapsed = ""
+                if item.started_at:
+                    import time
+                    secs = int(time.monotonic() - item.started_at)
+                    if secs > 0:
+                        elapsed = f" ({secs}s)"
+                status = item.update_text or ""
+                console.print(f"[yellow]- {item.text}{elapsed}[/yellow]")
+                if status:
+                    console.print(f"[dim]  {status[:200]}[/dim]")
+            else:
+                # 已完成
+                console.print(f"[yellow]- {item.text}[/yellow]")
+                console.print(f"[dim]{item.tool_result_text}[/dim]")
 
-        elif isinstance(event, ToolExecutionEndEvent):
-            status = "✓" if not event.is_error else "✗"
-            result_preview = event.result.text[:200] if event.result.text else ""
-            console.print(f"[dim]  {status} {result_preview}[/dim]")
+        elif item.role == "error":
+            console.print(f"[bold red]{item.text}[/bold red]")
 
-        elif isinstance(event, TurnEndEvent):
-            pass
-
-        elif isinstance(event, AgentEndEvent):
-            console.print()  # 空行分隔
-
-        return assistant_text, tool_calls_info
+        elif item.role == "status":
+            console.print(f"[dim]{item.text}[/dim]")
 
     def _render_slash_result(self, result: SlashResult) -> None:
-        """渲染斜杠命令结果"""
         if result.kind == "message":
             console.print(result.text)
         elif result.kind == "toast":
@@ -181,20 +182,20 @@ class DotTUI:
             console.print(f"[{style}]{result.text}[/{style}]")
         elif result.kind == "clear_screen":
             console.clear()
+            self.state.clear()
         elif result.kind == "quit":
             self._running = False
 
     def _make_approval_handler(self):
-        """创建权限审批回调"""
         def handler(info: dict) -> bool:
             console.print()
-            console.print("[bold yellow]【权限审批需人工确认】[/bold yellow]")
-            console.print(f"  工具: {info.get('tool_name', '')}")
-            console.print(f"  模式: {info.get('agent_mode', '')}")
-            console.print(f"  原因: {info.get('reason', '')}")
-            console.print(f"  参数: {str(info.get('args', {}))[:200]}")
+            console.print("[bold yellow]permission required[/bold yellow]")
+            console.print(f"  tool: {info.get('tool_name', '')}")
+            console.print(f"  mode: {info.get('agent_mode', '')}")
+            console.print(f"  reason: {info.get('reason', '')}")
+            console.print(f"  args: {str(info.get('args', {}))[:200]}")
             try:
-                answer = input("  输入 Y 执行 / N 取消: ").strip().lower()
+                answer = input("  approve? Y/N: ").strip().lower()
                 return answer in ("y", "yes")
             except (EOFError, KeyboardInterrupt):
                 return False

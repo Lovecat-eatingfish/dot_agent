@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from typing import Protocol
 
 from .events import ProviderEvent
-from .types import AgentMessage, ToolCall
+from .types import AgentMessage
 
 
 class ProviderCancellationToken(Protocol):
@@ -34,7 +34,7 @@ class ModelProvider(Protocol):
         model: str,
         system: str,
         messages: list[AgentMessage],
-        tools: list[ToolCall],
+        tools: list[AgentTool],
         signal: ProviderCancellationToken | None = None,
         session_id: str | None = None,
     ) -> AsyncIterator[ProviderEvent]:

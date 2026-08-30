@@ -30,6 +30,7 @@ from dot.ai.types import (
     ToolCall,
     ToolResultMessage,
 )
+from .cancel import SimpleCancellationToken
 
 from .events import (
     AgentEndEvent,
@@ -46,6 +47,7 @@ from .events import (
 )
 from .history import repair_tool_history
 from .tools import AgentTool, AgentToolResult
+from ..ai.providers import OpenAIProvider
 
 BeforeToolCall = Callable[[ToolCall], Awaitable[tuple[bool, str | None]]]
 AfterToolCall = Callable[
@@ -56,7 +58,7 @@ AfterToolCall = Callable[
 
 async def run_agent_loop(
     *,
-    provider: object,  # ModelProvider
+    provider: OpenAIProvider,  # ModelProvider
     model: str,
     system: str,
     messages: list[AgentMessage],
@@ -64,7 +66,7 @@ async def run_agent_loop(
     prompts: Sequence[AgentMessage] = (),
     prelude_messages: Sequence[AgentMessage] = (),
     max_turns: int | None = None,
-    signal: object | None = None,  # CancellationToken
+    signal: SimpleCancellationToken | None = None,  # CancellationToken
     session_id: str | None = None,
     get_steering_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
@@ -222,12 +224,12 @@ def _provider_context(messages: list[AgentMessage]) -> list[AgentMessage]:
 
 async def _assistant_events(
     *,
-    provider: object,
+    provider: OpenAIProvider,
     model: str,
     system: str,
     messages: list[AgentMessage],
     tools: list[AgentTool],
-    signal: object | None,
+    signal: SimpleCancellationToken | None,
     session_id: str | None,
 ) -> AsyncIterator[AgentEvent]:
     """消费 Provider 流式事件，转换为 Agent 事件"""
@@ -288,7 +290,7 @@ def _response_timing(
 async def _execute_tool_call(
     call: ToolCall,
     tools: Mapping[str, AgentTool],
-    signal: object | None,
+    signal: SimpleCancellationToken | None,
     before_tool_call: BeforeToolCall | None,
     after_tool_call: AfterToolCall | None,
 ) -> AsyncIterator[AgentEvent]:

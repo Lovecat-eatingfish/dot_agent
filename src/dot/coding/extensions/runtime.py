@@ -7,11 +7,11 @@ dot.coding.extensions.runtime — ExtensionRuntime
 - ExtensionGeneration liveness token：每次 /reload 创建新 generation，旧引用立即失效
 - fail-closed hook 链：hook 异常时默认阻止工具执行（block=True）
 - _notify 拷贝监听器列表：防止回调中取消订阅时的"迭代中修改集合"异常
-- accepting 标志：工具执行完毕后设为 False，防止幽灵更新
 """
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from inspect import isawaitable, signature
@@ -31,12 +31,44 @@ logger = logging.getLogger(__name__)
 HookFn = Callable[..., Awaitable[None] | None]
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
 
+# hook 时机全集：
+#   before_tool_call  — 工具执行前（可阻止）：fn(tool_call) -> (blocked, reason) | None
+#   after_tool_call   — 工具执行后（可改写结果）：fn(tool_call, result, is_error) -> (result, is_error) | None
+#   agent_start / agent_end / turn_start / turn_end /
+#   message_start / message_end /
+#   tool_execution_start / tool_execution_update / tool_execution_end
+#                     — 生命周期观察点：fn(event)，返回值忽略
+HOOK_TIMINGS = (
+    "before_tool_call", "after_tool_call",
+    "agent_start", "agent_end", "turn_start", "turn_end",
+    "message_start", "message_end",
+    "tool_execution_start", "tool_execution_update", "tool_execution_end",
+)
+
+# AgentEvent 类 -> 生命周期 hook 时机名
+_EVENT_TO_TIMING = {
+    "AgentStartEvent": "agent_start", "AgentEndEvent": "agent_end",
+    "TurnStartEvent": "turn_start", "TurnEndEvent": "turn_end",
+    "MessageStartEvent": "message_start", "MessageEndEvent": "message_end",
+    "MessageUpdateEvent": "message_update",
+    "ToolExecutionStartEvent": "tool_execution_start",
+    "ToolExecutionUpdateEvent": "tool_execution_update",
+    "ToolExecutionEndEvent": "tool_execution_end",
+}
+
+
+def timing_for_event(event: AgentEvent) -> str | None:
+    """AgentEvent -> hook 时机名（未知事件返回 None）"""
+    return _EVENT_TO_TIMING.get(type(event).__name__)
+
 
 @dataclass
 class HookEntry:
-    """一个注册的 hook"""
+    """一个注册的 hook（matcher 对工具时机匹配工具名，对生命周期时机匹配时机名）"""
     name: str
+    timing: str
     fn: HookFn
+    matcher: Any  # re.Pattern
     extension_name: str = ""
 
 
@@ -73,10 +105,8 @@ class ExtensionRuntime:
         self._commands: dict[str, Callable[..., Any]] = {}
         self._prompt_sections: list[str] = []
 
-        # Hook 链：tool_call hook（执行前，可阻止/重写参数）
-        self._tool_call_hooks: list[HookEntry] = []
-        # Hook 链：tool_result hook（执行后，可修改结果）
-        self._tool_result_hooks: list[HookEntry] = []
+        # Hook 链：按时机组织（before_tool_call / after_tool_call / agent_start / ...）
+        self._hooks: dict[str, list[HookEntry]] = {timing: [] for timing in HOOK_TIMINGS}
 
         # 事件监听
         self._event_listeners: list[EventSubscription] = []
@@ -88,6 +118,9 @@ class ExtensionRuntime:
 
         # 已加载模块及其上下文（reload 时用于 teardown）
         self._loaded: list[tuple[ExtensionModule, ExtensionContext]] = []
+
+        # harness 事件订阅的解绑函数（attach_to_harness 时赋值）
+        self._harness_unsub: Callable[[], None] | None = None
 
     @property
     def generation(self) -> ExtensionGeneration:
@@ -116,8 +149,8 @@ class ExtensionRuntime:
         self._tools.clear()
         self._commands.clear()
         self._prompt_sections.clear()
-        self._tool_call_hooks.clear()
-        self._tool_result_hooks.clear()
+        for entries in self._hooks.values():
+            entries.clear()
         self._event_listeners.clear()
         self._loaded.clear()
 
@@ -205,25 +238,24 @@ class ExtensionRuntime:
         self,
         tool_call: ToolCall,
     ) -> tuple[bool, str | None]:
-        """执行 tool_call hook 链（工具执行前）
+        """执行 before_tool_call hook 链（工具执行前）
 
-        Returns:
-            (blocked, reason) — blocked=True 表示阻止执行
-
+        按注册顺序执行 matcher 命中（正则匹配工具名）的 hook；
+        hook 返回 (True, reason) 阻止执行。
         fail-closed：hook 异常时默认阻止工具执行。
         """
-        for entry in list(self._tool_call_hooks):
+        for entry in list(self._hooks["before_tool_call"]):
+            if not entry.matcher.search(tool_call.name or ""):
+                continue
             try:
                 result = entry.fn(tool_call)
                 if isawaitable(result):
                     result = await result
-                if isinstance(result, tuple) and len(result) == 2:
-                    blocked, reason = result
-                    if blocked:
-                        return True, reason or f"Blocked by hook '{entry.name}'"
+                if isinstance(result, tuple) and len(result) == 2 and result[0]:
+                    return True, result[1] or f"Blocked by hook '{entry.name}'"
             except Exception as exc:
                 logger.error(
-                    "[extensions] tool_call hook '%s' error (fail-closed): %s",
+                    "[extensions] before_tool_call hook '%s' error (fail-closed): %s",
                     entry.name, exc,
                 )
                 return True, f"Hook '{entry.name}' raised an error: {exc}"
@@ -235,16 +267,16 @@ class ExtensionRuntime:
         result: AgentToolResult,
         is_error: bool,
     ) -> tuple[AgentToolResult, bool]:
-        """执行 tool_result hook 链（工具执行后）
+        """执行 after_tool_call hook 链（工具执行后）
 
-        Returns:
-            (result, is_error) — 可能被 hook 修改
-
+        按注册顺序执行 matcher 命中的 hook；hook 可返回 (result, is_error) 改写结果。
         fail-closed：hook 异常时默认返回错误结果。
         """
         from dot.ai.types import TextContent
 
-        for entry in list(self._tool_result_hooks):
+        for entry in list(self._hooks["after_tool_call"]):
+            if not entry.matcher.search(tool_call.name or ""):
+                continue
             try:
                 modified = entry.fn(tool_call, result, is_error)
                 if isawaitable(modified):
@@ -253,7 +285,7 @@ class ExtensionRuntime:
                     result, is_error = modified
             except Exception as exc:
                 logger.error(
-                    "[extensions] tool_result hook '%s' error (fail-closed): %s",
+                    "[extensions] after_tool_call hook '%s' error (fail-closed): %s",
                     entry.name, exc,
                 )
                 result = AgentToolResult(
@@ -264,22 +296,76 @@ class ExtensionRuntime:
                 return result, is_error
         return result, is_error
 
+    async def run_lifecycle_hooks(self, timing: str, event: AgentEvent) -> None:
+        """执行生命周期 hook（agent_start / turn_end / tool_execution_end 等观察点）
+
+        matcher 正则匹配时机名（默认 .* 全命中）；返回值忽略，异常只记日志。
+        """
+        # 工具事件按工具名匹配 matcher，其余生命周期时机按时机名匹配
+        tool_name = getattr(event, "tool_name", None)
+        subject = tool_name if tool_name is not None else timing
+        for entry in list(self._hooks.get(timing, [])):
+            if not entry.matcher.search(subject):
+                continue
+            try:
+                result = entry.fn(event)
+                if isawaitable(result):
+                    await result
+            except Exception as exc:
+                logger.error("[extensions] %s hook '%s' error: %s", timing, entry.name, exc)
+
+    # ============================================================
+    # 与 AgentHarness 的事件流对接
+    # ============================================================
+
+    def attach_to_harness(self, harness: Any) -> None:
+        """订阅 harness 的 AgentEvent 流，驱动生命周期 hook
+
+        同一 runtime 可安全多次 attach（先解绑旧的）。
+        """
+        if getattr(self, "_harness_unsub", None) is not None:
+            self._harness_unsub()
+        runtime = self
+
+        async def _on_agent_event(event: AgentEvent) -> None:
+            timing = timing_for_event(event)
+            if timing is not None:
+                await runtime.run_lifecycle_hooks(timing, event)
+            await runtime._notify_event_listeners(event, timing)
+
+
+        self._harness_unsub = harness.subscribe(_on_agent_event)
+
     # ============================================================
     # 事件分发
     # ============================================================
 
-    async def dispatch_event(self, event: AgentEvent) -> None:
-        """分发事件给订阅者
+    async def _notify_event_listeners(self, event: AgentEvent, timing: str | None) -> None:
+        """分发事件给 on_event 注册的被动监听（按 event_type 过滤）
 
-        拷贝监听器列表，防止回调中取消订阅时的"迭代中修改集合"异常。
+        event_type 支持时机名（如 "tool_execution_end"）或 "*"/"all"（全收）；
+        未知时机的事件只投递给通配监听。拷贝列表防止迭代中修改。
         """
+        if timing is None and not any(
+            sub.event_type in ("*", "all", "") for sub in self._event_listeners
+        ):
+            return
         for sub in list(self._event_listeners):
+            if not self._listener_matches(sub, timing):
+                continue
             try:
                 result = sub.fn(event)
                 if isawaitable(result):
                     await result
             except Exception as exc:
                 logger.debug("[extensions] Event listener error: %s", exc)
+
+    @staticmethod
+    def _listener_matches(sub: EventSubscription, timing: str | None) -> bool:
+        et = sub.event_type
+        if et in ("*", "all", ""):
+            return True
+        return timing is not None and et == timing
 
     # ============================================================
     # 运行时依赖
@@ -374,29 +460,46 @@ class _RuntimeAPI:
         self._check_alive()
         self._runtime._prompt_sections.append(section)
 
-    def register_tool_call_hook(self, name: str, fn: HookFn | None = None) -> Any:
-        """注册 tool_call hook，支持装饰器用法"""
-        self._check_alive()
-        if fn is not None:
-            self._runtime._tool_call_hooks.append(HookEntry(name=name, fn=fn))
-            return fn
+    def register_hook(
+        self,
+        timing: str,
+        fn: HookFn | None = None,
+        *,
+        name: str = "",
+        matcher: str = ".*",
+    ) -> Any:
+        """注册任意时机的 hook（支持装饰器用法）
 
-        def decorator(f: HookFn) -> HookFn:
-            self._runtime._tool_call_hooks.append(HookEntry(name=name, fn=f))
+        timing: HOOK_TIMINGS 之一（before_tool_call / after_tool_call / agent_start /
+                agent_end / turn_start / turn_end / message_start / message_end /
+                tool_execution_start / tool_execution_update / tool_execution_end）
+        matcher: 正则，对工具时机匹配工具名、对生命周期时机匹配时机名；默认全命中
+        """
+        self._check_alive()
+        if timing not in HOOK_TIMINGS:
+            raise ValueError(
+                f"Unknown hook timing: {timing!r} (valid: {', '.join(HOOK_TIMINGS)})"
+            )
+        compiled = re.compile(matcher)
+
+        def _register(f: HookFn) -> HookFn:
+            self._runtime._hooks[timing].append(HookEntry(
+                name=name or getattr(f, "__name__", "hook"),
+                timing=timing, fn=f, matcher=compiled,
+            ))
             return f
-        return decorator
+
+        if fn is not None:
+            return _register(fn)
+        return _register
+
+    def register_tool_call_hook(self, name: str, fn: HookFn | None = None) -> Any:
+        """兼容旧 API：等价于 register_hook("before_tool_call", ...)"""
+        return self.register_hook("before_tool_call", fn, name=name)
 
     def register_tool_result_hook(self, name: str, fn: HookFn | None = None) -> Any:
-        """注册 tool_result hook，支持装饰器用法"""
-        self._check_alive()
-        if fn is not None:
-            self._runtime._tool_result_hooks.append(HookEntry(name=name, fn=fn))
-            return fn
-
-        def decorator(f: HookFn) -> HookFn:
-            self._runtime._tool_result_hooks.append(HookEntry(name=name, fn=f))
-            return f
-        return decorator
+        """兼容旧 API：等价于 register_hook("after_tool_call", ...)"""
+        return self.register_hook("after_tool_call", fn, name=name)
 
     def send_user_message(self, content: str) -> None:
         self._check_alive()

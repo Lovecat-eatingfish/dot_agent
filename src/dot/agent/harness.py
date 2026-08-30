@@ -223,11 +223,9 @@ class AgentHarness:
             pass
 
     async def _notify(self, event: AgentEvent) -> None:
-        # 拷贝监听器列表，防止回调中取消订阅时的"迭代中修改集合"异常  给链路追踪使用的
+        # 分发给 harness 监听器（TraceCollector、扩展 hook/事件监听经 attach_to_harness 接入）
         for listener in list(self._listeners):
-            # 这个listener 就是：dot.coding.trace.collector.TraceCollector.on_event 方法
             result = listener(event)
-            # isawaitable() 是 Python 标准库 inspect 模块中的一个函数，用于检查一个对象是否可以被 await（即是否是可等待对象）。
             if isawaitable(result):
                 await result
 

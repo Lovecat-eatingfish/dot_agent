@@ -132,6 +132,8 @@ class CodingHost:
         config.before_tool_call = before_hook
         config.after_tool_call = after_hook
         self._harness = AgentHarness(config, messages=self._session.messages)
+        # AgentEvent 流 -> 扩展生命周期 hook（agent_start / turn_end / ...）
+        self.extensions.attach_to_harness(self._harness)
         # 订阅和初始化 TraceCollector
         self._attach_trace()
         return self._harness

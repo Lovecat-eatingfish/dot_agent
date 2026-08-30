@@ -48,12 +48,33 @@ class ExtensionAPI(Protocol):
         """注册一个斜杠命令"""
         ...
 
+    def register_hook(
+        self,
+        timing: str,
+        fn: Callable[..., Any] | None = None,
+        *,
+        name: str = "",
+        matcher: str = ".*",
+    ) -> Any:
+        """在指定时机注册 hook（支持装饰器），matcher 为正则匹配规则
+
+        时机（HOOK_TIMINGS）：
+          before_tool_call   fn(tool_call) -> (blocked, reason) | None   可阻止，fail-closed
+          after_tool_call    fn(tool_call, result, is_error) -> (result, is_error) | None
+          agent_start / agent_end / turn_start / turn_end /
+          message_start / message_end /
+          tool_execution_start / tool_execution_update / tool_execution_end
+                             fn(event)                                    观察点
+        matcher 正则：工具时机匹配工具名（如 r"bash"），生命周期时机匹配时机名。
+        """
+        ...
+
     def on_event(
         self,
         event_type: str,
         handler: Callable[[AgentEvent], Awaitable[None] | None],
     ) -> None:
-        """订阅事件（当前为全量广播，event_type 仅作声明用途）"""
+        """被动监听事件（不做匹配、不可阻止；需要拦截/改写请用 register_hook）"""
         ...
 
     def register_tool_call_hook(

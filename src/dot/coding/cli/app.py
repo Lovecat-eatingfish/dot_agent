@@ -33,13 +33,16 @@ def _main(
         resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a saved session by id"),
 ) -> None:
     """Default: TUI interactive mode"""
-    if ctx.invoked_subcommand is not None:
-        return
-    from dot.coding.cli.tui import DotTUI
-
+    # if ctx.invoked_subcommand is not None:
+    #     return
+    # from dot.coding.cli.tui import DotTUI
+    #
+    # workspace_path = Path(workspace).expanduser() if workspace else Path.cwd()
+    # tui = DotTUI(workspace_path, mode=AgentMode.from_str(mode), session_id=resume)
+    # tui.run()
+    """Interactive console (REPL) with logging"""
     workspace_path = Path(workspace).expanduser() if workspace else Path.cwd()
-    tui = DotTUI(workspace_path, mode=AgentMode.from_str(mode), session_id=resume)
-    tui.run()
+    sys.exit(run_console(workspace_path, mode=mode, session_id=resume))
 
 
 @app.command("console", help="Interactive console mode")

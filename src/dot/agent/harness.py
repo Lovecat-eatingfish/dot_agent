@@ -53,10 +53,10 @@ class AgentHarness:
     """可复用的有状态 Agent 核心，独立于 coding/UI 策略"""
 
     def __init__(
-        self,
-        config: AgentHarnessConfig,
-        *,
-        messages: Sequence[AgentMessage] = (),
+            self,
+            config: AgentHarnessConfig,
+            *,
+            messages: Sequence[AgentMessage] = (),
     ) -> None:
         self._config = config
         self._messages = list(messages)
@@ -146,7 +146,8 @@ class AgentHarness:
         self._running = True
         return self._run()
 
-    async def _run(self, *, prompts: Sequence[AgentMessage] = (), system_override: str | None = None) -> AsyncIterator[AgentEvent]:
+    async def _run(self, *, prompts: Sequence[AgentMessage] = (), system_override: str | None = None) -> AsyncIterator[
+        AgentEvent]:
         signal = SimpleCancellationToken()
         self._current_signal = signal
         try:
@@ -155,20 +156,20 @@ class AgentHarness:
             repairs = self._messages[repaired_from:]
             system = system_override if system_override is not None else self._config.system
             async for event in run_agent_loop(
-                provider=self._config.provider,
-                model=self._config.model,
-                system=system,
-                messages=self._messages,
-                prompts=prompts,
-                prelude_messages=repairs,
-                tools=self._config.tools,
-                max_turns=self._config.max_turns,
-                signal=signal,
-                session_id=self._config.session_id,
-                get_steering_messages=self._drain_steering_messages,
-                get_follow_up_messages=self._drain_follow_up_messages,
-                before_tool_call=self._config.before_tool_call,
-                after_tool_call=self._config.after_tool_call,
+                    provider=self._config.provider,
+                    model=self._config.model,
+                    system=system,
+                    messages=self._messages,
+                    prompts=prompts,
+                    prelude_messages=repairs,
+                    tools=self._config.tools,
+                    max_turns=self._config.max_turns,
+                    signal=signal,
+                    session_id=self._config.session_id,
+                    get_steering_messages=self._drain_steering_messages,
+                    get_follow_up_messages=self._drain_follow_up_messages,
+                    before_tool_call=self._config.before_tool_call,
+                    after_tool_call=self._config.after_tool_call,
             ):
                 await self._notify(event)
                 yield event
@@ -179,6 +180,7 @@ class AgentHarness:
 
     async def _shielded_cleanup(self, signal: SimpleCancellationToken) -> None:
         """受 shield 保护的清理逻辑"""
+
         async def _cleanup() -> None:
             if signal.is_cancelled():
                 repaired_from = len(self._messages)
@@ -200,7 +202,9 @@ class AgentHarness:
     async def _notify(self, event: AgentEvent) -> None:
         # 拷贝监听器列表，防止回调中取消订阅时的"迭代中修改集合"异常  给链路追踪使用的
         for listener in list(self._listeners):
+            # 这个listener 就是：dot.coding.trace.collector.TraceCollector.on_event 方法
             result = listener(event)
+            # isawaitable() 是 Python 标准库 inspect 模块中的一个函数，用于检查一个对象是否可以被 await（即是否是可等待对象）。
             if isawaitable(result):
                 await result
 

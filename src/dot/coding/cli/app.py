@@ -39,6 +39,18 @@ def _main(
     sys.exit(run_console(Path(workspace_str), mode=mode, session_id=resume))
 
 
+@app.command("console", help="Interactive console mode")
+def console_cmd(
+        workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+        mode: str = typer.Option("auto", "--mode", "-m"),
+        verbose: bool = typer.Option(False, "--verbose", "-v"),
+        resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a saved session by id"),
+) -> None:
+    """Interactive console (REPL) with logging"""
+    workspace_path = Path(workspace).expanduser() if workspace else Path.cwd()
+    sys.exit(run_console(workspace_path, mode=mode, verbose=verbose, session_id=resume))
+
+
 @app.command("run", help="Run a one-shot task")
 def run_cmd(
         task: str = typer.Argument(None, help="Task text"),
@@ -80,18 +92,6 @@ def run_cmd(
         raise typer.Exit(code=1)
 
     logger.info("done")
-
-
-@app.command("console", help="Interactive console mode")
-def console_cmd(
-        workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
-        mode: str = typer.Option("auto", "--mode", "-m"),
-        verbose: bool = typer.Option(False, "--verbose", "-v"),
-        resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a saved session by id"),
-) -> None:
-    """Interactive console (REPL) with logging"""
-    workspace_path = Path(workspace).expanduser() if workspace else Path.cwd()
-    sys.exit(run_console(workspace_path, mode=mode, verbose=verbose, session_id=resume))
 
 
 @app.command("sessions", help="List saved sessions")

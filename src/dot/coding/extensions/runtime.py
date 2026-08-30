@@ -22,7 +22,7 @@ from dot.agent.events import AgentEvent
 from dot.agent.tools import AgentTool, AgentToolResult
 from dot.ai.types import ToolCall
 
-from .api import ExtensionContext
+from .api import ExtensionContext, ExtensionAPI
 from .generation import ExtensionError, ExtensionGeneration
 from .loader import ExtensionLoader, ExtensionModule
 
@@ -403,7 +403,7 @@ class ExtensionRuntime:
 # _RuntimeAPI — ExtensionAPI 的运行时实现
 # ============================================================
 
-class _RuntimeAPI:
+class _RuntimeAPI(ExtensionAPI):
     """ExtensionAPI 的运行时实现
 
     扩展通过此对象注册工具、命令、事件监听。
@@ -502,6 +502,12 @@ class _RuntimeAPI:
         return self.register_hook("after_tool_call", fn, name=name)
 
     def send_user_message(self, content: str) -> None:
+        """把一条消息排队为 follow-up：当前回合结束后自动注入下一轮上下文"""
         self._check_alive()
-        # TODO: 注入 follow-up 消息到 AgentHarness
-        logger.info("[extensions] send_user_message queued: %s", content[:80])
+        host = self._runtime._runtime_deps.get("host")
+        harness = getattr(host, "_harness", None) if host is not None else None
+        if harness is None:
+            logger.warning("[extensions] send_user_message: no harness, dropped: %s", content[:80])
+            return
+        harness.follow_up(content)
+        logger.info("[extensions] send_user_message queued as follow-up: %s", content[:80])

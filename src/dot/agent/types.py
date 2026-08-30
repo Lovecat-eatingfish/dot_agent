@@ -1,7 +1,7 @@
 """
 dot.agent.types — Agent Loop 共享类型
 
-AgentLoopResult / AgentLoopConfig / TokenUsage 等。
+TokenUsage 等 Agent Loop 共享类型。
 """
 from __future__ import annotations
 
@@ -30,21 +30,4 @@ class ToolCallRecord:
     result_summary: str = ""
 
 
-@dataclass
-class AgentLoopResult:
-    """Inner Loop 返回值
 
-    通过函数返回值向外交付结果，不暴露内部状态。
-    """
-    final_message: str = ""
-    tool_calls: list[ToolCallRecord] = field(default_factory=list)
-    usage: TokenUsage = field(default_factory=TokenUsage)
-    was_cancelled: bool = False
-    stop_reason: str = "stop"
-
-
-@dataclass
-class AgentLoopConfig:
-    """Agent Loop 配置"""
-    max_turns: int | None = None
-    queue_mode: str = "one_at_a_time"  # "one_at_a_time" | "all"

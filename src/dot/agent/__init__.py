@@ -17,7 +17,7 @@ from .tools import AgentTool, AgentToolResult
 from .events import AgentEvent
 from .harness import AgentHarness
 from .loop import run_agent_loop
-from .types import AgentLoopResult, AgentLoopConfig, TokenUsage
+from .types import TokenUsage
 from .cancel import ProviderCancellationToken, ToolCancellationToken
 from .executor import execute_tool_safely
 from .history import repair_tool_history
@@ -33,9 +33,7 @@ __all__ = [
     # loop
     "run_agent_loop",
     # types
-    "AgentLoopResult",
-    "AgentLoopConfig",
-    "TokenUsage",
+            "TokenUsage",
     # cancel
     "ProviderCancellationToken",
     "ToolCancellationToken",

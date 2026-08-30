@@ -32,8 +32,7 @@ from .agent import (
     AgentEvent,
     AgentHarness,
     run_agent_loop,
-    AgentLoopResult,
-    execute_tool_safely,
+        execute_tool_safely,
     repair_tool_history,
 )
 
@@ -51,8 +50,6 @@ from .coding import (
     SlashResult,
     CodingHost,
     CodingEvent,
-    SessionState,
-    ToolContext,
     ExtensionRuntime,
     ExtensionLoader,
     ExtensionAPI,
@@ -73,8 +70,7 @@ __all__ = [
     "AgentEvent",
     "AgentHarness",
     "run_agent_loop",
-    "AgentLoopResult",
-    "execute_tool_safely",
+        "execute_tool_safely",
     "repair_tool_history",
     # coding
     "run_workflow",
@@ -89,8 +85,6 @@ __all__ = [
     "SlashResult",
     "CodingHost",
     "CodingEvent",
-    "SessionState",
-    "ToolContext",
     "ExtensionRuntime",
     "ExtensionLoader",
     "ExtensionAPI",

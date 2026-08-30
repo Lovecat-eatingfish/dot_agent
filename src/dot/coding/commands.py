@@ -170,7 +170,8 @@ class CommandRegistry:
         self.register(SlashCommand("skill", "/skill <name>", "expand skill content", self._cmd_skill))
         self.register(SlashCommand("skilllist", "/skilllist", "list all skills", self._cmd_skilllist))
         self.register(SlashCommand("reload", "/reload", "reload extensions", self._cmd_reload))
-        self.register(SlashCommand("compact", "/compact", "trigger compaction", self._cmd_compact))
+        # DEAD: _cmd_compact 是空 stub，压缩子系统未接入
+        self.register(SlashCommand("compact", "/compact", "compact context (L1/L2 now, L3 async)", self._cmd_compact))
         self.register(SlashCommand("sessions", "/sessions", "list saved sessions", self._cmd_sessions))
         self.register(SlashCommand("resume", "/resume <id>", "switch to a saved session", self._cmd_resume))
         self.register(SlashCommand("trace", "/trace [on|off]", "show or toggle tracing", self._cmd_trace))
@@ -229,6 +230,7 @@ class CommandRegistry:
             #         UserMessage(content=content)
             #     )
             #     return SlashResult(kind="toast", level="info", text=f"Skill '{skill_name}' loaded")
+            # DEAD: 旧架构残留，follow_up_message 机制已被 append_message 替代
             return SlashResult(kind="toast", level="warn", text="No active session to inject skill into")
         except Exception as exc:
             return SlashResult(kind="toast", level="error", text=f"/skill error: {exc}")
@@ -354,18 +356,28 @@ class CommandRegistry:
         )
 
     def _cmd_compact(self, args: str) -> SlashResult:
-        """触发上下文压缩"""
+        """触发上下文压缩（L1 截断可恢复结果 / L2 删老旧工具调用 / L3 调度 LLM 摘要）"""
+        if self._host is None or not hasattr(self._host, "compact_context"):
+            return SlashResult(kind="toast", level="error", text="/compact requires host context")
         try:
-            from .compress import plan_compaction
-            # TODO: 实际触发压缩逻辑
-            return SlashResult(kind="toast", level="info", text="compaction triggered")
+            report = self._host.compact_context()
         except Exception as exc:
             return SlashResult(kind="toast", level="error", text=f"/compact error: {exc}")
+        level = "warn" if report.startswith("no compaction") else "info"
+        return SlashResult(kind="toast", level=level, text=report)
 
 
 # 全局单例
 _registry: CommandRegistry | None = None
-_ext_generation: object | None = None  # ExtensionGeneration
+
+
+# DEAD: _ext_generation / get_extension_generation()
+# 旧架构遗留，代际管理已迁移到 ExtensionRuntime._generation
+# _ext_generation: object | None = None  # ExtensionGeneration
+#
+#
+# def get_extension_generation() -> object | None:
+#     return _ext_generation
 
 
 def get_command_registry() -> CommandRegistry:

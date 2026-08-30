@@ -185,6 +185,16 @@ class DotTUIApp(App[None]):
         self.query_one("#prompt", PromptInput).focus()
         self.set_interval(0.15, self._tick_status)
         self._refresh_status()
+        self.run_worker(self._startup_mcp(), exclusive=False)
+
+    async def _startup_mcp(self) -> None:
+        """启动时连接 .dot/mcp.json 配置的 MCP 服务器并刷新工具"""
+        try:
+            report = await self.host.connect_mcp()
+        except Exception as exc:
+            report = f"mcp startup error: {exc}"
+        if "no mcp servers" not in report:
+            await self.query_one(TranscriptView).add_status(f"· mcp: {report}")
 
     # ============================================================
     # 提交 / 补全

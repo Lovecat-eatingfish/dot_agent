@@ -132,6 +132,14 @@ async def _console_loop(harness: AgentHarness, host: CodingHost) -> None:
     commands = get_command_registry()
     commands.set_host(host)
 
+    # MCP 服务器连接（.dot/mcp.json，未配置时为 no-op）
+    try:
+        report = await host.connect_mcp()
+        if "no mcp servers" not in report:
+            print(f"mcp: {report}")
+    except Exception as exc:
+        log.warning("mcp startup failed: %s", exc)
+
     while True:
         try:
             # 打印可用命令

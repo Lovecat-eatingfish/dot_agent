@@ -181,7 +181,7 @@ async def _run_turn(harness: AgentHarness, user_input: str) -> None:
 
 
 def _process_event(event, buffer: list[str], thinking_buffer: list[str]) -> None:
-    """Process event: accumulate text deltas, flush on message end"""
+    """Process event: accumulate text deltas, flush on message end 给控制台调试使用的"""
     from dot.agent.events import (
         AgentEndEvent, AgentStartEvent, MessageEndEvent, MessageStartEvent,
         MessageUpdateEvent, ToolExecutionEndEvent, ToolExecutionStartEvent,

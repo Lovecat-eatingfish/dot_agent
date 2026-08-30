@@ -118,6 +118,7 @@ class CodingHost:
     ) -> AgentHarness:
         """创建 AgentHarness（若当前会话有历史消息则一并回灌）"""
         self._base_system = system
+        # 初始化 AgentHarness 配置： 主要是 模式，模型配置，插件机制（提示词，工具前/后调用扩展， 扩展工具注册）
         config = AgentHarnessConfig(
             provider=self.provider,
             model=model or self.provider.model,
@@ -129,6 +130,7 @@ class CodingHost:
         config.before_tool_call = before_hook
         config.after_tool_call = after_hook
         self._harness = AgentHarness(config, messages=self._session.messages)
+        # 订阅和初始化 TraceCollector
         self._attach_trace()
         return self._harness
 
@@ -140,9 +142,12 @@ class CodingHost:
         """为当前 harness 订阅 TraceCollector（DOT_TRACE_ENABLED=0 时为 Noop）"""
         from .trace import make_trace_collector
 
+        # 先取消旧的订阅
         self._detach_trace()
+        # 初始化 TraceCollector
         self._trace_collector = make_trace_collector(self.workspace, self._session.session_id)
         if self._harness is not None:
+            # 生成取消订阅 AgentEvent 流的函数
             self._trace_unsub = self._harness.subscribe(self._trace_collector.on_event)
 
     def _detach_trace(self) -> None:
@@ -242,11 +247,46 @@ class CodingHost:
         return self._session
 
     def save_session(self) -> None:
-        """将当前 harness 的消息同步到 session 并持久化"""
+        """兼容入口：等价于 end_turn（增量落盘 + git 快照）"""
+        self.end_turn()
+
+    def end_turn(self) -> int:
+        """一轮对话结束：把 harness 消息同步进 session，增量落盘 + git 快照
+
+        返回本轮 turn_id。
+        """
         if self._harness is not None:
             self._session.messages = list(self._harness.messages)
-        self._session_manager.session_storage.save(self._session)
-        logger.debug("[host] Session saved: %s", self._session.session_id)
+        new_messages = self._session.messages[self._session._persisted_count:]
+        turn_id = self._session_manager.commit_turn(new_messages)
+        return turn_id
+
+    def list_turns(self) -> list[dict]:
+        """列出当前会话的所有轮次（/rewind 列表用）"""
+        session = self._session
+        out: list[dict] = []
+        for i, t in enumerate(session.turns):
+            start = session.turns[i - 1].msg_count_end if i > 0 else 0
+            preview = ""
+            for m in session.messages[start:t.msg_count_end]:
+                if getattr(m, "role", "") == "user" and getattr(m, "text", ""):
+                    preview = m.text[:80]
+                    break
+            out.append({
+                "turn_id": t.turn_id, "timestamp": t.timestamp,
+                "commit": t.commit, "preview": preview,
+            })
+        return out
+
+    def rewind_to_turn(self, turn_id: int) -> dict:
+        """回滚到指定轮次：截断消息历史 + 恢复 workspace 文件（git reset）"""
+        commit = self._session_manager.rewind(turn_id)
+        if self._harness is not None:
+            self._harness.replace_messages(self._session.messages)
+        return {
+            "turn_id": turn_id, "commit": commit,
+            "messages": len(self._session.messages),
+        }
 
     def resume_session(self, session_id: str) -> bool:
         """切换到指定历史会话并把消息回灌到当前 harness

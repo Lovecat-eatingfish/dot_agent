@@ -11,8 +11,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from dot.ai.types import SkillMessage
-
 log = logging.getLogger(__name__)
 
 
@@ -121,6 +119,7 @@ class CommandRegistry:
         self.register(SlashCommand("sessions", "/sessions", "list saved sessions", self._cmd_sessions))
         self.register(SlashCommand("resume", "/resume <id>", "switch to a saved session", self._cmd_resume))
         self.register(SlashCommand("trace", "/trace [on|off]", "show or toggle tracing", self._cmd_trace))
+        self.register(SlashCommand("rewind", "/rewind [n]", "rewind to turn n (messages + files)", self._cmd_rewind))
 
     def _cmd_help(self, args: str) -> SlashResult:
         return SlashResult(kind="message", text=self.build_help_text())
@@ -265,6 +264,36 @@ class CommandRegistry:
         return SlashResult(
             kind="message",
             text=f"tracing: {status}  (session {info['session_id']})\noutput: {info['output_dir']}",
+        )
+
+    def _cmd_rewind(self, args: str) -> SlashResult:
+        """回滚对话与 workspace 文件到指定轮次"""
+        arg = args.strip()
+        if self._host is None or not hasattr(self._host, "rewind_to_turn"):
+            return SlashResult(kind="toast", level="error", text="/rewind requires host context")
+
+        if not arg:
+            turns = self._host.list_turns()
+            if not turns:
+                return SlashResult(kind="message", text="no turns recorded yet")
+            lines = [f"  {t['turn_id']:>3}  {t['timestamp']}  {t['commit'][:8] or '-':<8}  {t['preview']}"
+                     for t in turns]
+            return SlashResult(kind="message", text="turns (latest last):\n" + "\n".join(lines))
+
+        try:
+            turn_id = int(arg)
+        except ValueError:
+            return SlashResult(kind="toast", level="error", text=f"invalid turn id: {arg}")
+        try:
+            result = self._host.rewind_to_turn(turn_id)
+        except ValueError:
+            return SlashResult(kind="toast", level="error", text=f"unknown turn id: {turn_id}")
+        except Exception as exc:
+            return SlashResult(kind="toast", level="error", text=f"/rewind error: {exc}")
+        git_note = f", files -> {result['commit'][:8]}" if result["commit"] else " (no git snapshot)"
+        return SlashResult(
+            kind="toast", level="info",
+            text=f"rewound to turn {turn_id}: {result['messages']} messages kept{git_note}",
         )
 
     def _cmd_compact(self, args: str) -> SlashResult:

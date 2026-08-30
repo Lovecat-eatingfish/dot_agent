@@ -198,7 +198,7 @@ class AgentHarness:
             pass
 
     async def _notify(self, event: AgentEvent) -> None:
-        # 拷贝监听器列表，防止回调中取消订阅时的"迭代中修改集合"异常
+        # 拷贝监听器列表，防止回调中取消订阅时的"迭代中修改集合"异常  给链路追踪使用的
         for listener in list(self._listeners):
             result = listener(event)
             if isawaitable(result):

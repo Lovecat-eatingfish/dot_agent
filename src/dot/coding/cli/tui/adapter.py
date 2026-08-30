@@ -15,6 +15,7 @@ from dot.agent.events import (
     MessageUpdateEvent,
     ToolExecutionEndEvent,
     ToolExecutionStartEvent,
+    ToolExecutionUpdateEvent,
     TurnEndEvent,
     TurnStartEvent,
 )
@@ -30,6 +31,7 @@ class TuiEventAdapter:
     def __init__(self, state: TuiState) -> None:
         self.state = state
         self._assistant_start_item_index: int | None = None
+        self._tool_batch_ids: dict[str, int] = {}
 
     def apply(self, event: AgentEvent) -> None:
         if isinstance(event, AgentStartEvent):
@@ -60,8 +62,7 @@ class TuiEventAdapter:
             if isinstance(nested, TextDeltaEvent):
                 self.state.assistant_buffer += nested.delta
             elif isinstance(nested, ThinkingDeltaEvent):
-                if self.state.show_thinking:
-                    self._append_thinking(nested.delta)
+                self.state.add_thinking_delta(nested.delta)
             return
 
         if isinstance(event, MessageEndEvent):
@@ -79,6 +80,18 @@ class TuiEventAdapter:
                     self.state.add_assistant_message(msg)
                 self.state.assistant_buffer = ""
                 self._assistant_start_item_index = None
+                # 连续工具调用归组为一个 batch（对齐 tau 的折叠分组）
+                previous_was_tool = False
+                batch_id: int | None = None
+                for block in msg.content:
+                    from dot.ai.types import ToolCall as _ToolCall
+                    if isinstance(block, _ToolCall):
+                        if not previous_was_tool:
+                            batch_id = self.state.new_tool_batch_id()
+                        self._tool_batch_ids[block.id] = batch_id or 0
+                        previous_was_tool = True
+                    else:
+                        previous_was_tool = False
             return
 
         if isinstance(event, ToolExecutionStartEvent):
@@ -88,7 +101,10 @@ class TuiEventAdapter:
                 name=event.tool_name,
                 arguments=event.args,
             )
-            self.state.add_tool_call(tool_call)
+            self.state.add_tool_call(
+                tool_call,
+                batch_id=self._tool_batch_ids.pop(event.tool_call_id, None),
+            )
             return
 
         if isinstance(event, ToolExecutionUpdateEvent):
@@ -108,9 +124,3 @@ class TuiEventAdapter:
         if self.state.assistant_buffer:
             self.state.add_item("assistant", self.state.assistant_buffer)
             self.state.assistant_buffer = ""
-
-    def _append_thinking(self, delta: str) -> None:
-        if self.state.items and self.state.items[-1].role == "thinking":
-            self.state.items[-1].text += delta
-        else:
-            self.state.add_item("thinking", delta)

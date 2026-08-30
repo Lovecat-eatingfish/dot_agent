@@ -248,8 +248,6 @@ def _build_openai_messages(system: str, messages: list[AgentMessage]) -> list[di
     return result
 
 
-
-
 def _build_openai_tools(tools: list[AgentTool]) -> list[dict]:
     """将 AgentTool 列表转为 openai SDK 工具格式"""
     return [

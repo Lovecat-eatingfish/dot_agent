@@ -29,14 +29,17 @@ app = typer.Typer(
 def _main(
         ctx: typer.Context,
         workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
-        mode: str = typer.Option("auto", "--mode", "-m"),
+        mode: str = typer.Option("plan", "--mode", "-m"),
         resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a saved session by id"),
 ) -> None:
-    """Default: console interactive mode"""
+    """Default: TUI interactive mode"""
     if ctx.invoked_subcommand is not None:
         return
-    workspace_str = str(Path(workspace).expanduser()) if workspace else str(Path.cwd())
-    sys.exit(run_console(Path(workspace_str), mode=mode, session_id=resume))
+    from dot.coding.cli.tui import DotTUI
+
+    workspace_path = Path(workspace).expanduser() if workspace else Path.cwd()
+    tui = DotTUI(workspace_path, mode=AgentMode.from_str(mode), session_id=resume)
+    tui.run()
 
 
 @app.command("console", help="Interactive console mode")
@@ -92,6 +95,20 @@ def run_cmd(
         raise typer.Exit(code=1)
 
     logger.info("done")
+
+
+@app.command("tui", help="Interactive TUI mode (Textual)")
+def tui_cmd(
+        workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
+        mode: str = typer.Option("auto", "--mode", "-m"),
+        resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a saved session by id"),
+) -> None:
+    """Full-screen TUI (Textual): transcript + autocomplete + permission modal"""
+    from dot.coding.cli.tui import DotTUI
+
+    workspace_path = Path(workspace).expanduser() if workspace else Path.cwd()
+    tui = DotTUI(workspace_path, mode=AgentMode.from_str(mode), session_id=resume)
+    tui.run()
 
 
 @app.command("sessions", help="List saved sessions")

@@ -17,9 +17,11 @@ log = logging.getLogger(__name__)
 @dataclass
 class SlashResult:
     """斜杠命令执行结果"""
-    kind: str = "message"  # message | toast | clear_screen | quit | none
+    kind: str = "message"  # message | toast | clear_screen | quit | prompt | none
     text: str = ""
     level: str = "info"  # info | warn | error
+    # kind == "prompt" 时：text 是要送入 agent 的完整 prompt（skill 内容 + 任务），
+    # 由 UI 层（console / TUI）负责执行 agent 回合并落盘。
 
 
 @dataclass
@@ -37,17 +39,70 @@ class CommandRegistry:
     def __init__(self) -> None:
         self._commands: dict[str, SlashCommand] = {}
         self._host: Any = None  # CodingHost 引用，由 TUI/CLI 注入
+        self._skill_command_names: set[str] = set()
         self._register_builtins()
 
     def set_host(self, host: Any) -> None:
         """注入 CodingHost 引用，使 /mode、/reload 等命令能操作实际状态"""
         self._host = host
+        self.refresh_skills()
 
     def register(self, command: SlashCommand) -> None:
         self._commands[command.name] = command
 
     def unregister(self, name: str) -> bool:
         return self._commands.pop(name, None) is not None
+
+    # ============================================================
+    # Skill 即命令（对标 Claude Code：/<skill-name> <task> 直接驱动 agent）
+    # ============================================================
+
+    def refresh_skills(self) -> int:
+        """扫描 workspace 下的 SKILL.md，把每个 skill 注册为独立斜杠命令
+
+        命令名 = skill 名；执行时展开 skill 内容 + 用户任务，以 kind="prompt"
+        返回给 UI 层送入 agent。内置命令名冲突时跳过（内置优先）。
+        """
+        for name in list(self._skill_command_names):
+            self._commands.pop(name, None)
+        self._skill_command_names.clear()
+
+        from .skills.manager import SkillManager
+
+        workspace = getattr(self._host, "workspace", None) or Path.cwd()
+        manager = SkillManager()
+        try:
+            manager.scan_directory(workspace)
+        except OSError as exc:
+            log.warning("[commands] skill scan failed: %s", exc)
+            return 0
+
+        registered = 0
+        for skill in manager.list_skills():
+            if skill.name in self._commands:
+                log.warning("[commands] skill '%s' conflicts with existing command, skipped", skill.name)
+                continue
+            self.register(SlashCommand(
+                name=skill.name,
+                usage=f"/{skill.name} <task>",
+                description=f"skill: {skill.description[:60]}",
+                handler=self._make_skill_handler(skill),
+            ))
+            self._skill_command_names.add(skill.name)
+            registered += 1
+        if registered:
+            log.info("[commands] %d skills registered as slash commands", registered)
+        return registered
+
+    @staticmethod
+    def _make_skill_handler(skill) -> Callable[[str], SlashResult]:
+        def handler(args: str) -> SlashResult:
+            task = args.strip()
+            prompt = skill.to_prompt_section()
+            if task:
+                prompt += f"\n\n<task>\n{task}\n</task>"
+            return SlashResult(kind="prompt", text=prompt)
+        return handler
 
     def get(self, name: str) -> SlashCommand | None:
         return self._commands.get(name)
@@ -210,7 +265,9 @@ class CommandRegistry:
         try:
             if self._host is not None and hasattr(self._host, "refresh_extensions"):
                 loaded = self._host.refresh_extensions()
-                return SlashResult(kind="toast", level="info", text=f"extensions reloaded ({loaded} loaded)")
+                skills = self.refresh_skills()
+                return SlashResult(kind="toast", level="info",
+                                   text=f"extensions reloaded ({loaded} loaded, {skills} skills)")
             # 无 host 时退化为仅重新扫描（不推荐）
             from .extensions.runtime import ExtensionRuntime
             runtime = ExtensionRuntime()

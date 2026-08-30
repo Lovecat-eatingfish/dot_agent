@@ -13,14 +13,18 @@ ASK 审批：有 UI 时弹确认框，无 UI 时自动降级 DENY（无头兜底
 from __future__ import annotations
 
 import json
+import logging
 import re
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
 from enum import Enum
+from inspect import isawaitable
 from pathlib import Path
 from typing import Any, Callable
 
 from .modes import AgentMode
 
+logger = logging.getLogger(__name__)
 SECURITY_CONFIG_FILE = ".agent-security.json"
 
 FILE_TOOLS = {"read_file", "write_file", "edit_file", "glob_search", "grep"}
@@ -82,11 +86,18 @@ class ProjectSecurityConfig:
 
     def match_file(self, rel_path: str) -> str | None:
         from fnmatch import fnmatch
-        normalized = rel_path.replace("\\", "/").lstrip("./")
+        normalized = rel_path.replace("\\", "/")
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+        normalized = normalized.lstrip("/")
         if not normalized:
             return None
         for pattern in self.deny_file_patterns:
-            if fnmatch(normalized, pattern) or fnmatch(normalized, f"**/{pattern}"):
+            candidates = [pattern]
+            if pattern.startswith("**/"):
+                # globstar 语义：**/ 匹配任意深度，含顶层文件本身
+                candidates.append(pattern[len("**/"):])
+            if any(fnmatch(normalized, c) for c in candidates):
                 return pattern
         return None
 
@@ -159,7 +170,7 @@ class PermissionManager:
                     if not resolved.is_relative_to(ws_resolved):
                         return PermissionDecision(Decision.DENY, "system", "path traversal blocked")
                 except Exception:
-                    pass
+                    logger.error(f"Error resolving path: {path_str}")
 
         # ---- 2. 项目自定义黑名单 ----
         if tool_name == "bash":
@@ -194,14 +205,14 @@ class PermissionManager:
 
         return PermissionDecision(Decision.ALLOW, "mode", "auto mode")
 
-    def ask_user(
+    async def ask_user(
         self,
         tool_name: str,
         args: dict[str, Any],
         decision: PermissionDecision,
         *,
         agent_mode: str = "",
-    ) -> bool:
+    ) -> bool | Awaitable[bool]:
         """发起人工审批；无交互能力时自动降级 DENY"""
         info = {
             "tool_name": tool_name,
@@ -214,7 +225,10 @@ class PermissionManager:
         if handler is None:
             return False
         try:
-            return bool(handler(info))
+            result = handler(info)
+            if isawaitable(result):
+                result = await result
+            return bool(result)
         except (EOFError, KeyboardInterrupt):
             return False
         except Exception:

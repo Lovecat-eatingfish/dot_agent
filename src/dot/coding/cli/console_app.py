@@ -21,7 +21,7 @@ log = logging.getLogger("console")
 
 def run_console(
         workspace: Path,
-        mode: str = "auto",
+        mode: str = "plan",
         verbose: bool = False,
         session_id: str | None = None,
 ) -> int:
@@ -40,6 +40,9 @@ def run_console(
             Path(__file__).resolve().parents[2] / ".dot" / "extensions"
         ],
     )
+
+    # 设置审批处理函数 ==> 不需要在 harness 里面绑定
+    host.permission.set_approval_handler(approval_handler)
 
     # 恢复会话
     if session_id:
@@ -150,11 +153,21 @@ async def _console_loop(harness: AgentHarness, host: CodingHost) -> None:
                 print(f"[{result.level}] {result.text}")
             elif result.kind == "message":
                 print(result.text)
+            elif result.kind == "prompt":
+                # skill 即命令：把 skill 内容 + 任务送入 agent 执行
+                try:
+                    await _run_turn(harness, result.text)
+                    host.end_turn()
+                except asyncio.CancelledError:
+                    print("interrupted")
+                except Exception as exc:
+                    log.error("Turn failed: %s", exc, exc_info=True)
+                    print(f"error: {exc}")
             continue
 
         try:
             await _run_turn(harness, user_input)
-            host.save_session()
+            host.end_turn()
         except asyncio.CancelledError:
             print("interrupted")
         except Exception as exc:

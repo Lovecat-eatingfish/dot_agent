@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from typing import TYPE_CHECKING
 from time import monotonic_ns
 
 from dot.ai.events import (
@@ -49,6 +50,11 @@ from .history import repair_tool_history
 from .tools import AgentTool, AgentToolResult
 from ..ai.providers import OpenAIProvider
 
+if TYPE_CHECKING:
+    # 仅类型标注使用：运行时实例由 CodingHost 注入；运行时的 Decision 在
+    # _execute_tool_call 内延迟导入，避免 agent → coding 的循环导入
+    from ..coding.permission import PermissionManager
+
 BeforeToolCall = Callable[[ToolCall], Awaitable[tuple[bool, str | None]]]
 AfterToolCall = Callable[
     [ToolCall, AgentToolResult, bool],
@@ -72,6 +78,8 @@ async def run_agent_loop(
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     before_tool_call: BeforeToolCall | None = None,
     after_tool_call: AfterToolCall | None = None,
+    permission: PermissionManager | None = None,
+    agent_mode: str = "auto",
 ) -> AsyncIterator[AgentEvent]:
     """运行 Provider/Tool 循环，发射 Agent 事件
 
@@ -90,6 +98,8 @@ async def run_agent_loop(
         get_follow_up_messages: 获取 follow-up 消息回调
         before_tool_call: 工具执行前 hook
         after_tool_call: 工具执行后 hook
+        permission: 权限管理器（None 表示跳过权限检查）
+        agent_mode: 当前 agent 模式字符串（plan / edit / auto）
 
     Yields:
         AgentEvent: Agent 生命周期事件
@@ -186,6 +196,8 @@ async def run_agent_loop(
                     signal,
                     before_tool_call,
                     after_tool_call,
+                    permission,
+                    agent_mode,
                 ):
                     yield event
                     if isinstance(event, MessageEndEvent) and isinstance(
@@ -293,8 +305,15 @@ async def _execute_tool_call(
     signal: SimpleCancellationToken | None,
     before_tool_call: BeforeToolCall | None,
     after_tool_call: AfterToolCall | None,
+    permission: PermissionManager | None,
+    agent_mode: str = "auto",
 ) -> AsyncIterator[AgentEvent]:
-    """执行单个工具调用，发射工具执行事件"""
+    """执行单个工具调用，发射工具执行事件
+
+    执行顺序：extension before_hook → 权限检查（系统/项目/模式三层）→ 工具执行
+    """
+    from ..coding.permission import Decision  # 延迟导入避免循环依赖
+
     yield ToolExecutionStartEvent(
         tool_call_id=call.id,
         tool_name=call.name,
@@ -303,8 +322,32 @@ async def _execute_tool_call(
 
     blocked = False
     block_reason: str | None = None
+
+    # 1. Extension before_hook（用户扩展优先拦截）
     if before_tool_call is not None:
         blocked, block_reason = await before_tool_call(call)
+
+    # 2. 权限检查（三层拦截：系统黑名单 → 项目黑名单 → 模式规则）
+    if not blocked and permission is not None:
+        decision = permission.check(call.name, dict(call.arguments), agent_mode=agent_mode)
+        if decision.decision is Decision.DENY:
+            blocked = True
+            block_reason = decision.deny_message()
+        elif decision.decision is Decision.ASK:
+            approved = await permission.ask_user(
+                call.name, dict(call.arguments), decision, agent_mode=agent_mode,
+            )
+            if not approved:
+                blocked = True
+                block_reason = decision.deny_message()
+            else:
+                # 用户批准，重新检查（仅 bypass 模式规则，系统/项目黑名单仍生效）
+                final_decision = permission.check(
+                    call.name, dict(call.arguments), agent_mode=agent_mode, approved=True,
+                )
+                if final_decision.decision is Decision.DENY:
+                    blocked = True
+                    block_reason = final_decision.deny_message()
 
     if blocked:
         result = _error_result(block_reason or "Tool execution was blocked")

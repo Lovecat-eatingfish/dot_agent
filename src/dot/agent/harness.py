@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from inspect import isawaitable
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from dot.ai.types import AgentMessage, AssistantMessage, TextContent, ToolResultMessage, UserMessage
 
@@ -21,6 +21,11 @@ from .events import AgentEvent, MessageEndEvent, MessageStartEvent
 from .loop import AfterToolCall, BeforeToolCall, run_agent_loop
 from .tools import AgentTool
 from ..ai.providers import OpenAIProvider
+
+if TYPE_CHECKING:
+    # 仅类型标注使用：运行时不导入，避免 agent → coding 的循环导入
+    # （权限管理器实例由 CodingHost 通过 AgentHarnessConfig 注入）
+    from ..coding.permission import PermissionManager
 
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
 QueueMode = Literal["one_at_a_time", "all"]
@@ -47,6 +52,8 @@ class AgentHarnessConfig:
     session_id: str | None = None
     before_tool_call: BeforeToolCall | None = None
     after_tool_call: AfterToolCall | None = None
+    permission: PermissionManager | None = None
+    agent_mode: str = "auto"
 
 
 class AgentHarness:
@@ -100,14 +107,28 @@ class AgentHarness:
         self._config.tools = list(tools)
 
     def subscribe(self, listener: EventListener) -> Callable[[], None]:
-        """订阅事件，返回 unsubscribe 函数"""
-        self._listeners.append(listener)
+        """
+        # 使用场景
+        event_bus = EventBus()
 
-        def unsubscribe() -> None:
+        # 订阅事件
+        def my_handler(event):
+            print(f"处理: {event}")
+
+        unsubscribe = event_bus.subscribe(my_handler)  # 获取取消订阅函数
+
+        # 稍后取消订阅
+        unsubscribe()  # 闭包记住了要移除哪个 listener
+        :param listener:
+        :return:
+        """
+        self._listeners.append(listener)  # 保存监听器
+
+        def unsubscribe() -> None:         # 闭包函数
             with suppress(ValueError):
-                self._listeners.remove(listener)
+                self._listeners.remove(listener)  # 捕获外部变量 listener
 
-        return unsubscribe
+        return unsubscribe  # 返回闭包
 
     def cancel(self) -> None:
         if self._current_signal is not None:
@@ -170,6 +191,8 @@ class AgentHarness:
                     get_follow_up_messages=self._drain_follow_up_messages,
                     before_tool_call=self._config.before_tool_call,
                     after_tool_call=self._config.after_tool_call,
+                    permission=self._config.permission,
+                    agent_mode=self._config.agent_mode,
             ):
                 await self._notify(event)
                 yield event

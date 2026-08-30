@@ -39,7 +39,6 @@ class CodingHost:
             mode: AgentMode = AgentMode.AUTO,
             extra_extension_dirs: list[Path] | None = None,
     ) -> None:
-        from .cli.console_app import approval_handler
         self.workspace = workspace or Path.cwd()
         self.mode = mode
 
@@ -51,8 +50,6 @@ class CodingHost:
         # 权限管理
         self.permission = get_permission_manager()
         self.permission.load_project(self.workspace)
-        # 设置审批处理函数
-        self.permission.set_approval_handler(approval_handler)
 
         # 扩展运行时
         self.extensions = ExtensionRuntime(
@@ -107,7 +104,10 @@ class CodingHost:
         return self._builtin_tools + self.extensions.tools
 
     def set_mode(self, mode: AgentMode) -> None:
+        """切换模式并同步到当前 harness（权限检查读取 harness 配置里的模式快照）"""
         self.mode = mode
+        if self._harness is not None:
+            self._harness._config.agent_mode = mode.value
 
     def create_harness(
             self,
@@ -125,6 +125,8 @@ class CodingHost:
             system=self._compose_system(system),
             tools=self._tools,
             max_turns=max_turns,
+            permission=self.permission,
+            agent_mode=self.mode.value,
         )
         before_hook, after_hook = self.extensions.make_tool_hooks()
         config.before_tool_call = before_hook

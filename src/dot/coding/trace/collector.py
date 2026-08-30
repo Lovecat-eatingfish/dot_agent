@@ -157,16 +157,19 @@ class TraceCollector:
             self._exporter.wait_flushed()
 
     def _push_span(self, service: str, name: str) -> Span:
+        # 如果有父 span，设置为当前 span 的 id
         parent_id = self._span_stack[-1].span_id if self._span_stack else ""
         span = Span(
             trace_id=self._trace_id,
             span_id=uuid.uuid4().hex[:16],
+            # 链接到父节点 span
             parent_span_id=parent_id,
             service=service,
             name=name,
         )
         if self._session_id:
             span.tags["session_id"] = self._session_id
+        # 保存 span 到栈和列表
         self._span_stack.append(span)
         self._spans.append(span)
         return span

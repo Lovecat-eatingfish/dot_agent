@@ -69,7 +69,14 @@ class TuiState:
         self.error = text
         self.add_item("error", f"Error: {text}")
 
-    def add_tool_call(self, tool_call: ToolCall) -> None:
+    def add_thinking_delta(self, delta: str) -> None:
+        """流式追加 thinking 文本（合并进最后一条 thinking 项）"""
+        if self.items and self.items[-1].role == "thinking":
+            self.items[-1].text += delta
+        else:
+            self.add_item("thinking", delta)
+
+    def add_tool_call(self, tool_call: ToolCall, *, batch_id: int | None = None) -> None:
         invocation = format_tool_call_block(tool_call)
         self.add_item(
             "tool",
@@ -78,6 +85,7 @@ class TuiState:
             tool_name=tool_call.name,
             tool_arguments=tool_call.arguments,
             started_at=time.monotonic(),
+            tool_batch_id=batch_id,
         )
 
     def find_tool_item(self, tool_call_id: str) -> ChatItem | None:

@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 
 from dot.agent.events import AgentEvent
 from dot.agent.harness import AgentHarness, AgentHarnessConfig
@@ -289,7 +290,11 @@ class CodingHost:
             if not url:
                 reports.append(f"{name}: no url, skipped")
                 continue
-            client = MCPClient(name, url)
+            client = MCPClient(
+                name, url,
+                transport=cfg.get("transport", "auto"),
+                headers=cfg.get("headers") or None,
+            )
             try:
                 tools = await client.make_agent_tools()
             except Exception as exc:

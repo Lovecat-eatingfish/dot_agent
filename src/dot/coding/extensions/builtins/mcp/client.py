@@ -27,6 +27,10 @@ from dot.ai.types import TextContent
 
 logger = logging.getLogger(__name__)
 
+# Streamable HTTP 的 GET 推流在不支持它的服务器上会 405，SDK 重试 2 次后自动放弃，
+# 这是协议允许的正常行为（工具调用走 POST 通道，不受影响）——压掉重连过程的 INFO 刷屏
+logging.getLogger("mcp.client.streamable_http").setLevel(logging.WARNING)
+
 MCP_CONFIG_FILE = "mcp.json"
 
 
@@ -47,11 +51,26 @@ def load_mcp_config(workspace: Path) -> dict[str, dict[str, Any]]:
 
 
 class MCPClient:
-    """单个 MCP 服务器的 SSE 客户端（保持长连接，自动重连一次）"""
+    """单个 MCP 服务器客户端（保持长连接，自动重连一次）
 
-    def __init__(self, name: str, url: str) -> None:
+    transport:
+      "http" — Streamable HTTP（现代服务器，URL 无 /sse 后缀）
+      "sse"  — SSE（旧式服务器，URL 以 /sse 结尾）
+      "auto" — 先试 http，失败回退 sse（默认）
+    """
+
+    def __init__(
+        self,
+        name: str,
+        url: str,
+        *,
+        transport: str = "auto",
+        headers: dict[str, str] | None = None,
+    ) -> None:
         self.name = name
         self.url = url
+        self.transport = transport
+        self.headers = headers or {}
         self._session: Any = None
         self._stack: Any = None
 
@@ -60,16 +79,43 @@ class MCPClient:
         return self._session is not None
 
     async def connect(self) -> None:
-        """建立 SSE 会话并 initialize（重复调用先关闭旧连接）"""
+        """建立会话并 initialize（重复调用先关闭旧连接）"""
         from mcp import ClientSession
-        from mcp.client.sse import sse_client
 
         await self.close()
         self._stack = contextlib.AsyncExitStack()
-        streams = await self._stack.enter_async_context(sse_client(self.url))
+        streams = await self._open_streams()
         self._session = await self._stack.enter_async_context(ClientSession(*streams))
         await self._session.initialize()
-        logger.info("[mcp] Connected: %s (%s)", self.name, self.url)
+        logger.info("[mcp] Connected: %s (%s, transport=%s)", self.name, self.url, self.transport)
+
+    async def _open_streams(self) -> tuple[Any, Any]:
+        """按 transport 打开读写流；auto = 先 streamable http，失败回退 sse"""
+        from mcp.client.sse import sse_client
+
+        if self.transport == "sse":
+            return await self._stack.enter_async_context(sse_client(self.url, headers=self.headers))
+        if self.transport == "http":
+            return await self._open_http_streams()
+        # auto
+        try:
+            return await self._open_http_streams()
+        except Exception as exc:
+            logger.info("[mcp] %s streamable-http failed (%s), falling back to sse", self.name, exc)
+            await self.close()
+            self._stack = contextlib.AsyncExitStack()
+            return await self._stack.enter_async_context(sse_client(self.url, headers=self.headers))
+
+    async def _open_http_streams(self) -> tuple[Any, Any]:
+        from mcp.client.streamable_http import streamable_http_client
+
+        if self.headers:
+            from mcp.shared._httpx_utils import create_mcp_http_client
+            http_client = create_mcp_http_client(headers=self.headers)
+            return await self._stack.enter_async_context(
+                streamable_http_client(self.url, http_client=http_client),
+            )
+        return await self._stack.enter_async_context(streamable_http_client(self.url))
 
     async def close(self) -> None:
         if self._stack is not None:
@@ -92,7 +138,12 @@ class MCPClient:
             {
                 "name": tool.name,
                 "description": tool.description or "",
-                "input_schema": tool.inputSchema or {"type": "object", "properties": {}},
+                # mcp 1.x 用 inputSchema，2.x 用 input_schema
+                "input_schema": (
+                    getattr(tool, "input_schema", None)
+                    or getattr(tool, "inputSchema", None)
+                    or {"type": "object", "properties": {}}
+                ),
             }
             for tool in result.tools
         ]

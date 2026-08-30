@@ -32,15 +32,10 @@ def _main(
         mode: str = typer.Option("plan", "--mode", "-m"),
         resume: Optional[str] = typer.Option(None, "--resume", "-r", help="Resume a saved session by id"),
 ) -> None:
-    """Default: TUI interactive mode"""
-    # if ctx.invoked_subcommand is not None:
-    #     return
-    # from dot.coding.cli.tui import DotTUI
-    #
-    # workspace_path = Path(workspace).expanduser() if workspace else Path.cwd()
-    # tui = DotTUI(workspace_path, mode=AgentMode.from_str(mode), session_id=resume)
-    # tui.run()
-    """Interactive console (REPL) with logging"""
+    """Default: interactive console (REPL)"""
+    if ctx.invoked_subcommand is not None:
+        return
+    # todo： 测试阶段优先用这个console，后面使用tui
     workspace_path = Path(workspace).expanduser() if workspace else Path.cwd()
     sys.exit(run_console(workspace_path, mode=mode, session_id=resume))
 
@@ -63,9 +58,14 @@ def run_cmd(
         workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
         mode: str = typer.Option("auto", "--mode", "-m"),
 ) -> None:
-    """Run a task and output results via logging"""
+    """Run a one-shot task through the plan → code → validate workflow"""
     import logging
+    from dot.agent.events import (
+        MessageEndEvent, ToolExecutionEndEvent, ToolExecutionStartEvent,
+    )
+    from dot.ai.types import AssistantMessage
     from dot.coding.logging_config import setup as setup_logging
+    from dot.coding.state import WorkflowPhase
 
     workspace_str = str(Path(workspace).expanduser()) if workspace else str(Path.cwd())
     setup_logging(workspace=Path(workspace_str), level="INFO")
@@ -81,23 +81,52 @@ def run_cmd(
     logger.info("[run] task: %s", task[:200])
 
     host = CodingHost(workspace=Path(workspace_str), mode=AgentMode.from_str(mode))
-    context = WorkflowContext(task=task)
+
+    async def _run_one_shot() -> int:
+        from dot.coding.workflow import run_workflow
+
+        await host.connect_mcp()
+        context = WorkflowContext(task=task)
+        logger.info("─── phase: %s ───", WorkflowPhase.PLAN.value)  # 起始阶段（变更时事件流才会再发）
+
+        async for event in run_workflow(context, host):
+            if isinstance(event, WorkflowPhase):
+                logger.info("─── phase: %s ───", event.value)
+            elif isinstance(event, ToolExecutionStartEvent):
+                logger.info("[tool] %s %s", event.tool_name, str(event.args)[:150])
+            elif isinstance(event, ToolExecutionEndEvent):
+                status = "FAIL" if event.is_error else "OK"
+                detail = event.result.text[:150] if event.result else ""
+                logger.info("[tool] %s [%s] %s", event.tool_name, status, detail)
+            elif isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
+                text = event.message.text
+                if text.strip():
+                    for line in text.rstrip().splitlines():
+                        logger.info("[ai] %s", line)
+
+        # 会话落盘（增量 + git 快照）与链路追踪收尾
+        host.end_turn()
+        host.flush_trace()
+        if context.validate_result and not context.validate_result.passed:
+            logger.error("validation failed: %s", context.validate_result.message[:200])
+            return 1
+        return 0
 
     try:
-        async def _collect():
-            from dot.coding.workflow import run_workflow
-            async for event in run_workflow(context, host):
-                if hasattr(event, "value"):
-                    logger.info("[phase] %s", event.value)
-                elif hasattr(event, "message"):
-                    logger.info("[agent] %s", str(event)[:200])
-
-        asyncio.run(_collect())
+        exit_code = asyncio.run(_run_one_shot())
+    except KeyboardInterrupt:
+        if host._harness is not None:
+            host._harness.cancel()
+        host.flush_trace()
+        logger.warning("interrupted")
+        raise typer.Exit(code=130)
     except Exception as exc:
         logger.error("Failed: %s", exc, exc_info=True)
         raise typer.Exit(code=1)
 
-    logger.info("done")
+    logger.info("work flow 运行完毕")
+    if exit_code != 0:
+        raise typer.Exit(code=exit_code)
 
 
 @app.command("tui", help="Interactive TUI mode (Textual)")

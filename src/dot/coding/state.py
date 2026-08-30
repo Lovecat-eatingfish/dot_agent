@@ -35,10 +35,14 @@ class WorkflowContext:
     """
     task: str = ""
     plan: str | None = None
+    # 重新规划次数
     replan_count: int = 0
     validate_result: ValidationResult | None = None
+    # work flow 的 状态机
     phase: WorkflowPhase = WorkflowPhase.PLAN
+    # 最大重新规划次数
     max_replan: int = 3
+    # 错误信息
     error: str | None = None
 
     def should_replan(self) -> bool:

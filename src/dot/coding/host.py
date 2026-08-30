@@ -282,6 +282,7 @@ class CodingHost:
 
         servers = load_mcp_config(self.workspace)
         if not servers:
+            logger.info("[host] no mcp servers configured")
             return "no mcp servers configured"
 
         reports = []

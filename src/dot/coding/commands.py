@@ -21,7 +21,8 @@ class SlashResult:
     text: str = ""
     level: str = "info"  # info | warn | error
     # kind == "prompt" 时：text 是要送入 agent 的完整 prompt（skill 内容 + 任务），
-    # 由 UI 层（console / TUI）负责执行 agent 回合并落盘。
+    # kind == "workflow" 时：text 是 coding workflow 的任务文本。
+    # 两者都由 UI 层（console / TUI）负责执行并落盘。
 
 
 @dataclass
@@ -176,9 +177,16 @@ class CommandRegistry:
         self.register(SlashCommand("resume", "/resume <id>", "switch to a saved session", self._cmd_resume))
         self.register(SlashCommand("trace", "/trace [on|off]", "show or toggle tracing", self._cmd_trace))
         self.register(SlashCommand("rewind", "/rewind [n]", "rewind to turn n (messages + files)", self._cmd_rewind))
+        self.register(SlashCommand("workflow", "/workflow <task>", "run plan → code → validate", self._cmd_workflow))
 
     def _cmd_help(self, args: str) -> SlashResult:
         return SlashResult(kind="message", text=self.build_help_text())
+
+    def _cmd_workflow(self, args: str) -> SlashResult:
+        task = args.strip()
+        if not task:
+            return SlashResult(kind="toast", level="warn", text="Usage: /workflow <task>")
+        return SlashResult(kind="workflow", text=task)
 
     def _cmd_mode(self, args: str) -> SlashResult:
         from .modes import AgentMode

@@ -17,6 +17,7 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
@@ -33,15 +34,29 @@ from dot.agent.events import (
     ToolExecutionUpdateEvent,
 )
 from dot.ai.events import TextDeltaEvent, ThinkingDeltaEvent
-from dot.ai.types import AssistantMessage, UserMessage
+from dot.ai.types import AgentMessage, AssistantMessage, UserMessage
 from dot.coding.commands import get_command_registry
 from dot.coding.host import CodingHost
 from dot.coding.modes import AgentMode
+from dot.workflow import (
+    WorkflowDoneEvent,
+    WorkflowErrorEvent,
+    WorkflowInterruptEvent,
+    WorkflowNodeStartEvent,
+)
 
 from .adapter import TuiEventAdapter
 from .autocomplete import build_completion_state, render_completions
 from .state import TuiState
-from .widgets import StatusBar, TranscriptView
+from .widgets import QueueStatus, StatusBar, TranscriptView
+
+
+def _message_text(message: AgentMessage) -> str:
+    text = getattr(message, "text", None)
+    if isinstance(text, str):
+        return text
+    content = getattr(message, "content", "")
+    return content if isinstance(content, str) else str(content)
 
 
 # ============================================================
@@ -65,10 +80,16 @@ class PromptInput(TextArea):
     ]
 
     def action_submit(self) -> None:
-        self.post_message(self.Submitted(self.text))
+        if getattr(getattr(self.app, "state", None), "running", False):
+            self.app.queue_running_message(self.text, deliver_as="steer")
+        else:
+            self.post_message(self.Submitted(self.text))
 
     def action_newline(self) -> None:
-        self.insert("\n")
+        if getattr(getattr(self.app, "state", None), "running", False):
+            self.app.queue_running_message(self.text, deliver_as="follow_up")
+        else:
+            self.insert("\n")
 
     def action_accept_completion(self) -> None:
         completion = self.app._completion
@@ -128,6 +149,45 @@ class PermissionModal(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class WorkflowInterventionModal(ModalScreen[bool]):
+    """人工介入弹窗：继续会开启新的 replan 预算，拒绝则结束 workflow。"""
+
+    BINDINGS = [
+        Binding("y", "continue_workflow", "Continue"),
+        Binding("n", "stop_workflow", "Stop"),
+        Binding("escape", "stop_workflow", "Stop", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    WorkflowInterventionDialog { width: 72; height: auto; border: thick $warning;
+                                 background: $panel; padding: 1 2; }
+    """
+
+    def __init__(self, reason: str, issues: list[str]) -> None:
+        super().__init__()
+        self._reason = reason
+        self._issues = issues
+
+    def compose(self) -> ComposeResult:
+        details = self._reason
+        if self._issues:
+            details += "\n\n" + "\n".join(f"- {issue}" for issue in self._issues[:8])
+        yield Vertical(
+            Static(
+                "[bold yellow]Workflow needs your decision[/bold yellow]\n\n"
+                f"{details}\n\n"
+                "[dim]y = continue with a new plan · n / Esc = stop[/dim]",
+            ),
+            classes="WorkflowInterventionDialog",
+        )
+
+    def action_continue_workflow(self) -> None:
+        self.dismiss(True)
+
+    def action_stop_workflow(self) -> None:
+        self.dismiss(False)
+
+
 # ============================================================
 # 主应用
 # ============================================================
@@ -166,6 +226,7 @@ class DotTUIApp(App[None]):
             system=system or "You are a helpful coding assistant.",
         )
         self._run_id = 0
+        self._workflow_ctx = None
         self._completion: Any = None
 
     # ============================================================
@@ -176,6 +237,7 @@ class DotTUIApp(App[None]):
         with Vertical(id="main"):
             yield TranscriptView()
             with Vertical(id="input-area"):
+                yield QueueStatus(id="queue-status")
                 yield Static(id="autocomplete")
                 yield PromptInput(id="prompt", soft_wrap=True)
             yield StatusBar()
@@ -207,10 +269,29 @@ class DotTUIApp(App[None]):
         prompt = self.query_one("#prompt", PromptInput)
         prompt.text = ""
         self._set_completion(None)
+        if self.state.running:
+            self._harness.steer(text)
+            self._refresh_status()
+            return
         if text.startswith("/"):
             await self._render_slash_result(self.commands.execute(text))
             return
         self._run_agent_turn(text)
+
+    def queue_running_message(self, text: str, *, deliver_as: str) -> None:
+        """Queue input submitted while the active harness is running."""
+        text = text.strip()
+        if not text:
+            return
+        if deliver_as == "steer":
+            self._harness.steer(text)
+        elif deliver_as == "follow_up":
+            self._harness.follow_up(text)
+        else:
+            raise ValueError("deliver_as must be 'steer' or 'follow_up'")
+        self.query_one("#prompt", PromptInput).text = ""
+        self._set_completion(None)
+        self._refresh_status()
 
     def on_text_area_changed(self, event: TextArea.Changed) -> None:
         if event.text_area.id == "prompt":
@@ -243,6 +324,20 @@ class DotTUIApp(App[None]):
         if self._completion and self._completion.active:
             self._completion.move_previous()
             self._refresh_completion_panel()
+        elif self._harness.is_running and not self.query_one("#prompt", PromptInput).text:
+            self.action_edit_latest_queued()
+
+    def action_edit_latest_queued(self) -> None:
+        """Move the newest queued follow-up or steering message back to input."""
+        message = self._harness.pop_latest_follow_up()
+        if message is None:
+            message = self._harness.pop_latest_steering()
+        if message is None:
+            return
+        prompt = self.query_one("#prompt", PromptInput)
+        prompt.text = _message_text(message)
+        prompt.move_cursor(prompt.document.end)
+        self._refresh_status()
 
     def _refresh_completion_panel(self) -> None:
         panel = self.query_one("#autocomplete", Static)
@@ -252,6 +347,47 @@ class DotTUIApp(App[None]):
     # ============================================================
     # Agent 回合（Textual worker，exclusive）
     # ============================================================
+
+    @work(exclusive=True, group="prompt")
+    async def _run_workflow_turn(self, task: str) -> None:
+        """Run the coding workflow with TUI-backed human intervention."""
+        from dot.coding.workflow import create_context, run_workflow
+
+        self._run_id += 1
+        run_id = self._run_id
+        self.state.running = True
+        self._set_running_visual(True)
+        self.host.permission.set_approval_handler(self._make_approval_handler())
+        context = create_context(task)
+        self._workflow_ctx = context
+        transcript = self.query_one(TranscriptView)
+        try:
+            async for event in run_workflow(
+                    context,
+                    self.host,
+                    ui_mode="tui",
+                    human_intervene=self._make_workflow_intervention_handler(),
+                    harness=self._harness,
+            ):
+                if run_id != self._run_id:
+                    return
+                self.adapter.apply(event)
+                self._refresh_status()
+                await self._apply_event_to_transcript(event)
+            self.host.end_turn()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await transcript.add_error(str(exc))
+        finally:
+            if self._workflow_ctx is context:
+                self._workflow_ctx = None
+            if run_id == self._run_id:
+                self.state.running = False
+                self.state.assistant_buffer = ""
+                await transcript.finish_streaming()
+                self._set_running_visual(False)
+                self._refresh_status()
 
     @work(exclusive=True, group="prompt")
     async def _run_agent_turn(self, text: str) -> None:
@@ -268,6 +404,7 @@ class DotTUIApp(App[None]):
                 if run_id != self._run_id:
                     return  # 陈旧事件：已被更新的一次回合取代
                 self.adapter.apply(event)
+                self._refresh_status()
                 await self._apply_event_to_transcript(event)
             self.host.end_turn()
         except asyncio.CancelledError:
@@ -286,7 +423,19 @@ class DotTUIApp(App[None]):
         """事件 → 增量渲染（对齐 tau：增量为主，终态校正）"""
         transcript = self.query_one(TranscriptView)
 
-        if isinstance(event, MessageStartEvent):
+        if isinstance(event, WorkflowNodeStartEvent):
+            await transcript.add_status(f"· workflow: {event.node}")
+
+        elif isinstance(event, WorkflowErrorEvent):
+            await transcript.add_error(event.error)
+
+        elif isinstance(event, WorkflowInterruptEvent):
+            await transcript.add_status(f"· waiting for decision: {event.reason}")
+
+        elif isinstance(event, WorkflowDoneEvent):
+            await transcript.add_status("· workflow complete")
+
+        elif isinstance(event, MessageStartEvent):
             if isinstance(event.message, AssistantMessage):
                 await transcript.start_streaming()
 
@@ -330,7 +479,19 @@ class DotTUIApp(App[None]):
         self._refresh_status()
 
     def _refresh_status(self) -> None:
-        bar = self.query_one(StatusBar)
+        queued = self._harness.queued_messages
+        self.state.update_queue(
+            steering=tuple(_message_text(message) for message in queued.steering),
+            follow_up=tuple(_message_text(message) for message in queued.follow_up),
+        )
+        try:
+            self.query_one(QueueStatus).render_state(self.state)
+        except NoMatches:
+            pass
+        try:
+            bar = self.query_one(StatusBar)
+        except NoMatches:
+            return
         bar.render_state(
             self.state,
             mode_label=self.host.mode.label,
@@ -343,6 +504,9 @@ class DotTUIApp(App[None]):
         if result.kind == "prompt":
             # skill 即命令：skill 内容 + 任务作为一轮对话送入 agent
             self._run_agent_turn(result.text)
+            return
+        if result.kind == "workflow":
+            self._run_workflow_turn(result.text)
             return
         if result.kind == "message":
             await transcript.add_status(result.text)
@@ -367,6 +531,8 @@ class DotTUIApp(App[None]):
         if not self.state.running:
             return
         self._run_id += 1  # 使陈旧事件失效
+        if self._workflow_ctx is not None:
+            self._workflow_ctx.signal.cancel()
         self._harness.cancel()
         for worker in list(self.workers):
             if worker.group == "prompt":
@@ -422,6 +588,29 @@ class DotTUIApp(App[None]):
             return await fut
 
         return _approve
+
+    def _make_workflow_intervention_handler(self):
+        async def _intervene(event: WorkflowInterruptEvent) -> bool:
+            loop = asyncio.get_running_loop()
+            future: asyncio.Future[bool] = loop.create_future()
+
+            def _push() -> None:
+                if future.done():
+                    return
+                issues = event.payload.get("issues", [])
+                if not isinstance(issues, list):
+                    issues = []
+                self.push_screen(
+                    WorkflowInterventionModal(event.reason, issues),
+                    callback=lambda approved: (
+                        None if future.done() else future.set_result(bool(approved))
+                    ),
+                )
+
+            self.call_later(_push)
+            return await future
+
+        return _intervene
 
 
 # ============================================================

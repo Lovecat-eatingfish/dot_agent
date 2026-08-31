@@ -171,3 +171,30 @@ class StatusBar(Static):
         self.update(
             f" {mode_label} │ {workspace} │ session {session_id} │ {status} │ /help for commands"
         )
+
+
+class QueueStatus(Static):
+    """Compact preview of messages waiting behind the active run."""
+
+    DEFAULT_CSS = """
+    QueueStatus { height: auto; max-height: 4; display: none; color: $text-muted;
+                  padding: 0 1; background: $panel; }
+    QueueStatus.visible { display: block; }
+    """
+
+    def render_state(self, state: TuiState) -> None:
+        lines: list[str] = []
+        if state.queued_steering:
+            lines.append(self._line("steer", state.queued_steering))
+        if state.queued_follow_up:
+            lines.append(self._line("follow-up", state.queued_follow_up))
+        self.update("\n".join(lines))
+        self.set_class(bool(lines), "visible")
+
+    @staticmethod
+    def _line(label: str, messages: tuple[str, ...]) -> str:
+        preview = messages[-1].replace("\n", " ").strip()
+        if len(preview) > 100:
+            preview = preview[:97] + "..."
+        suffix = f": {preview}" if preview else ""
+        return f"{label} {len(messages)}{suffix}"

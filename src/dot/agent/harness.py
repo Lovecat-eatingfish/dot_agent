@@ -124,7 +124,7 @@ class AgentHarness:
         """
         self._listeners.append(listener)  # 保存监听器
 
-        def unsubscribe() -> None:         # 闭包函数
+        def unsubscribe() -> None:  # 闭包函数
             with suppress(ValueError):
                 self._listeners.remove(listener)  # 捕获外部变量 listener
 
@@ -153,6 +153,14 @@ class AgentHarness:
         self._steering_queue.clear()
         self._follow_up_queue.clear()
         return snapshot
+
+    def pop_latest_steering(self) -> AgentMessage | None:
+        """Remove and return the most recently queued steering message."""
+        return self._steering_queue.pop() if self._steering_queue else None
+
+    def pop_latest_follow_up(self) -> AgentMessage | None:
+        """Remove and return the most recently queued follow-up message."""
+        return self._follow_up_queue.pop() if self._follow_up_queue else None
 
     def prompt_message(self, message: AgentMessage, *, system: str | None = None) -> AsyncIterator[AgentEvent]:
         self._ensure_not_running()

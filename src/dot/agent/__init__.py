@@ -15,12 +15,13 @@ from __future__ import annotations
 
 from .tools import AgentTool, AgentToolResult
 from .events import AgentEvent
-from .harness import AgentHarness
+from .harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from .loop import run_agent_loop
 from .types import TokenUsage
 from .cancel import ProviderCancellationToken, ToolCancellationToken
 from .executor import execute_tool_safely
 from .history import repair_tool_history
+from .workflow import AgentNode
 
 __all__ = [
     # tools
@@ -30,10 +31,12 @@ __all__ = [
     "AgentEvent",
     # harness
     "AgentHarness",
+    "AgentHarnessConfig",
+    "QueuedMessages",
     # loop
     "run_agent_loop",
     # types
-            "TokenUsage",
+    "TokenUsage",
     # cancel
     "ProviderCancellationToken",
     "ToolCancellationToken",
@@ -41,4 +44,6 @@ __all__ = [
     "execute_tool_safely",
     # history
     "repair_tool_history",
+    # workflow adapter
+    "AgentNode",
 ]

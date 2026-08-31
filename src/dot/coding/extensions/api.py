@@ -12,7 +12,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from dot.agent.events import AgentEvent
 from dot.agent.tools import AgentTool
@@ -99,6 +99,19 @@ class ExtensionAPI(Protocol):
         """向 system prompt 添加段落"""
         ...
 
-    def send_user_message(self, content: str) -> None:
-        """发送用户消息到 agent"""
+    def send_user_message(
+        self,
+        content: str,
+        *,
+        deliver_as: Literal["steer", "follow_up"] = "follow_up",
+    ) -> None:
+        """发送用户消息到 agent；运行中默认作为 follow-up 排队。"""
+        ...
+
+    def queue_steering_message(self, content: str) -> None:
+        """把消息排队到当前 agent 回合的 steering 队列。"""
+        ...
+
+    def queue_follow_up_message(self, content: str) -> None:
+        """把消息排队到当前 agent 回合结束后的 follow-up 队列。"""
         ...

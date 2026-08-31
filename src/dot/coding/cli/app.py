@@ -15,7 +15,6 @@ import typer
 from dot.coding.cli.console_app import run_console
 from dot.coding.host import CodingHost
 from dot.coding.modes import AgentMode
-from dot.coding.state import WorkflowContext
 
 app = typer.Typer(
     name="agent",
@@ -65,7 +64,8 @@ def run_cmd(
     )
     from dot.ai.types import AssistantMessage
     from dot.coding.logging_config import setup as setup_logging
-    from dot.coding.state import WorkflowPhase
+    from dot.coding.workflow import create_context, get_state, run_workflow
+    from dot.workflow import WorkflowNodeStartEvent
 
     workspace_str = str(Path(workspace).expanduser()) if workspace else str(Path.cwd())
     setup_logging(workspace=Path(workspace_str), level="INFO")
@@ -83,15 +83,13 @@ def run_cmd(
     host = CodingHost(workspace=Path(workspace_str), mode=AgentMode.from_str(mode))
 
     async def _run_one_shot() -> int:
-        from dot.coding.workflow import run_workflow
-
         await host.connect_mcp()
-        context = WorkflowContext(task=task)
-        logger.info("─── phase: %s ───", WorkflowPhase.PLAN.value)  # 起始阶段（变更时事件流才会再发）
+        context = create_context(task)
+        logger.info("─── phase: plan ───")  # 起始节点（变更时事件流才会再发）
 
-        async for event in run_workflow(context, host):
-            if isinstance(event, WorkflowPhase):
-                logger.info("─── phase: %s ───", event.value)
+        async for event in run_workflow(context, host, ui_mode="console"):
+            if isinstance(event, WorkflowNodeStartEvent):
+                logger.info("─── phase: %s ───", event.node)
             elif isinstance(event, ToolExecutionStartEvent):
                 logger.info("[tool] %s %s", event.tool_name, str(event.args)[:150])
             elif isinstance(event, ToolExecutionEndEvent):
@@ -107,8 +105,9 @@ def run_cmd(
         # 会话落盘（增量 + git 快照）与链路追踪收尾
         host.end_turn()
         host.flush_trace()
-        if context.validate_result and not context.validate_result.passed:
-            logger.error("validation failed: %s", context.validate_result.message[:200])
+        state = get_state(context)
+        if state.validate_result and not state.validate_result.passed:
+            logger.error("validation failed: %s", state.validate_result.message[:200])
             return 1
         return 0
 

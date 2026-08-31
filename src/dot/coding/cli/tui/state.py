@@ -44,6 +44,8 @@ class TuiState:
     error: str | None = None
     show_tool_results: bool = False
     show_thinking: bool = False
+    queued_steering: tuple[str, ...] = ()
+    queued_follow_up: tuple[str, ...] = ()
     _tool_items_by_call_id: dict[str, ChatItem] = field(
         default_factory=dict, init=False, repr=False, compare=False,
     )
@@ -117,6 +119,15 @@ class TuiState:
         self._tool_items_by_call_id.clear()
         self.assistant_buffer = ""
         self.error = None
+
+    def update_queue(
+        self,
+        *,
+        steering: tuple[str, ...] = (),
+        follow_up: tuple[str, ...] = (),
+    ) -> None:
+        self.queued_steering = steering
+        self.queued_follow_up = follow_up
 
     def new_tool_batch_id(self) -> int:
         self._next_tool_batch_id += 1

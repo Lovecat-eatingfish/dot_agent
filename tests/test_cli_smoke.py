@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typer.testing import CliRunner
 
-from dot.cli.app import app
+from dot.coding.cli.app import app
 
 runner = CliRunner()
 
@@ -11,12 +11,12 @@ runner = CliRunner()
 def test_cli_help_available() -> None:
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
-    assert "interactive" in result.output
+    assert "interactive" in result.output.lower()
     assert "run" in result.output
 
 
-def test_cli_interactive_help() -> None:
-    result = runner.invoke(app, ["interactive", "--help"])
+def test_cli_tui_help() -> None:
+    result = runner.invoke(app, ["tui", "--help"])
     assert result.exit_code == 0
     assert "--workspace" in result.output
     assert "--mode" in result.output

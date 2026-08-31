@@ -1,22 +1,13 @@
 """
-dot.coding.state — 外层 Workflow 状态
+dot.coding.state — coding 工作流的业务状态
 
-WorkflowPhase 枚举 + WorkflowContext dataclass，
-替代 LangGraph 的隐式状态机（3 个布尔 flag）。
+通用的图 / 上下文抽象在 dot.workflow；这里只放 plan→code→validate
+这条业务工作流自己的状态对象（挂在 WorkflowContext.data 中传递），
+替代旧的 WorkflowPhase 显式状态机——阶段流转现在由图的边和路由函数表达。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
-
-
-class WorkflowPhase(Enum):
-    """外层 workflow 的显式状态机"""
-    PLAN = "plan"
-    CODE = "code"
-    VALIDATE = "validate"
-    HUMAN_INTERVENE = "human_intervene"
-    DONE = "done"
 
 
 @dataclass
@@ -28,35 +19,29 @@ class ValidationResult:
 
 
 @dataclass
-class WorkflowContext:
-    """外层 workflow 的状态容器
-
-    通过函数返回值传递结果，不通过共享 Session 字段通信。
-    """
-    task: str = ""
+class CodingWorkflowState:
+    """plan→code→validate 工作流的业务状态"""
+    task: str
     plan: str | None = None
-    # 重新规划次数
     replan_count: int = 0
-    validate_result: ValidationResult | None = None
-    # work flow 的 状态机
-    phase: WorkflowPhase = WorkflowPhase.PLAN
-    # 最大重新规划次数
     max_replan: int = 3
-    # 错误信息
+    validate_result: ValidationResult | None = None
+    validation_history: list[ValidationResult] = field(default_factory=list)
     error: str | None = None
+    human_intervention_count: int = 0
 
     def should_replan(self) -> bool:
-        """是否应该重新规划"""
+        """是否还有重新规划的机会"""
         return self.replan_count < self.max_replan
 
     def mark_replan(self) -> None:
+        """记录一次 replan，清空上一轮验证结果"""
         self.replan_count += 1
-        self.phase = WorkflowPhase.PLAN
         self.validate_result = None
 
-    def mark_done(self) -> None:
-        self.phase = WorkflowPhase.DONE
-
-    def mark_error(self, error: str) -> None:
-        self.error = error
-        self.phase = WorkflowPhase.DONE
+    def continue_after_human_intervention(self) -> None:
+        """人工确认后开启一轮新的 replan 预算"""
+        self.human_intervention_count += 1
+        self.replan_count = 0
+        self.validate_result = None
+        self.error = None

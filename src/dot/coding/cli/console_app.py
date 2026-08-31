@@ -171,6 +171,15 @@ async def _console_loop(harness: AgentHarness, host: CodingHost) -> None:
                 except Exception as exc:
                     log.error("Turn failed: %s", exc, exc_info=True)
                     print(f"error: {exc}")
+            elif result.kind == "workflow":
+                try:
+                    await _run_workflow_turn(harness, host, result.text)
+                    host.end_turn()
+                except asyncio.CancelledError:
+                    print("interrupted")
+                except Exception as exc:
+                    log.error("Workflow failed: %s", exc, exc_info=True)
+                    print(f"error: {exc}")
             continue
 
         try:
@@ -245,6 +254,27 @@ def _process_event(event, buffer: list[str], thinking_buffer: list[str]) -> None
         status = "OK" if not event.is_error else "FAIL"
         result_text = event.result.text[:200] if event.result else ""
         print(f"  {status}: {result_text}")
+
+
+async def _run_workflow_turn(harness: AgentHarness, host: CodingHost, task: str) -> None:
+    """Run the coding workflow using the console interaction handler."""
+    from dot.coding.workflow import create_context, run_workflow
+    from dot.workflow import WorkflowErrorEvent, WorkflowNodeStartEvent
+
+    context = create_context(task)
+    buffer: list[str] = []
+    thinking_buffer: list[str] = []
+    async for event in run_workflow(
+            context,
+            host,
+            ui_mode="console",
+            harness=harness,
+    ):
+        if isinstance(event, WorkflowNodeStartEvent):
+            print(f"\n--- workflow: {event.node} ---")
+        elif isinstance(event, WorkflowErrorEvent):
+            print(f"workflow error: {event.error}")
+        _process_event(event, buffer, thinking_buffer)
 
 
 def _execute_slash(text: str, host):

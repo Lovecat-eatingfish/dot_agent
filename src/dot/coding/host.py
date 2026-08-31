@@ -9,22 +9,25 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from dot.agent.events import AgentEvent
 from dot.agent.harness import AgentHarness, AgentHarnessConfig
 from dot.agent.tools import AgentTool
 from dot.ai.catalog import ProviderCatalog
 from dot.ai.providers.openai import OpenAIProvider
+from dot.workflow import WorkflowEvent
 
 from .extensions.runtime import ExtensionRuntime
 from .modes import AgentMode
 from .permission import PermissionManager, get_permission_manager
 from .session import Session
 from .session.manager import SessionManager
-from .state import WorkflowContext, WorkflowPhase
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .workflow import HumanInterventionHandler
 
 
 class CodingHost:
@@ -232,12 +235,28 @@ class CodingHost:
             self,
             task: str,
             *,
-            model: str | None = None,
-    ) -> AsyncIterator[AgentEvent | WorkflowPhase]:
-        from .workflow import run_workflow
-        """运行完整 workflow"""
-        context = WorkflowContext(task=task)
-        async for event in run_workflow(context, self):
+            max_replan: int = 3,
+            max_turns: int | None = 30,
+            ui_mode: Literal["none", "console", "tui"] = "console",
+            human_intervene: "HumanInterventionHandler | None" = None,
+            harness: AgentHarness | None = None,
+    ) -> AsyncIterator[AgentEvent | WorkflowEvent]:
+        """运行完整 coding workflow（plan → code → validate）
+
+        Yields:
+            引擎事件（WorkflowEvent）与 Agent 事件
+        """
+        from .workflow import create_context, run_workflow
+
+        ctx = create_context(task, max_replan=max_replan)
+        async for event in run_workflow(
+                ctx,
+                self,
+                max_turns=max_turns,
+                ui_mode=ui_mode,
+                human_intervene=human_intervene,
+                harness=harness,
+        ):
             yield event
 
     # ============================================================

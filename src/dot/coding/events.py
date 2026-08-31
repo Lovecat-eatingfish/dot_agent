@@ -13,7 +13,6 @@ from typing import Annotated, Literal
 
 from pydantic import Field
 
-from .state import WorkflowPhase
 from dot.ai.types import WireModel
 
 
@@ -40,13 +39,6 @@ class ThinkingLevelChangedEvent(WireModel):
     level: str  # "off" | "low" | "medium" | "high"
 
 
-class WorkflowPhaseChangedEvent(WireModel):
-    """Workflow 阶段变更"""
-    type: Literal["workflow_phase_changed"] = "workflow_phase_changed"
-    phase: WorkflowPhase
-    old_phase: WorkflowPhase | None = None
-
-
 class ExtensionLoadedEvent(WireModel):
     """扩展加载/重载"""
     type: Literal["extension_loaded"] = "extension_loaded"
@@ -65,7 +57,6 @@ type CodingEvent = Annotated[
     CompactionEvent
     | SessionInfoChangedEvent
     | ThinkingLevelChangedEvent
-    | WorkflowPhaseChangedEvent
     | ExtensionLoadedEvent
     | ModeChangedEvent,
     Field(discriminator="type"),

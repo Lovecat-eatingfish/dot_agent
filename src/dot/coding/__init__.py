@@ -2,7 +2,7 @@
 dot.coding — Coding 应用层（顶层）
 
 职责：
-  - 外层 Workflow 循环（plan → code → validate → human_intervene）
+  - 内置 coding 工作流（plan → code → validate，基于 dot.workflow 引擎）
   - CLI 入口
   - 会话管理（Session / SessionManager / SessionStorage）
   - 扩展系统（Extension API / Loader / Runtime）
@@ -13,12 +13,20 @@ dot.coding — Coding 应用层（顶层）
   - 权限管控
   - 事件驱动链路追踪
 
-依赖：dot.agent + typer + rich + mcp + prompt_toolkit
+依赖：dot.workflow + dot.agent + typer + rich + mcp + prompt_toolkit
 """
 from __future__ import annotations
 
-from .workflow import run_workflow
-from .state import WorkflowPhase, WorkflowContext, ValidationResult
+from .workflow import (
+    build_coding_workflow,
+    create_context,
+    get_state,
+    HumanInterventionHandler,
+    HumanInterventionMode,
+    parse_verdict,
+    run_workflow,
+)
+from .state import CodingWorkflowState, ValidationResult
 from .permission import PermissionManager, get_permission_manager
 from .modes import AgentMode
 from .commands import CommandRegistry, get_command_registry, SlashResult
@@ -27,10 +35,15 @@ from .events import CodingEvent
 from .extensions import ExtensionRuntime, ExtensionLoader, ExtensionAPI, ExtensionGeneration
 
 __all__ = [
-    # workflow
+    # workflow（coding 业务实例）
     "run_workflow",
-    "WorkflowPhase",
-    "WorkflowContext",
+    "build_coding_workflow",
+    "create_context",
+    "get_state",
+    "HumanInterventionHandler",
+    "HumanInterventionMode",
+    "parse_verdict",
+    "CodingWorkflowState",
     "ValidationResult",
     # permission
     "PermissionManager",
@@ -45,7 +58,6 @@ __all__ = [
     "CodingHost",
     # events
     "CodingEvent",
-    # session
     # extensions
     "ExtensionRuntime",
     "ExtensionLoader",

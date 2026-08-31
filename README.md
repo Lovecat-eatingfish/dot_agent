@@ -1,14 +1,19 @@
 # dot_agent v2.0
 
-三层架构的 Coding Agent 系统，零 langchain/langgraph 依赖。
+自研工作流引擎与 Coding Agent 系统，工作流编排不依赖 langgraph/langchain。
+LLM/Agent 调用通过适配器接入，具体模型实现可以独立选择。
 
 ## 架构概览
 
 ```text
 ┌─────────────────────────────────────────────────────┐
 │  dot.coding  — Coding 应用层                        │
-│  CLI / Workflow / Session / Extensions / MCP / Skills│
-│  依赖：dot.agent + typer + rich + mcp               │
+│  CLI / Session / Extensions / MCP / Skills          │
+│  依赖：dot.workflow + typer + rich + mcp            │
+├─────────────────────────────────────────────────────┤
+│  dot.workflow — 通用工作流引擎                      │
+│  WorkflowGraph / Node / 事件 / 取消                 │
+│  核心不依赖 Agent、模型 SDK 或编排框架              │
 ├─────────────────────────────────────────────────────┤
 │  dot.agent   — Agent 核心层                         │
 │  Agent Loop / Tools / Events / Harness / History    │
@@ -20,21 +25,32 @@
 └─────────────────────────────────────────────────────┘
 ```
 
-层间依赖严格单向：`coding → agent → ai`，禁止反向。
+层间依赖保持单向：`coding → workflow`，`coding → agent → ai`；
+`workflow` 核心不依赖 Agent、模型 SDK 或编排框架。
 
 ## 核心设计
 
 ### 双循环架构
 
 ```text
-Outer Loop (Workflow)           Inner Loop (Agent Loop)
+Outer Loop (WorkflowGraph)      Inner Loop (Agent Loop)
 plan → code → validate          LLM call → tool exec → append
      ↑              |                (steering / follow-up)
      └──────────────┘
 ```
 
-- **外层**：`WorkflowPhase` 显式状态机（PLAN → CODE → VALIDATE → DONE）
+- **外层**：通用工作流引擎 `dot.workflow`（节点 + 条件路由的图），
+  coding 的 plan→code→validate 是它的一个业务实例，不是引擎本身
 - **内层**：`run_agent_loop` 流式响应 → 工具执行 → 循环
+
+引擎内核（`src/dot/workflow/`）：
+
+| 模块 | 职责 |
+| --- | --- |
+| `graph.py` | `WorkflowGraph`：add_node / add_edge / add_conditional_edges + 执行循环（max_steps 防死循环） |
+| `node.py` | `WorkflowNode` Protocol + `FunctionNode`（任意函数节点）；Agent 节点由上层适配器提供 |
+| `context.py` | `WorkflowContext`：节点间数据（data/results）+ 取消令牌 |
+| `events.py` | `WorkflowEvent` discriminated union（NodeStart/NodeEnd/Error/Done） |
 
 ### 工具系统
 
@@ -100,9 +116,16 @@ src/dot/
 │   ├── cancel.py                # CancellationToken Protocol
 │   └── types.py                 # AgentLoopResult, TokenUsage
 │
-├── coding/                      # Layer 3: Coding 应用
-│   ├── state.py                 # WorkflowPhase + WorkflowContext
-│   ├── workflow.py              # run_workflow（外层循环）
+├── workflow/                    # Layer 3: 通用工作流引擎
+│   ├── graph.py                 # WorkflowGraph（线性 + 条件分支 + 执行循环）
+│   ├── node.py                  # WorkflowNode Protocol / AgentNode / FunctionNode
+│   ├── context.py               # WorkflowContext（data/results + 取消令牌）
+│   ├── events.py                # WorkflowEvent discriminated union
+│   └── cancel.py                # WorkflowCancellationToken（只读 Protocol）
+│
+├── coding/                      # Layer 4: Coding 应用
+│   ├── state.py                 # CodingWorkflowState + ValidationResult
+│   ├── workflow.py              # 内置 coding 工作流（引擎的业务实例）
 │   ├── permission.py            # PermissionManager 三级拦截
 │   ├── modes.py                 # AgentMode (plan/edit/auto)
 │   ├── commands.py              # CommandRegistry 斜杠命令
@@ -151,8 +174,11 @@ src/dot/
 | `AgentEvent` | agent | Agent 生命周期事件 |
 | `AgentHarness` | agent | 消息历史 + 事件订阅 + 双队列 |
 | `AgentLoopResult` | agent | 内层循环返回值 |
-| `WorkflowPhase` | coding | 外层状态机枚举 |
-| `WorkflowContext` | coding | 外层状态容器 |
+| `WorkflowNode` | workflow | 节点 Protocol（AgentNode / FunctionNode 为内置实现） |
+| `WorkflowGraph` | workflow | 节点编排 + 条件路由 + 执行循环 |
+| `WorkflowContext` | workflow | 节点间数据容器（data / results / 取消令牌） |
+| `WorkflowEvent` | workflow | 引擎生命周期事件 discriminated union |
+| `CodingWorkflowState` | coding | plan→code→validate 的业务状态 |
 | `PermissionManager` | coding | 三级拦截权限管控 |
 | `AgentMode` | coding | plan / edit / auto |
 | `Session` | coding | 消息历史 + 文件快照 |
@@ -193,6 +219,7 @@ cp .env.example .env
 agent                    # TUI 交互模式
 agent run "任务描述"      # 一次性执行
 agent console            # 控制台模式
+# 在 console / TUI 中输入 /workflow 任务，可运行 plan → code → validate
 ```
 
 ## 设计文档

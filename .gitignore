@@ -26,3 +26,6 @@ package-lock.json
 python
 src/dot/.dot
 node_modules/
+design/
+.zcode/
+.agents

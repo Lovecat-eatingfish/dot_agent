@@ -501,13 +501,29 @@ class _RuntimeAPI(ExtensionAPI):
         """兼容旧 API：等价于 register_hook("after_tool_call", ...)"""
         return self.register_hook("after_tool_call", fn, name=name)
 
-    def send_user_message(self, content: str) -> None:
-        """把一条消息排队为 follow-up：当前回合结束后自动注入下一轮上下文"""
+    def send_user_message(
+        self,
+        content: str,
+        *,
+        deliver_as: str = "follow_up",
+    ) -> None:
+        """把消息排队到当前运行中的 harness。"""
         self._check_alive()
         host = self._runtime._runtime_deps.get("host")
         harness = getattr(host, "_harness", None) if host is not None else None
         if harness is None:
             logger.warning("[extensions] send_user_message: no harness, dropped: %s", content[:80])
             return
-        harness.follow_up(content)
-        logger.info("[extensions] send_user_message queued as follow-up: %s", content[:80])
+        if deliver_as == "steer":
+            harness.steer(content)
+        elif deliver_as == "follow_up":
+            harness.follow_up(content)
+        else:
+            raise ValueError("deliver_as must be 'steer' or 'follow_up'")
+        logger.info("[extensions] send_user_message queued as %s: %s", deliver_as, content[:80])
+
+    def queue_steering_message(self, content: str) -> None:
+        self.send_user_message(content, deliver_as="steer")
+
+    def queue_follow_up_message(self, content: str) -> None:
+        self.send_user_message(content, deliver_as="follow_up")

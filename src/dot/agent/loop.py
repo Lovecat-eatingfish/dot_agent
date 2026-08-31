@@ -279,6 +279,9 @@ async def _assistant_events(
                 yield MessageStartEvent(message=event.message)
             yield MessageEndEvent(message=event.message)
         elif isinstance(event, AssistantErrorEvent):
+            # Provider 实现不一定会在错误消息上设置 stop_reason；在 Agent
+            # 层统一归一化，确保错误不会被当作正常空回复继续流转。
+            event.error.stop_reason = event.reason
             event.error.timing = _response_timing(first_output_elapsed_ns, provider_elapsed_ns)
             if not started:
                 yield MessageStartEvent(message=event.error)

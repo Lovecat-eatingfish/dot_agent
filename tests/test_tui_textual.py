@@ -9,13 +9,16 @@ import pytest
 from dot.agent import events as ae
 from dot.agent.tools import AgentTool, AgentToolResult
 from dot.ai import events as pe
-from dot.ai.types import AssistantMessage, TextContent, ToolCall
+from dot.ai.types import AssistantMessage, TextContent, ToolCall, UserMessage
 from dot.coding.cli.tui.adapter import TuiEventAdapter
-from dot.coding.cli.tui.app import DotTUIApp, PromptInput
+from dot.coding.cli.tui.app import DotTUIApp, PromptInput, WorkflowInterventionModal
 from dot.coding.cli.tui.autocomplete import build_completion_state
 from dot.coding.cli.tui.state import TuiState
-from dot.coding.cli.tui.widgets import StatusBar, TranscriptView
+from dot.coding.cli.tui.widgets import QueueStatus, StatusBar, TranscriptView
 from dot.coding.commands import get_command_registry
+from dot.coding.host import CodingHost
+from dot.coding.workflow import create_context
+from dot.workflow import WorkflowInterruptEvent
 
 
 def _assistant(text: str, *, model: str = "m", **kwargs) -> AssistantMessage:
@@ -98,8 +101,6 @@ def test_tui_app_end_to_end(tmp_path: Path) -> None:
 async def _run_tui_end_to_end(tmp_path: Path) -> None:
     pytest.importorskip("textual")
     (tmp_path / "a.txt").write_text("v0", encoding="utf-8")
-
-    from dot.coding.host import CodingHost
 
     call = ToolCall(id="c1", name="write_tool", arguments={})
 
@@ -194,3 +195,141 @@ async def _run_tui_end_to_end(tmp_path: Path) -> None:
         # Esc 中断（空闲时 no-op 不崩溃）
         await pilot.press("escape")
         await pilot.pause()
+
+
+def test_tui_routes_running_input_to_queues(tmp_path: Path) -> None:
+    pytest.importorskip("textual")
+    asyncio.run(_run_tui_queue_routing(tmp_path))
+
+
+async def _run_tui_queue_routing(tmp_path: Path) -> None:
+    from dot.coding.host import CodingHost
+
+    class BlockingProvider:
+        model = "test-model"
+
+        def __init__(self) -> None:
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.replies = ["base", "steered", "followed"]
+
+        async def stream_response(self, *, messages, **kwargs):
+            del messages, kwargs
+            self.started.set()
+            await self.release.wait()
+            reply = self.replies.pop(0)
+            yield pe.AssistantDoneEvent(
+                reason="stop",
+                message=_assistant(reply, model=self.model),
+            )
+
+    provider = BlockingProvider()
+    app = DotTUIApp(CodingHost(workspace=tmp_path), system="sys")
+    app._harness._config.provider = provider
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "start"
+        await pilot.press("enter")
+        for _ in range(20):
+            await pilot.pause(0.05)
+            if provider.started.is_set():
+                break
+        assert provider.started.is_set()
+
+        prompt.text = "steer now"
+        await pilot.press("enter")
+        assert [m.text for m in app._harness.queued_messages.steering] == ["steer now"]
+
+        prompt.text = "follow later"
+        await pilot.press("alt+enter")
+        assert [m.text for m in app._harness.queued_messages.follow_up] == ["follow later"]
+        assert app.state.queued_steering == ("steer now",)
+        assert app.state.queued_follow_up == ("follow later",)
+        assert app.query_one(QueueStatus).has_class("visible")
+
+        prompt.text = ""
+        await pilot.press("up")
+        assert prompt.text == "follow later"
+        assert not app._harness.queued_messages.follow_up
+        await pilot.press("alt+enter")
+
+        provider.release.set()
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if not app.state.running:
+                break
+        assert not app.state.running
+    assert [m.text for m in app._harness.messages if isinstance(m, UserMessage)] == [
+        "start", "steer now", "follow later"
+    ]
+
+
+def test_tui_workflow_intervention_handler_waits_for_modal(tmp_path: Path) -> None:
+    pytest.importorskip("textual")
+    asyncio.run(_run_tui_intervention_handler(tmp_path))
+
+
+async def _run_tui_intervention_handler(tmp_path: Path) -> None:
+    from dot.coding.state import ValidationResult
+
+    app = DotTUIApp(CodingHost(workspace=tmp_path), system="sys")
+    context = create_context("task")
+    state = context.data["coding"]
+    state.validate_result = ValidationResult(
+        passed=False,
+        message="tests failed",
+        issues=["missing assertion"],
+    )
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        handler = app._make_workflow_intervention_handler()
+        task = asyncio.create_task(handler(WorkflowInterruptEvent(
+            interrupt_id="test",
+            node="human_intervene_tui",
+            reason="tests failed",
+            payload={"issues": ["missing assertion"]},
+        )))
+        await pilot.pause(0.2)
+        assert isinstance(app.screen, WorkflowInterventionModal)
+        await pilot.press("y")
+        assert await task is True
+
+
+def test_tui_workflow_command_runs_coding_workflow(tmp_path: Path) -> None:
+    pytest.importorskip("textual")
+    asyncio.run(_run_tui_workflow_command(tmp_path))
+
+
+async def _run_tui_workflow_command(tmp_path: Path) -> None:
+    class WorkflowProvider:
+        model = "workflow-model"
+
+        def __init__(self) -> None:
+            self.replies = ["plan", "code complete", "VERDICT: PASS"]
+
+        async def stream_response(self, *, messages, **kwargs):
+            del messages, kwargs
+            yield pe.AssistantDoneEvent(
+                reason="stop",
+                message=_assistant(self.replies.pop(0), model=self.model),
+            )
+
+    app = DotTUIApp(CodingHost(workspace=tmp_path), system="sys")
+    app._harness._config.provider = WorkflowProvider()
+
+    async with app.run_test(size=(100, 30)) as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "/workflow verify this"
+        await pilot.press("enter")
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if not app.state.running:
+                break
+
+        assert not app.state.running
+        assert [m.text for m in app._harness.messages if isinstance(m, UserMessage)] == [
+            "verify this",
+            "Execute the plan above for: verify this",
+            "Verify the work product.",
+        ]

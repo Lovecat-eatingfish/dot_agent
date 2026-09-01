@@ -166,7 +166,6 @@ def plan_node(state: DotAgentState) -> dict[str, Any]:
     except Exception as exc:
         logger.warning("plan_node: LLM plan generation failed: %s", exc, exc_info=True)
         plan = {}
-
     plan.setdefault("description", "")
     plan.setdefault("subtasks", [])
     plan.setdefault("validation_commands", [])

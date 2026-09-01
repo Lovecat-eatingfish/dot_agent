@@ -34,6 +34,43 @@ logging.getLogger("mcp.client.streamable_http").setLevel(logging.WARNING)
 MCP_CONFIG_FILE = "mcp.json"
 
 
+def _install_gc_log_suppressor() -> None:
+    """Suppress asyncio GC finalization ERROR logs from MCP streamable_http generators.
+
+    streamable_http_client 内部有 anyio TaskGroup，被 GC 时 asyncio finalizer
+    会在不同 task 里调用 __aexit__，触发 "Attempted to exit cancel scope in a
+    different task" 错误。这是 MCP SDK + anyio 的已知问题，不影响功能，
+    但会刷屏 ERROR 日志。通过 logging filter 静默吞掉。
+    """
+    try:
+        asyncio_logger = logging.getLogger("asyncio")
+        if not any(isinstance(f, _MCPGCFilter) for f in asyncio_logger.filters):
+            asyncio_logger.addFilter(_MCPGCFilter())
+    except Exception:
+        pass
+
+
+class _MCPGCFilter(logging.Filter):
+    """Filter out asyncio GC finalization errors from MCP streamable_http generators."""
+
+    _MESSAGES = (
+        "error occurred during closing of asynchronous generator",
+        "Attempted to exit cancel scope in a different task",
+        "aclose(): asynchronous generator is already running",
+        "generator didn't stop after athrow",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        if any(m in msg for m in self._MESSAGES):
+            return False
+        return True
+
+
+# 模块加载时安装 filter（只执行一次）
+_install_gc_log_suppressor()
+
+
 def load_mcp_config(workspace: Path) -> dict[str, dict[str, Any]]:
     """读取 .dot/mcp.json 的 mcpServers 段，返回 {server_name: {"url": ...}}"""
     path = workspace / ".dot" / MCP_CONFIG_FILE
@@ -73,6 +110,8 @@ class MCPClient:
         self.headers = headers or {}
         self._session: Any = None
         self._stack: Any = None
+        self._http_gen: Any = None
+        self._sse_gen: Any = None
 
     @property
     def connected(self) -> bool:
@@ -83,6 +122,8 @@ class MCPClient:
         from mcp import ClientSession
 
         await self.close()
+        self._http_gen = None
+        self._sse_gen = None
         self._stack = contextlib.AsyncExitStack()
         streams = await self._open_streams()
         self._session = await self._stack.enter_async_context(ClientSession(*streams))
@@ -94,7 +135,7 @@ class MCPClient:
         from mcp.client.sse import sse_client
 
         if self.transport == "sse":
-            return await self._stack.enter_async_context(sse_client(self.url, headers=self.headers))
+            return await self._open_sse_streams()
         if self.transport == "http":
             return await self._open_http_streams()
         # auto
@@ -104,7 +145,15 @@ class MCPClient:
             logger.info("[mcp] %s streamable-http failed (%s), falling back to sse", self.name, exc)
             await self.close()
             self._stack = contextlib.AsyncExitStack()
-            return await self._stack.enter_async_context(sse_client(self.url, headers=self.headers))
+            return await self._open_sse_streams()
+
+    async def _open_sse_streams(self) -> tuple[Any, Any]:
+        from mcp.client.sse import sse_client
+
+        gen = sse_client(self.url, headers=self.headers)
+        streams = await gen.__aenter__()
+        self._sse_gen = gen
+        return streams
 
     async def _open_http_streams(self) -> tuple[Any, Any]:
         from mcp.client.streamable_http import streamable_http_client
@@ -112,17 +161,36 @@ class MCPClient:
         if self.headers:
             from mcp.shared._httpx_utils import create_mcp_http_client
             http_client = create_mcp_http_client(headers=self.headers)
-            return await self._stack.enter_async_context(
-                streamable_http_client(self.url, http_client=http_client),
-            )
-        return await self._stack.enter_async_context(streamable_http_client(self.url))
+            gen = streamable_http_client(self.url, http_client=http_client)
+        else:
+            gen = streamable_http_client(self.url)
+
+        # 手动 enter async generator（不通过 AsyncExitStack），
+        # 确保 __aenter__ / __aexit__ 在同一个 task 里成对出现，
+        # 避免 anyio TaskGroup 检测到跨任务退出 cancel scope 报错。
+        streams = await gen.__aenter__()
+        self._http_gen = gen
+        return streams
 
     async def close(self) -> None:
+        # 关闭 streamable_http / sse 异步生成器（可能在任意 task 被 GC 关闭）
+        # 所有异常静默吞掉——追踪/连接清理失败不能影响主流程。
+        for attr in ("_http_gen", "_sse_gen"):
+            gen = getattr(self, attr)
+            setattr(self, attr, None)
+            if gen is not None:
+                try:
+                    await gen.__aexit__(None, None, None)
+                except GeneratorExit:
+                    pass
+                except BaseException:
+                    pass  # 静默吞掉 anyio CancelScope / TaskGroup 清理异常
+
         if self._stack is not None:
             try:
                 await self._stack.aclose()
-            except Exception as exc:
-                logger.debug("[mcp] close %s error: %s", self.name, exc)
+            except BaseException:
+                pass  # AsyncExitStack 清理失败不影响主流程
         self._session = None
         self._stack = None
 
@@ -149,10 +217,17 @@ class MCPClient:
         ]
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
-        """调用远程工具，返回文本结果；失败重连一次再试"""
+        """调用远程工具，返回文本结果；连接错误重连一次，协议错误直接返回"""
         try:
             return await self._call_once(name, arguments)
         except Exception as exc:
+            err_text = str(exc)
+            # MCP 协议错误（-32602 Invalid params 等）：服务端返回了非法数据，
+            # 重连无法修复，直接返回错误信息，避免触发 streamable_http_client
+            # 清理时跨 task 退出 CancelScope 的连锁崩溃。
+            if "MCP error" in err_text and ("-32602" in err_text or "Invalid tools/call result" in err_text):
+                logger.warning("[mcp] call %s/%s protocol error (not retrying): %s", self.name, name, err_text)
+                return f"[MCP protocol error] {err_text}"
             logger.warning("[mcp] call %s/%s failed (%s), reconnecting once", self.name, name, exc)
             await self.connect()
             return await self._call_once(name, arguments)

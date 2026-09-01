@@ -53,11 +53,18 @@ def console_cmd(
 
 @app.command("run", help="Run a one-shot task")
 def run_cmd(
-        task: str = typer.Argument(None, help="Task text"),
+        task: list[str] = typer.Argument(None, help="Task text (quote not required)"),
         workspace: Optional[str] = typer.Option(None, "--workspace", "-w"),
         mode: str = typer.Option("auto", "--mode", "-m"),
 ) -> None:
-    """Run a one-shot task through the plan → code → validate workflow"""
+    """Run a one-shot task through the plan → code → validate workflow
+
+    Examples:
+      agent run "fix the login bug"
+      agent run fix the login bug
+      agent run --mode plan "write a hello world"
+    """
+    task_text = " ".join(task) if task else None
     import logging
     from dot.agent.events import (
         MessageEndEvent, ToolExecutionEndEvent, ToolExecutionStartEvent,
@@ -71,20 +78,20 @@ def run_cmd(
     setup_logging(workspace=Path(workspace_str), level="INFO")
     logger = logging.getLogger("cli")
 
-    if not task:
+    if not task_text:
         if not sys.stdin.isatty():
-            task = sys.stdin.read().strip()
-        if not task:
+            task_text = sys.stdin.read().strip()
+        if not task_text:
             logger.error("Usage: agent run 'your task'")
             raise typer.Exit(code=1)
 
-    logger.info("[run] task: %s", task[:200])
+    logger.info("[run] task: %s", task_text[:200])
 
     host = CodingHost(workspace=Path(workspace_str), mode=AgentMode.from_str(mode))
 
     async def _run_one_shot() -> int:
         await host.connect_mcp()
-        context = create_context(task)
+        context = create_context(task_text)
         logger.info("─── phase: plan ───")  # 起始节点（变更时事件流才会再发）
 
         async for event in run_workflow(context, host, ui_mode="console"):

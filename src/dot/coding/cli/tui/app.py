@@ -229,6 +229,19 @@ class DotTUIApp(App[None]):
         self._workflow_ctx = None
         self._completion: Any = None
 
+    def on_error(self, event: Any) -> None:
+        """全局异常兜底：防止 MarkdownTable container=None 等 Textual 内部 bug 导致应用退出"""
+        error = getattr(event, "error", None)
+        if error is not None:
+            import traceback as _traceback
+            tb = _traceback.format_exception(type(error), error, error.__traceback__)
+            self.query_one(TranscriptView).add_error(
+                f"[dim]UI error: {error} — click ignored[/dim]\n"
+                + "".join(tb[-3:])
+            )
+            return
+        super().error_console(event)
+
     # ============================================================
     # 布局
     # ============================================================

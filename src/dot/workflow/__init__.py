@@ -34,7 +34,6 @@ from .interaction import (
     run_with_interaction,
 )
 from .node import FunctionNode, WorkflowNode
-from .. import AgentNode
 
 
 def __getattr__(name: str):
@@ -67,7 +66,6 @@ __all__ = [
     "WorkflowNode",
     "FunctionNode",
     # compatibility export; implementation lives in dot.agent.workflow
-    "AgentNode",
     # events
     "WorkflowEvent",
     "WorkflowNodeStartEvent",

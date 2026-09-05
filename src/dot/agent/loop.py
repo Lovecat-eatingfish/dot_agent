@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
 from time import monotonic_ns
 
 from dot.ai.events import (
@@ -33,10 +32,12 @@ from dot.ai.types import (
 )
 from .cancel import SimpleCancellationToken
 
+from .compaction import CompactionGate
 from .events import (
     AgentEndEvent,
     AgentEvent,
     AgentStartEvent,
+    ContextCompactedEvent,
     MessageEndEvent,
     MessageStartEvent,
     MessageUpdateEvent,
@@ -47,13 +48,9 @@ from .events import (
     TurnStartEvent,
 )
 from .history import repair_tool_history
+from .permission import Decision, PermissionGate
 from .tools import AgentTool, AgentToolResult
 from ..ai.providers import OpenAIProvider
-
-if TYPE_CHECKING:
-    # 仅类型标注使用：运行时实例由 CodingHost 注入；运行时的 Decision 在
-    # _execute_tool_call 内延迟导入，避免 agent → coding 的循环导入
-    from ..coding.permission import PermissionManager
 
 BeforeToolCall = Callable[[ToolCall], Awaitable[tuple[bool, str | None]]]
 AfterToolCall = Callable[
@@ -78,7 +75,8 @@ async def run_agent_loop(
     get_follow_up_messages: Callable[[], Sequence[AgentMessage]] | None = None,
     before_tool_call: BeforeToolCall | None = None,
     after_tool_call: AfterToolCall | None = None,
-    permission: PermissionManager | None = None,
+    permission: PermissionGate | None = None,
+    compaction: CompactionGate | None = None,
     agent_mode: str = "auto",
 ) -> AsyncIterator[AgentEvent]:
     """运行 Provider/Tool 循环，发射 Agent 事件
@@ -99,6 +97,7 @@ async def run_agent_loop(
         before_tool_call: 工具执行前 hook
         after_tool_call: 工具执行后 hook
         permission: 权限管理器（None 表示跳过权限检查）
+        compaction: 上下文压缩钩子（None 表示不自动压缩；在 turn 边界检查）
         agent_mode: 当前 agent 模式字符串（plan / edit / auto）
 
     Yields:
@@ -118,13 +117,10 @@ async def run_agent_loop(
         yield MessageEndEvent(message=prompt)
 
     if max_turns is not None and max_turns < 1:
-        error = _error_message(model, "max_turns must be at least 1")
-        messages.append(error)
-        new_messages.append(error)
-        yield MessageStartEvent(message=error)
-        yield MessageEndEvent(message=error)
-        yield TurnEndEvent(message=error)
-        yield AgentEndEvent(messages=new_messages)
+        async for event in _error_turn_events(
+            model, messages, new_messages, "max_turns must be at least 1",
+        ):
+            yield event
         return
 
     tool_by_name = {tool.name: tool for tool in tools}
@@ -147,13 +143,11 @@ async def run_agent_loop(
             pending = ()
 
             if max_turns is not None and turn > max_turns:
-                error = _error_message(model, f"Agent stopped after max_turns={max_turns}")
-                messages.append(error)
-                new_messages.append(error)
-                yield MessageStartEvent(message=error)
-                yield MessageEndEvent(message=error)
-                yield TurnEndEvent(message=error)
-                yield AgentEndEvent(messages=new_messages)
+                async for event in _error_turn_events(
+                    model, messages, new_messages,
+                    f"Agent stopped after max_turns={max_turns}",
+                ):
+                    yield event
                 return
 
             # 消费 assistant 流式事件
@@ -189,25 +183,28 @@ async def run_agent_loop(
             tool_results: list[ToolResultMessage] = []
             calls = list(assistant.tool_calls)
             has_more_tools = bool(calls)
-            for call in calls:
-                async for event in _execute_tool_call(
-                    call,
-                    tool_by_name,
-                    signal,
-                    before_tool_call,
-                    after_tool_call,
-                    permission,
-                    agent_mode,
-                ):
-                    yield event
-                    if isinstance(event, MessageEndEvent) and isinstance(
-                        event.message, ToolResultMessage
-                    ):
-                        tool_results.append(event.message)
-                        messages.append(event.message)
-                        new_messages.append(event.message)
+            async for event in _run_tool_calls(
+                calls, tool_by_name, signal, before_tool_call, after_tool_call,
+                permission, agent_mode, messages, new_messages, tool_results,
+            ):
+                yield event
 
             yield TurnEndEvent(message=assistant, tool_results=tool_results)
+
+            # 上下文压缩检查（turn 边界：工具执行完、下一轮 LLM 调用前）
+            # 压缩结果原地替换 messages（与 harness._messages 是同一列表对象）
+            if compaction is not None:
+                compaction_result = await compaction.maybe_compact(messages)
+                if compaction_result is not None:
+                    before_count = len(messages)
+                    messages[:] = compaction_result.messages
+                    yield ContextCompactedEvent(
+                        level=compaction_result.level,
+                        before=before_count,
+                        after=len(compaction_result.messages),
+                        reason=compaction_result.reason,
+                    )
+
             turn += 1
             pending = tuple(get_steering_messages() if get_steering_messages else ())
 
@@ -218,6 +215,54 @@ async def run_agent_loop(
         break
 
     yield AgentEndEvent(messages=new_messages)
+
+
+async def _error_turn_events(
+    model: str,
+    messages: list[AgentMessage],
+    new_messages: list[AgentMessage],
+    reason: str,
+) -> AsyncIterator[AgentEvent]:
+    """构造一条错误消息结束整个 agent 运行（消息入历史 + 四个收尾事件）"""
+    error = _error_message(model, reason)
+    messages.append(error)
+    new_messages.append(error)
+    yield MessageStartEvent(message=error)
+    yield MessageEndEvent(message=error)
+    yield TurnEndEvent(message=error)
+    yield AgentEndEvent(messages=new_messages)
+
+
+async def _run_tool_calls(
+    calls: list[ToolCall],
+    tool_by_name: dict[str, AgentTool],
+    signal: SimpleCancellationToken | None,
+    before_tool_call: BeforeToolCall | None,
+    after_tool_call: AfterToolCall | None,
+    permission: PermissionGate | None,
+    agent_mode: str,
+    messages: list[AgentMessage],
+    new_messages: list[AgentMessage],
+    tool_results: list[ToolResultMessage],
+) -> AsyncIterator[AgentEvent]:
+    """顺序执行本轮工具调用，透传事件并把 tool result 消息写入历史"""
+    for call in calls:
+        async for event in _execute_tool_call(
+            call,
+            tool_by_name,
+            signal,
+            before_tool_call,
+            after_tool_call,
+            permission,
+            agent_mode,
+        ):
+            yield event
+            if isinstance(event, MessageEndEvent) and isinstance(
+                event.message, ToolResultMessage
+            ):
+                tool_results.append(event.message)
+                messages.append(event.message)
+                new_messages.append(event.message)
 
 
 def _provider_context(messages: list[AgentMessage]) -> list[AgentMessage]:
@@ -302,55 +347,63 @@ def _response_timing(
     )
 
 
+async def _permission_block(
+    call: ToolCall,
+    permission: PermissionGate | None,
+    agent_mode: str,
+) -> tuple[bool, str | None]:
+    """权限三层拦截：DENY 直接拒绝；ASK 走人工审批，批准后 bypass 复检
+
+    返回 (blocked, block_reason)。
+    """
+    if permission is None:
+        return False, None
+
+    decision = permission.check(call.name, dict(call.arguments), agent_mode=agent_mode)
+    if decision.decision is Decision.DENY:
+        return True, decision.deny_message()
+    if decision.decision is Decision.ASK:
+        approved = await permission.ask_user(
+            call.name, dict(call.arguments), decision, agent_mode=agent_mode,
+        )
+        if not approved:
+            return True, decision.deny_message()
+        # 用户批准，重新检查（仅 bypass 模式规则，系统/项目黑名单仍生效）
+        final_decision = permission.check(
+            call.name, dict(call.arguments), agent_mode=agent_mode, approved=True,
+        )
+        if final_decision.decision is Decision.DENY:
+            return True, final_decision.deny_message()
+    return False, None
+
+
 async def _execute_tool_call(
     call: ToolCall,
     tools: Mapping[str, AgentTool],
     signal: SimpleCancellationToken | None,
     before_tool_call: BeforeToolCall | None,
     after_tool_call: AfterToolCall | None,
-    permission: PermissionManager | None,
+    permission: PermissionGate | None,
     agent_mode: str = "auto",
 ) -> AsyncIterator[AgentEvent]:
     """执行单个工具调用，发射工具执行事件
 
     执行顺序：extension before_hook → 权限检查（系统/项目/模式三层）→ 工具执行
     """
-    from ..coding.permission import Decision  # 延迟导入避免循环依赖
-
     yield ToolExecutionStartEvent(
         tool_call_id=call.id,
         tool_name=call.name,
         args=call.arguments,
     )
 
-    blocked = False
-    block_reason: str | None = None
-
     # 1. Extension before_hook（用户扩展优先拦截）
+    blocked, block_reason = (False, None)
     if before_tool_call is not None:
         blocked, block_reason = await before_tool_call(call)
 
     # 2. 权限检查（三层拦截：系统黑名单 → 项目黑名单 → 模式规则）
-    if not blocked and permission is not None:
-        decision = permission.check(call.name, dict(call.arguments), agent_mode=agent_mode)
-        if decision.decision is Decision.DENY:
-            blocked = True
-            block_reason = decision.deny_message()
-        elif decision.decision is Decision.ASK:
-            approved = await permission.ask_user(
-                call.name, dict(call.arguments), decision, agent_mode=agent_mode,
-            )
-            if not approved:
-                blocked = True
-                block_reason = decision.deny_message()
-            else:
-                # 用户批准，重新检查（仅 bypass 模式规则，系统/项目黑名单仍生效）
-                final_decision = permission.check(
-                    call.name, dict(call.arguments), agent_mode=agent_mode, approved=True,
-                )
-                if final_decision.decision is Decision.DENY:
-                    blocked = True
-                    block_reason = final_decision.deny_message()
+    if not blocked:
+        blocked, block_reason = await _permission_block(call, permission, agent_mode)
 
     if blocked:
         result = _error_result(block_reason or "Tool execution was blocked")

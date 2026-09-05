@@ -3,34 +3,40 @@ dot.ai.types — 共享类型定义
 
 Provider 层的基础类型：消息、内容块、工具调用等。
 所有类型使用 Pydantic BaseModel，支持 JSON 序列化。
+
+WireModel 基类已上移至 dot.core.wire（所有层共用），此处保留 re-export。
 """
 from __future__ import annotations
 
 from time import time
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import Field, model_validator
 
+from dot.core.wire import WireModel
 
-# ============================================================
-# 基础配置
-# ============================================================
-
-def _to_camel(name: str) -> str:
-    parts = name.split("_")
-    return parts[0] + "".join(part.title() for part in parts[1:])
-
-
-class WireModel(BaseModel):
-    """严格模型：Python 字段名 + camelCase JSON 别名"""
-
-    model_config = ConfigDict(
-        extra="forbid",
-        validate_by_name=True,
-        validate_by_alias=True,
-        serialize_by_alias=True,
-        alias_generator=_to_camel,
-    )
+__all__ = [
+    "WireModel",
+    "JSONValue",
+    "UsageCost",
+    "Usage",
+    "ResponseTiming",
+    "TextContent",
+    "ThinkingContent",
+    "ImageContent",
+    "ToolCall",
+    "UserMessage",
+    "AssistantMessage",
+    "ToolResultMessage",
+    "SystemMessage",
+    "AgentMessage",
+    "UserContent",
+    "AssistantContent",
+    "ToolResultContent",
+    "StopReason",
+    "content_text",
+    "assistant_content",
+]
 
 
 # ============================================================

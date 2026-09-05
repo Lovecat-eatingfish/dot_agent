@@ -10,6 +10,7 @@ from dot.agent.events import (
     AgentEndEvent,
     AgentEvent,
     AgentStartEvent,
+    ContextCompactedEvent,
     MessageEndEvent,
     MessageStartEvent,
     MessageUpdateEvent,
@@ -117,6 +118,14 @@ class TuiEventAdapter:
                 event.tool_name,
                 event.result.text,
                 event.is_error,
+            )
+            return
+
+        if isinstance(event, ContextCompactedEvent):
+            self._flush()
+            self.state.add_item(
+                "status",
+                f"context compacted {event.level}: {event.before} -> {event.after} messages",
             )
             return
 

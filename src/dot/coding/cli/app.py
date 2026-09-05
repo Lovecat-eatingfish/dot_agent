@@ -66,13 +66,9 @@ def run_cmd(
     """
     task_text = " ".join(task) if task else None
     import logging
-    from dot.agent.events import (
-        MessageEndEvent, ToolExecutionEndEvent, ToolExecutionStartEvent,
-    )
-    from dot.ai.types import AssistantMessage
     from dot.coding.logging_config import setup as setup_logging
-    from dot.coding.workflow import create_context, get_state, run_workflow
-    from dot.workflow import WorkflowNodeStartEvent
+    from dot.coding.render import LogSink, StreamRenderer
+    from dot.coding.workflow import get_state, start_workflow_turn
 
     workspace_str = str(Path(workspace).expanduser()) if workspace else str(Path.cwd())
     setup_logging(workspace=Path(workspace_str), level="INFO")
@@ -91,28 +87,17 @@ def run_cmd(
 
     async def _run_one_shot() -> int:
         await host.connect_mcp()
-        context = create_context(task_text)
+        turn = start_workflow_turn(host, task_text, ui_mode="console")
+        renderer = StreamRenderer(LogSink(logger))
         logger.info("─── phase: plan ───")  # 起始节点（变更时事件流才会再发）
 
-        async for event in run_workflow(context, host, ui_mode="console"):
-            if isinstance(event, WorkflowNodeStartEvent):
-                logger.info("─── phase: %s ───", event.node)
-            elif isinstance(event, ToolExecutionStartEvent):
-                logger.info("[tool] %s %s", event.tool_name, str(event.args)[:150])
-            elif isinstance(event, ToolExecutionEndEvent):
-                status = "FAIL" if event.is_error else "OK"
-                detail = event.result.text[:150] if event.result else ""
-                logger.info("[tool] %s [%s] %s", event.tool_name, status, detail)
-            elif isinstance(event, MessageEndEvent) and isinstance(event.message, AssistantMessage):
-                text = event.message.text
-                if text.strip():
-                    for line in text.rstrip().splitlines():
-                        logger.info("[ai] %s", line)
+        async for event in turn.events:
+            renderer.process(event)
 
         # 会话落盘（增量 + git 快照）与链路追踪收尾
         host.end_turn()
         host.flush_trace()
-        state = get_state(context)
+        state = get_state(turn.context)
         if state.validate_result and not state.validate_result.passed:
             logger.error("validation failed: %s", state.validate_result.message[:200])
             return 1

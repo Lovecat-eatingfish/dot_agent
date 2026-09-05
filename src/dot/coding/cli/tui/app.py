@@ -26,6 +26,7 @@ from textual.widgets import Footer, Markdown, Static, TextArea
 from dot.agent.events import (
     AgentEndEvent,
     AgentStartEvent,
+    ContextCompactedEvent,
     MessageEndEvent,
     MessageStartEvent,
     MessageUpdateEvent,
@@ -364,46 +365,23 @@ class DotTUIApp(App[None]):
     @work(exclusive=True, group="prompt")
     async def _run_workflow_turn(self, task: str) -> None:
         """Run the coding workflow with TUI-backed human intervention."""
-        from dot.coding.workflow import create_context, run_workflow
+        from dot.coding.workflow import start_workflow_turn
 
-        self._run_id += 1
-        run_id = self._run_id
-        self.state.running = True
-        self._set_running_visual(True)
-        self.host.permission.set_approval_handler(self._make_approval_handler())
-        context = create_context(task)
-        self._workflow_ctx = context
-        transcript = self.query_one(TranscriptView)
-        try:
-            async for event in run_workflow(
-                    context,
-                    self.host,
-                    ui_mode="tui",
-                    human_intervene=self._make_workflow_intervention_handler(),
-                    harness=self._harness,
-            ):
-                if run_id != self._run_id:
-                    return
-                self.adapter.apply(event)
-                self._refresh_status()
-                await self._apply_event_to_transcript(event)
-            self.host.end_turn()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await transcript.add_error(str(exc))
-        finally:
-            if self._workflow_ctx is context:
-                self._workflow_ctx = None
-            if run_id == self._run_id:
-                self.state.running = False
-                self.state.assistant_buffer = ""
-                await transcript.finish_streaming()
-                self._set_running_visual(False)
-                self._refresh_status()
+        turn = start_workflow_turn(
+            self.host,
+            task,
+            ui_mode="tui",
+            human_intervene=self._make_workflow_intervention_handler(),
+            harness=self._harness,
+        )
+        await self._drive_turn(turn.events, workflow_ctx=turn.context)
 
     @work(exclusive=True, group="prompt")
     async def _run_agent_turn(self, text: str) -> None:
+        await self._drive_turn(self._harness.prompt(text))
+
+    async def _drive_turn(self, events, *, workflow_ctx=None) -> None:
+        """统一的回合外壳：run-id 守卫 / 状态与视觉开关 / 审批注入 / 异常与收尾"""
         self._run_id += 1
         run_id = self._run_id
         self.state.running = True
@@ -412,8 +390,10 @@ class DotTUIApp(App[None]):
         self.host.permission.set_approval_handler(self._make_approval_handler())
 
         transcript = self.query_one(TranscriptView)
+        if workflow_ctx is not None:
+            self._workflow_ctx = workflow_ctx
         try:
-            async for event in self._harness.prompt(text):
+            async for event in events:
                 if run_id != self._run_id:
                     return  # 陈旧事件：已被更新的一次回合取代
                 self.adapter.apply(event)
@@ -425,6 +405,8 @@ class DotTUIApp(App[None]):
         except Exception as exc:
             await transcript.add_error(str(exc))
         finally:
+            if workflow_ctx is not None and self._workflow_ctx is workflow_ctx:
+                self._workflow_ctx = None
             if run_id == self._run_id:
                 self.state.running = False
                 self.state.assistant_buffer = ""
@@ -482,6 +464,11 @@ class DotTUIApp(App[None]):
             item = self.state.find_tool_item(event.tool_call_id)
             if item is not None:
                 transcript.update_tool(item)
+
+        elif isinstance(event, ContextCompactedEvent):
+            await transcript.add_status(
+                f"· context compacted {event.level}: {event.before} -> {event.after} messages"
+            )
 
     def _set_running_visual(self, running: bool) -> None:
         prompt = self.query_one("#prompt", PromptInput)

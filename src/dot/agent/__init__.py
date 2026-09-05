@@ -14,11 +14,12 @@ dot.agent — Agent 核心层（中层）
 from __future__ import annotations
 
 from .tools import AgentTool, AgentToolResult
-from .events import AgentEvent
+from .events import AgentEvent, ContextCompactedEvent
 from .harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from .loop import run_agent_loop
 from .types import TokenUsage
 from .cancel import ProviderCancellationToken, ToolCancellationToken
+from .compaction import CompactionGate, CompactionResult
 from .executor import execute_tool_safely
 from .history import repair_tool_history
 from .workflow import AgentNode
@@ -29,6 +30,7 @@ __all__ = [
     "AgentToolResult",
     # events
     "AgentEvent",
+    "ContextCompactedEvent",
     # harness
     "AgentHarness",
     "AgentHarnessConfig",
@@ -37,6 +39,9 @@ __all__ = [
     "run_agent_loop",
     # types
     "TokenUsage",
+    # compaction contract
+    "CompactionGate",
+    "CompactionResult",
     # cancel
     "ProviderCancellationToken",
     "ToolCancellationToken",

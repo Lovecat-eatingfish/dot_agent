@@ -31,6 +31,7 @@ class WorkflowContext:
         default_factory=SimpleWorkflowCancellationToken,
     )
     run_id: str | None = None
+    workflow_name: str | None = None
     status: WorkflowStatus = "pending"
     current_node: str | None = None
     current_step: int = 0
@@ -57,7 +58,6 @@ class WorkflowContext:
         self.error_code = None
         self.error_details = None
         self._interrupt_queue = asyncio.Queue()
-
     def _detach_run(self) -> None:
         for future in self._pending_interrupts.values():
             if not future.done():
@@ -97,7 +97,7 @@ class WorkflowContext:
         try:
             return await future
         finally:
-            self._pending_interrupts.pop(interrupt_id, None)
+            await self._pending_interrupts.pop(interrupt_id, None)
             if self.status == "paused" and not self._pending_interrupts:
                 self.status = "running"
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 import logging
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 from typing import Literal
 
@@ -307,3 +308,49 @@ async def run_workflow(
 
     async for event in run_with_interaction(graph, ctx, handler):
         yield event
+
+
+# ============================================================
+# 统一回合执行器（console / one-shot CLI / TUI 共用）
+# ============================================================
+
+@dataclass
+class WorkflowTurn:
+    """一次 workflow 回合：上下文 + 事件流
+
+    context 供调用方读取业务状态（如 validate_result），
+    events 是 create_context → run_workflow 的事件迭代器。
+    """
+    context: WorkflowContext
+    events: AsyncIterator[AgentEvent | WorkflowEvent]
+
+
+def start_workflow_turn(
+    host: "CodingHost",
+    task: str,
+    *,
+    max_replan: int = 3,
+    max_turns: int | None = 30,
+    ui_mode: HumanInterventionMode = "console",
+    human_intervene: HumanInterventionHandler | None = None,
+    harness: "AgentHarness | None" = None,
+) -> WorkflowTurn:
+    """创建并启动一次 coding workflow 回合（不开始迭代）
+
+    三处调用方（console REPL / agent run 一次性任务 / TUI）原先各自
+    重复 create_context → run_workflow 装配，收敛到这里。
+    """
+    context = create_context(task, max_replan=max_replan)
+
+    async def _events() -> AsyncIterator[AgentEvent | WorkflowEvent]:
+        async for event in run_workflow(
+                context,
+                host,
+                max_turns=max_turns,
+                ui_mode=ui_mode,
+                human_intervene=human_intervene,
+                harness=harness,
+        ):
+            yield event
+
+    return WorkflowTurn(context=context, events=_events())

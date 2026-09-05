@@ -1,15 +1,24 @@
 """
-dot.coding.host — CodingHost（新架构组装层）
+dot.coding.host — CodingHost（组装层 / 组合根）
 
-组装 dot.ai + dot.agent + dot.coding 三层，
-提供统一的执行入口。集成 SessionManager 实现消息持久化。
+组装 dot.ai + dot.agent + dot.coding 三层，提供统一的执行入口。
+自身只做装配与委托，具体职责拆分在各子模块：
+
+- 工具注册      ：coding.tools.*
+- 链路追踪      ：coding.trace.controller.TraceController
+- 上下文压缩    ：coding.compress.compactor.ContextCompactor
+                  （AutoCompactor 实现 agent 层 CompactionGate，turn 边界自动触发）
+- MCP 连接      ：coding.extensions.builtins.mcp.manager.McpConnector
+- 会话持久化    ：coding.session.manager.SessionManager
+- 权限          ：coding.permission.PermissionManager
+- 扩展          ：coding.extensions.runtime.ExtensionRuntime
 """
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 from dot.agent.events import AgentEvent
 from dot.agent.harness import AgentHarness, AgentHarnessConfig
@@ -18,11 +27,15 @@ from dot.ai.catalog import ProviderCatalog
 from dot.ai.providers.openai import OpenAIProvider
 from dot.workflow import WorkflowEvent
 
+from .compress.compactor import ContextCompactor
+from .compress.auto_compact import AutoCompactor
+from .extensions.builtins.mcp.manager import McpConnector
 from .extensions.runtime import ExtensionRuntime
 from .modes import AgentMode
-from .permission import PermissionManager, get_permission_manager
+from .permission import get_permission_manager
 from .session import Session
 from .session.manager import SessionManager
+from .trace.controller import TraceController
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +44,7 @@ if TYPE_CHECKING:
 
 
 class CodingHost:
-    """Coding Agent 主机组装
+    """Coding Agent 主机组装（组合根，只装配与委托）
 
     一个 CodingHost = 一个工作空间 = Provider + Agent + Tools + Permission + Extensions + Session
     """
@@ -42,9 +55,11 @@ class CodingHost:
             *,
             mode: AgentMode = AgentMode.AUTO,
             extra_extension_dirs: list[Path] | None = None,
+            auto_compact: bool = True,
     ) -> None:
         self.workspace = workspace or Path.cwd()
         self.mode = mode
+        self.auto_compact = auto_compact
 
         # 加载 Provider 配置
         # todo： 暂时实现env的配置，配置大模型参数，后面改为文件配置
@@ -79,11 +94,11 @@ class CodingHost:
         # 当前 Harness
         self._harness: AgentHarness | None = None
         self._base_system = ""
-        # MCP 远程客户端与工具（connect_mcp 后填充）
-        self._mcp_clients: dict[str, Any] = {}
-        self._mcp_tools: dict[str, AgentTool] = {}
-        self._trace_unsub: Callable[[], None] | None = None
-        self._trace_collector = None
+
+        # 子系统
+        self._trace = TraceController(self.workspace, lambda: self._session)
+        self._mcp = McpConnector()
+        self._compactor = ContextCompactor(provider=self.provider, model=self.provider.model)
 
     def _init_tools(self) -> None:
         """初始化内置工具"""
@@ -108,7 +123,7 @@ class CodingHost:
     @property
     def _tools(self) -> list[AgentTool]:
         """内置工具 + 扩展注册工具 + MCP 远程工具"""
-        return self._builtin_tools + self.extensions.tools + list(self._mcp_tools.values())
+        return self._builtin_tools + self.extensions.tools + list(self._mcp.tools.values())
 
     def set_mode(self, mode: AgentMode) -> None:
         """切换模式并同步到当前 harness（权限检查读取 harness 配置里的模式快照）"""
@@ -133,6 +148,7 @@ class CodingHost:
             tools=self._tools,
             max_turns=max_turns,
             permission=self.permission,
+            compaction=AutoCompactor(self._compactor) if self.auto_compact else None,
             agent_mode=self.mode.value,
         )
         before_hook, after_hook = self.extensions.make_tool_hooks()
@@ -142,51 +158,24 @@ class CodingHost:
         # AgentEvent 流 -> 扩展生命周期 hook（agent_start / turn_end / ...）
         self.extensions.attach_to_harness(self._harness)
         # 订阅和初始化 TraceCollector
-        self._attach_trace()
+        self._trace.attach(self._harness)
         return self._harness
 
     # ============================================================
-    # 链路追踪
+    # 链路追踪（委托 TraceController）
     # ============================================================
-
-    def _attach_trace(self) -> None:
-        """为当前 harness 订阅 TraceCollector（DOT_TRACE_ENABLED=0 时为 Noop）"""
-        from .trace import make_trace_collector
-
-        # 先取消旧的订阅
-        self._detach_trace()
-        # 初始化 TraceCollector
-        self._trace_collector = make_trace_collector(self.workspace, self._session.session_id)
-        if self._harness is not None:
-            # 生成取消订阅 AgentEvent 流的函数
-            self._trace_unsub = self._harness.subscribe(self._trace_collector.on_event)
-
-    def _detach_trace(self) -> None:
-        if self._trace_unsub is not None:
-            self._trace_unsub()
-            self._trace_unsub = None
 
     def set_trace_enabled(self, enabled: bool) -> None:
         """运行时开关链路追踪（重挂 collector）"""
-        import os
-
-        os.environ["DOT_TRACE_ENABLED"] = "1" if enabled else "0"
-        self._attach_trace()
+        self._trace.set_enabled(enabled, harness=self._harness)
 
     def trace_info(self) -> dict:
         """追踪状态与落盘目录"""
-        from .trace import trace_enabled as _enabled
-
-        return {
-            "enabled": _enabled(),
-            "session_id": self._session.session_id,
-            "output_dir": self.workspace / ".dot" / "traces",
-        }
+        return self._trace.info()
 
     def flush_trace(self) -> None:
         """进程退出前兜底落盘未结束的 span"""
-        if self._trace_collector is not None:
-            self._trace_collector.flush()
+        self._trace.flush()
 
     def _compose_system(self, base: str) -> str:
         """基础 system prompt + 扩展注册的 prompt sections"""
@@ -260,7 +249,7 @@ class CodingHost:
             yield event
 
     # ============================================================
-    # Session 管理
+    # Session 管理（委托 SessionManager / Session）
     # ============================================================
 
     @property
@@ -288,148 +277,9 @@ class CodingHost:
         turn_id = self._session_manager.commit_turn(new_messages)
         return turn_id
 
-    # ============================================================
-    # MCP 远程工具（.dot/mcp.json）
-    # ============================================================
-
-    async def connect_mcp(self) -> str:
-        """连接 .dot/mcp.json 里配置的 MCP 服务器，把远程工具绑定进工具列表
-
-        在事件循环内调用（console / TUI 启动时）。返回报告文本。
-        """
-        from .extensions.builtins.mcp.client import MCPClient, load_mcp_config
-
-        servers = load_mcp_config(self.workspace)
-        if not servers:
-            logger.info("[host] no mcp servers configured")
-            return "no mcp servers configured"
-
-        reports = []
-        for name, cfg in servers.items():
-            url = cfg.get("url")
-            if not url:
-                reports.append(f"{name}: no url, skipped")
-                continue
-            client = MCPClient(
-                name, url,
-                transport=cfg.get("transport", "auto"),
-                headers=cfg.get("headers") or None,
-            )
-            try:
-                tools = await client.make_agent_tools()
-            except Exception as exc:
-                logger.warning("[host] mcp %s connect failed: %s", name, exc)
-                reports.append(f"{name}: connect failed ({exc})")
-                continue
-            self._mcp_clients[name] = client
-            for tool in tools:
-                self._mcp_tools[tool.name] = tool
-            reports.append(f"{name}: {len(tools)} tools")
-
-        if self._mcp_tools and self._harness is not None:
-            self._harness.set_tools(self._tools)
-        return "; ".join(reports)
-
-    def list_mcp_servers(self) -> list[dict]:
-        return [{"name": c.name, "url": c.url, "connected": c.connected}
-                for c in self._mcp_clients.values()]
-
-    # ============================================================
-    # 上下文压缩（/compact）
-    # ============================================================
-
-    def _estimate_context(self) -> "ContextWindowInfo":
-        """按字符估算当前上下文占用（CHARS_PER_TOKEN=4）
-
-        窗口大小可用环境变量 DOT_CONTEXT_WINDOW 覆盖（默认 128000）。
-        """
-        import os
-
-        from dot.ai.limits import ContextWindowInfo
-
-        total_chars = sum(len(m.text) for m in self._session.messages if hasattr(m, "text"))
-        estimated = total_chars // 4 + len(self._session.messages) * 4
-        try:
-            context_window = int(os.environ.get("DOT_CONTEXT_WINDOW", "128000"))
-        except ValueError:
-            context_window = 128000
-        return ContextWindowInfo(context_window=context_window, trailing_tokens=estimated)
-
-    def compact_context(self) -> str:
-        """应用压缩：L1/L2 同步执行；L3 级别时调度异步 LLM 摘要后替换消息
-
-        返回给人看的报告文本。压缩结果同步写回 harness 与 session。
-        """
-        from dot.coding.compress import CompactionLevel, compact_l1, compact_l2, plan_compaction
-
-        if self._harness is None:
-            return "no harness"
-        self._session.messages = list(self._harness.messages)
-        before = len(self._session.messages)
-
-        plan = plan_compaction(self._estimate_context())
-        if plan.level is CompactionLevel.NONE:
-            return f"no compaction needed ({plan.reason})"
-
-        messages = self._session.messages
-        applied = []
-        if plan.level in (CompactionLevel.L1, CompactionLevel.L2, CompactionLevel.L3):
-            messages = compact_l1(messages)
-            applied.append("L1")
-        if plan.level in (CompactionLevel.L2, CompactionLevel.L3):
-            messages = compact_l2(messages)
-            applied.append("L2")
-
-        if plan.level is CompactionLevel.L3:
-            self._schedule_l3_compaction(messages)
-            applied.append("L3(async scheduled)")
-
-        self._harness.replace_messages(messages)
-        self._session.messages = list(messages)
-        self._session._persisted_count = min(self._session._persisted_count, len(messages))
-        self.save_session()
-        return (f"compacted [{'+'.join(applied)}]: {before} -> {len(messages)} messages "
-                f"({plan.reason})")
-
-    def _schedule_l3_compaction(self, messages: list) -> None:
-        """L3：在运行中的事件循环上调度 LLM 摘要压缩，完成后替换消息"""
-        import asyncio
-
-        async def _run() -> None:
-            from dot.coding.compress import compact_l3
-
-            compacted = await compact_l3(
-                list(self._harness.messages),
-                provider=self.provider,
-                model=self.provider.model,
-            )
-            self._harness.replace_messages(compacted)
-            self._session.messages = list(compacted)
-            self.save_session()
-            logger.info("[host] L3 semantic compaction done (%d messages)", len(compacted))
-
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(_run())
-        except RuntimeError:
-            logger.warning("[host] L3 compaction skipped: no running event loop")
-
     def list_turns(self) -> list[dict]:
         """列出当前会话的所有轮次（/rewind 列表用）"""
-        session = self._session
-        out: list[dict] = []
-        for i, t in enumerate(session.turns):
-            start = session.turns[i - 1].msg_count_end if i > 0 else 0
-            preview = ""
-            for m in session.messages[start:t.msg_count_end]:
-                if getattr(m, "role", "") == "user" and getattr(m, "text", ""):
-                    preview = m.text[:80]
-                    break
-            out.append({
-                "turn_id": t.turn_id, "timestamp": t.timestamp,
-                "commit": t.commit, "preview": preview,
-            })
-        return out
+        return self._session.list_turns()
 
     def rewind_to_turn(self, turn_id: int) -> dict:
         """回滚到指定轮次：截断消息历史 + 恢复 workspace 文件（git reset）"""
@@ -462,3 +312,54 @@ class CodingHost:
     def list_sessions(self) -> list[dict]:
         """列出所有历史会话"""
         return self._session_manager.list_sessions()
+
+    # ============================================================
+    # MCP 远程工具（委托 McpConnector）
+    # ============================================================
+
+    async def connect_mcp(self) -> str:
+        """连接 .dot/mcp.json 里配置的 MCP 服务器，把远程工具绑定进工具列表
+
+        在事件循环内调用（console / TUI 启动时）。返回报告文本。
+        """
+        report = await self._mcp.connect(self.workspace)
+        if self._mcp.tools and self._harness is not None:
+            self._harness.set_tools(self._tools)
+        return report
+
+    def list_mcp_servers(self) -> list[dict]:
+        """已配置 MCP 服务器的连接状态"""
+        return self._mcp.list_servers()
+
+    # ============================================================
+    # 上下文压缩（/compact，委托 ContextCompactor）
+    # ============================================================
+
+    def compact_context(self) -> str:
+        """应用压缩：L1/L2 同步执行；L3 级别时调度异步 LLM 摘要后替换消息
+
+        返回给人看的报告文本。压缩结果同步写回 harness 与 session。
+        """
+        if self._harness is None:
+            return "no harness"
+        self._session.messages = list(self._harness.messages)
+
+        outcome = self._compactor.compact(self._session.messages)
+        if outcome.scheduled_l3:
+            self._compactor.schedule_l3(
+                outcome.messages,
+                on_done=self._apply_l3_result,
+            )
+
+        self._harness.replace_messages(outcome.messages)
+        self._session.messages = list(outcome.messages)
+        self._session._persisted_count = min(self._session._persisted_count, len(outcome.messages))
+        self.save_session()
+        return outcome.report
+
+    def _apply_l3_result(self, compacted: list) -> None:
+        """L3 异步摘要完成后的写回：替换 harness 与 session 消息"""
+        if self._harness is not None:
+            self._harness.replace_messages(compacted)
+        self._session.messages = list(compacted)
+        self.save_session()

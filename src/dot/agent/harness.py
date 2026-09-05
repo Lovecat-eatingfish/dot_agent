@@ -12,20 +12,17 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from inspect import isawaitable
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 
 from dot.ai.types import AgentMessage, AssistantMessage, TextContent, ToolResultMessage, UserMessage
 
 from .cancel import SimpleCancellationToken
+from .compaction import CompactionGate
 from .events import AgentEvent, MessageEndEvent, MessageStartEvent
 from .loop import AfterToolCall, BeforeToolCall, run_agent_loop
+from .permission import PermissionGate
 from .tools import AgentTool
 from ..ai.providers import OpenAIProvider
-
-if TYPE_CHECKING:
-    # 仅类型标注使用：运行时不导入，避免 agent → coding 的循环导入
-    # （权限管理器实例由 CodingHost 通过 AgentHarnessConfig 注入）
-    from ..coding.permission import PermissionManager
 
 EventListener = Callable[[AgentEvent], Awaitable[None] | None]
 QueueMode = Literal["one_at_a_time", "all"]
@@ -52,7 +49,8 @@ class AgentHarnessConfig:
     session_id: str | None = None
     before_tool_call: BeforeToolCall | None = None
     after_tool_call: AfterToolCall | None = None
-    permission: PermissionManager | None = None
+    permission: PermissionGate | None = None
+    compaction: CompactionGate | None = None
     agent_mode: str = "auto"
 
 
@@ -200,6 +198,7 @@ class AgentHarness:
                     before_tool_call=self._config.before_tool_call,
                     after_tool_call=self._config.after_tool_call,
                     permission=self._config.permission,
+                    compaction=self._config.compaction,
                     agent_mode=self._config.agent_mode,
             ):
                 await self._notify(event)

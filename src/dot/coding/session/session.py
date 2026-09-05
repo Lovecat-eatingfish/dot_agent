@@ -114,6 +114,22 @@ class Session:
             self._message_seq += 1
             return f"msg-{self._message_seq:05d}"
 
+    def list_turns(self) -> list[dict[str, Any]]:
+        """列出所有轮次的回滚锚点信息（/rewind 列表用）"""
+        out: list[dict[str, Any]] = []
+        for i, t in enumerate(self.turns):
+            start = self.turns[i - 1].msg_count_end if i > 0 else 0
+            preview = ""
+            for m in self.messages[start:t.msg_count_end]:
+                if getattr(m, "role", "") == "user" and getattr(m, "text", ""):
+                    preview = m.text[:80]
+                    break
+            out.append({
+                "turn_id": t.turn_id, "timestamp": t.timestamp,
+                "commit": t.commit, "preview": preview,
+            })
+        return out
+
     def to_snapshot(self) -> dict[str, Any]:
         """序列化为快照字典"""
         return {

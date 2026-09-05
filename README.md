@@ -22,11 +22,17 @@ LLM/Agent 调用通过适配器接入，具体模型实现可以独立选择。
 │  dot.ai      — Provider 抽象层                      │
 │  ModelProvider / Events / Catalog / Limits          │
 │  依赖：仅 httpx                                     │
+├─────────────────────────────────────────────────────┤
+│  dot.core    — 共享内核（最底层）                    │
+│  WireModel 序列化基类 / 取消令牌 Protocol           │
+│  不依赖任何 dot.* 模块，被所有层依赖                │
 └─────────────────────────────────────────────────────┘
 ```
 
-层间依赖保持单向：`coding → workflow`，`coding → agent → ai`；
-`workflow` 核心不依赖 Agent、模型 SDK 或编排框架。
+层间依赖保持单向：`coding → workflow`，`coding → agent → ai → core`，
+`workflow → core`；`workflow` 核心不依赖 Agent、模型 SDK 或编排框架。
+权限契约（Decision / PermissionGate Protocol）由 `dot.agent.permission` 定义、
+`dot.coding.permission` 实现，避免 agent → coding 反向依赖。
 
 ## 核心设计
 
@@ -43,14 +49,19 @@ plan → code → validate          LLM call → tool exec → append
   coding 的 plan→code→validate 是它的一个业务实例，不是引擎本身
 - **内层**：`run_agent_loop` 流式响应 → 工具执行 → 循环
 
-引擎内核（`src/dot/workflow/`）：
+引擎内核（`src/dot/workflow/`），**完整使用说明见 [src/dot/workflow/README.md](src/dot/workflow/README.md)**：
 
 | 模块 | 职责 |
 | --- | --- |
-| `graph.py` | `WorkflowGraph`：add_node / add_edge / add_conditional_edges + 执行循环（max_steps 防死循环） |
-| `node.py` | `WorkflowNode` Protocol + `FunctionNode`（任意函数节点）；Agent 节点由上层适配器提供 |
-| `context.py` | `WorkflowContext`：节点间数据（data/results）+ 取消令牌 |
-| `events.py` | `WorkflowEvent` discriminated union（NodeStart/NodeEnd/Error/Done） |
+| `graph.py` | `WorkflowGraph`：add_node / add_edge / add_conditional_edges（定义 + 校验/执行/导出委托到下列模块） |
+| `graph_runner.py` | GraphRunner：执行循环（重试/退避/补偿/取消，max_steps 防死循环） |
+| `graph_validate.py` | GraphValidator：静态校验（入口/不可达/END 可达性/环检测） |
+| `graph_export.py` | to_dict / to_mermaid 序列化导出 |
+| `node.py` | `WorkflowNode` Protocol + `FunctionNode` / `ParallelNode`；Agent 节点由上层适配器提供 |
+| `subgraph.py` | `SubgraphNode`：图嵌套子图（data 共享、取消传播、事件透传） |
+| `interaction.py` | `run_with_interaction`：中断事件 ↔ 人工处理器的通用桥接 |
+| `context.py` | `WorkflowContext`：节点间数据（data/results）+ 取消令牌 + 中断/恢复 |
+| `events.py` | `WorkflowEvent` discriminated union（NodeStart/NodeEnd/Error/Done/Interrupt） |
 
 ### 工具系统
 

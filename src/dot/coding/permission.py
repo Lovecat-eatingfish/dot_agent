@@ -15,45 +15,35 @@ from __future__ import annotations
 import json
 import logging
 import re
-from collections.abc import Awaitable
 from dataclasses import dataclass, field
-from enum import Enum
 from inspect import isawaitable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Awaitable
+
+from dot.agent.permission import (
+    ApprovalHandler,
+    Decision,
+    PermissionDecision,
+    SECURITY_CONFIG_FILE, PermissionGate,
+)
 
 from .modes import AgentMode
 
 logger = logging.getLogger(__name__)
-SECURITY_CONFIG_FILE = ".agent-security.json"
+
+__all__ = [
+    "Decision",
+    "PermissionDecision",
+    "PermissionManager",
+    "ProjectSecurityConfig",
+    "SECURITY_CONFIG_FILE",
+    "get_permission_manager",
+    "reset_permission_manager",
+]
 
 FILE_TOOLS = {"read_file", "write_file", "edit_file", "glob_search", "grep"}
 FILE_WRITE_TOOLS = {"write_file", "edit_file"}
 _PATH_ARGS = ("file_path", "path", "pattern_path")
-
-
-class Decision(Enum):
-    ALLOW = "allow"
-    ASK = "ask"
-    DENY = "deny"
-
-
-@dataclass
-class PermissionDecision:
-    decision: Decision
-    source: str = ""  # system | project | mode
-    reason: str = ""
-
-    @property
-    def allowed(self) -> bool:
-        return self.decision is Decision.ALLOW
-
-    def deny_message(self) -> str:
-        if self.source == "system":
-            return f"Blocked by system security rule: {self.reason}"
-        if self.source == "project":
-            return f"Blocked by project {SECURITY_CONFIG_FILE} rule: {self.reason}"
-        return f"Blocked by current mode: {self.reason}"
 
 
 @dataclass
@@ -126,16 +116,16 @@ class PermissionManager:
         self._workspace = Path(workspace)
         self._project = ProjectSecurityConfig.load(self._workspace)
 
-    def set_approval_handler(self, handler: Callable[[dict[str, Any]], bool] | None) -> None:
+    def set_approval_handler(self, handler: ApprovalHandler | None) -> None:
         self._approval_handler = handler
 
     def check(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        *,
-        agent_mode: str = "auto",
-        approved: bool = False,
+            self,
+            tool_name: str,
+            args: dict[str, Any],
+            *,
+            agent_mode: str = "auto",
+            approved: bool = False,
     ) -> PermissionDecision:
         """三级权限校验"""
         try:
@@ -144,11 +134,11 @@ class PermissionManager:
             return PermissionDecision(Decision.DENY, "system", "check-internal-error")
 
     def _check_inner(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        agent_mode: str,
-        approved: bool,
+            self,
+            tool_name: str,
+            args: dict[str, Any],
+            agent_mode: str,
+            approved: bool,
     ) -> PermissionDecision:
         # MCP / Skill 工具不做权限校验（直接放行）
         if tool_name.startswith(("mcp_", "skill_")):
@@ -206,12 +196,12 @@ class PermissionManager:
         return PermissionDecision(Decision.ALLOW, "mode", "auto mode")
 
     async def ask_user(
-        self,
-        tool_name: str,
-        args: dict[str, Any],
-        decision: PermissionDecision,
-        *,
-        agent_mode: str = "",
+            self,
+            tool_name: str,
+            args: dict[str, Any],
+            decision: PermissionDecision,
+            *,
+            agent_mode: str = "",
     ) -> bool | Awaitable[bool]:
         """发起人工审批；无交互能力时自动降级 DENY"""
         info = {

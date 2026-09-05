@@ -13,7 +13,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import Field
 
-from dot.ai.types import WireModel
+from dot.core.wire import WireModel
 
 
 class WorkflowNodeStartEvent(WireModel):

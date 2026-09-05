@@ -33,16 +33,8 @@ from .interaction import (
     WorkflowInteractionHandler,
     run_with_interaction,
 )
-from .node import FunctionNode, WorkflowNode
-
-
-def __getattr__(name: str):
-    """Keep the old `dot.workflow.AgentNode` import lazy and compatible."""
-    if name == "AgentNode":
-        from dot.agent.workflow import AgentNode
-
-        return AgentNode
-    raise AttributeError(name)
+from .node import FunctionNode, ParallelBranch, ParallelNode, WorkflowNode
+from .subgraph import SubgraphNode
 
 
 __all__ = [
@@ -65,7 +57,9 @@ __all__ = [
     # nodes
     "WorkflowNode",
     "FunctionNode",
-    # compatibility export; implementation lives in dot.agent.workflow
+    "ParallelNode",
+    "ParallelBranch",
+    "SubgraphNode",
     # events
     "WorkflowEvent",
     "WorkflowNodeStartEvent",

@@ -3,6 +3,9 @@ dot.ai.stream — 流式响应统一
 
 canonicalize_provider_stream 桥接函数：将不同 Provider 的 SSE 格式
 统一为 ProviderEvent 流。支持增量迁移——旧 parser 和新事件格式共存。
+
+归一化状态与各事件类型的处理逻辑在 _StreamNormalizer 中按单一职责拆分，
+主循环只做分发与终止判断。
 """
 from __future__ import annotations
 
@@ -26,6 +29,135 @@ from .events import (
 from .types import AssistantMessage, TextContent, ThinkingContent, ToolCall
 
 
+class _StreamNormalizer:
+    """单个响应流的归一化状态机
+
+    持有累积中的 AssistantMessage 与内容块游标，
+    每种原始事件类型对应一个 _on_* 处理方法（返回 0 或 1 个 ProviderEvent）。
+    """
+
+    def __init__(self, *, model: str = "unknown", provider: str = "unknown") -> None:
+        self.message = AssistantMessage(model=model, provider=provider)
+        self.content_index = 0
+        self.started = False
+        self.text_started = False
+        self.thinking_started = False
+
+    def handle(self, raw: dict) -> ProviderEvent | None:
+        """处理一个原始事件；返回对应 ProviderEvent（无需产出时为 None）"""
+        event_type = raw.get("type", "")
+        handler = getattr(self, f"_on_{event_type}", None)
+        return handler(raw) if handler is not None else None
+
+    # ---- 生命周期 ----
+
+    def _on_start(self, raw: dict) -> ProviderEvent | None:
+        if self.started:
+            return None
+        self.started = True
+        return AssistantStartEvent(partial=self.message)
+
+    def _on_done(self, raw: dict) -> AssistantDoneEvent:
+        reason = raw.get("reason", "stop")
+        self.message.stop_reason = reason
+        return AssistantDoneEvent(reason=reason, message=self.message)
+
+    def _on_error(self, raw: dict) -> AssistantErrorEvent:
+        reason = raw.get("reason", "error")
+        self.message.error_message = raw.get("error", "Unknown error")
+        return AssistantErrorEvent(reason=reason, error=self.message)
+
+    # ---- 文本块 ----
+
+    def _on_text_start(self, raw: dict) -> ProviderEvent | None:
+        if self.text_started:
+            return None
+        self.text_started = True
+        return TextStartEvent(content_index=self.content_index, partial=self.message)
+
+    def _on_text_delta(self, raw: dict) -> ProviderEvent | None:
+        delta = raw.get("delta", "")
+        if not delta:
+            return None
+        self.message.content.append(TextContent(text=delta))
+        return TextDeltaEvent(
+            content_index=self.content_index,
+            delta=delta,
+            partial=self.message,
+        )
+
+    def _on_text_end(self, raw: dict) -> TextEndEvent:
+        text_content = raw.get("content", "")
+        self.content_index += 1
+        self.text_started = False
+        return TextEndEvent(
+            content_index=self.content_index - 1,
+            content=text_content,
+            partial=self.message,
+        )
+
+    # ---- 思考块 ----
+
+    def _on_thinking_start(self, raw: dict) -> ProviderEvent | None:
+        if self.thinking_started:
+            return None
+        self.thinking_started = True
+        return ThinkingStartEvent(content_index=self.content_index, partial=self.message)
+
+    def _on_thinking_delta(self, raw: dict) -> ProviderEvent | None:
+        delta = raw.get("delta", "")
+        if not delta:
+            return None
+        self.message.content.append(ThinkingContent(thinking=delta))
+        return ThinkingDeltaEvent(
+            content_index=self.content_index,
+            delta=delta,
+            partial=self.message,
+        )
+
+    def _on_thinking_end(self, raw: dict) -> ThinkingEndEvent:
+        thinking_content = raw.get("content", "")
+        self.content_index += 1
+        self.thinking_started = False
+        return ThinkingEndEvent(
+            content_index=self.content_index - 1,
+            content=thinking_content,
+            partial=self.message,
+        )
+
+    # ---- 工具调用块 ----
+
+    def _on_toolcall_start(self, raw: dict) -> ToolCallStartEvent:
+        return ToolCallStartEvent(content_index=self.content_index, partial=self.message)
+
+    def _on_toolcall_delta(self, raw: dict) -> ToolCallDeltaEvent:
+        delta = raw.get("delta", "")
+        return ToolCallDeltaEvent(
+            content_index=self.content_index,
+            delta=delta,
+            partial=self.message,
+        )
+
+    def _on_toolcall_end(self, raw: dict) -> ToolCallEndEvent:
+        tool_call = ToolCall(
+            id=raw.get("id", ""),
+            name=raw.get("name", ""),
+            arguments=raw.get("arguments", {}),
+        )
+        self.message.content.append(tool_call)
+        index = self.content_index
+        self.content_index += 1
+        return ToolCallEndEvent(
+            content_index=index,
+            tool_call=tool_call,
+            partial=self.message,
+        )
+
+
+# 终止型事件：处理后立即结束流
+_TERMINAL_EVENTS = (AssistantDoneEvent, AssistantErrorEvent)
+
+
 async def canonicalize_provider_stream(
     raw_events: AsyncIterator[dict],
     *,
@@ -45,107 +177,15 @@ async def canonicalize_provider_stream(
     Yields:
         ProviderEvent: 统一的流式事件
     """
-    message = AssistantMessage(model=model, provider=provider)
-    content_index = 0
-    started = False
-    text_started = False
-    thinking_started = False
+    normalizer = _StreamNormalizer(model=model, provider=provider)
 
     async for raw in raw_events:
-        event_type = raw.get("type", "")
-
-        if event_type == "start":
-            if not started:
-                started = True
-                yield AssistantStartEvent(partial=message)
-
-        elif event_type == "text_start":
-            if not text_started:
-                text_started = True
-                yield TextStartEvent(content_index=content_index, partial=message)
-
-        elif event_type == "text_delta":
-            delta = raw.get("delta", "")
-            if delta:
-                message.content.append(TextContent(text=delta))
-                yield TextDeltaEvent(
-                    content_index=content_index,
-                    delta=delta,
-                    partial=message,
-                )
-
-        elif event_type == "text_end":
-            text_content = raw.get("content", "")
-            yield TextEndEvent(
-                content_index=content_index,
-                content=text_content,
-                partial=message,
-            )
-            content_index += 1
-            text_started = False
-
-        elif event_type == "thinking_start":
-            if not thinking_started:
-                thinking_started = True
-                yield ThinkingStartEvent(content_index=content_index, partial=message)
-
-        elif event_type == "thinking_delta":
-            delta = raw.get("delta", "")
-            if delta:
-                message.content.append(ThinkingContent(thinking=delta))
-                yield ThinkingDeltaEvent(
-                    content_index=content_index,
-                    delta=delta,
-                    partial=message,
-                )
-
-        elif event_type == "thinking_end":
-            thinking_content = raw.get("content", "")
-            yield ThinkingEndEvent(
-                content_index=content_index,
-                content=thinking_content,
-                partial=message,
-            )
-            content_index += 1
-            thinking_started = False
-
-        elif event_type == "toolcall_start":
-            yield ToolCallStartEvent(content_index=content_index, partial=message)
-
-        elif event_type == "toolcall_delta":
-            delta = raw.get("delta", "")
-            yield ToolCallDeltaEvent(
-                content_index=content_index,
-                delta=delta,
-                partial=message,
-            )
-
-        elif event_type == "toolcall_end":
-            tool_call = ToolCall(
-                id=raw.get("id", ""),
-                name=raw.get("name", ""),
-                arguments=raw.get("arguments", {}),
-            )
-            message.content.append(tool_call)
-            yield ToolCallEndEvent(
-                content_index=content_index,
-                tool_call=tool_call,
-                partial=message,
-            )
-            content_index += 1
-
-        elif event_type == "done":
-            reason = raw.get("reason", "stop")
-            message.stop_reason = reason
-            yield AssistantDoneEvent(reason=reason, message=message)
-            return
-
-        elif event_type == "error":
-            reason = raw.get("reason", "error")
-            message.error_message = raw.get("error", "Unknown error")
-            yield AssistantErrorEvent(reason=reason, error=message)
+        event = normalizer.handle(raw)
+        if event is not None:
+            yield event
+        if isinstance(event, _TERMINAL_EVENTS):
             return
 
     # 流意外结束
-    if started:
-        yield AssistantDoneEvent(reason="stop", message=message)
+    if normalizer.started:
+        yield AssistantDoneEvent(reason="stop", message=normalizer.message)

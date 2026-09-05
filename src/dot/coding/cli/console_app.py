@@ -194,87 +194,30 @@ async def _console_loop(harness: AgentHarness, host: CodingHost) -> None:
 
 async def _run_turn(harness: AgentHarness, user_input: str) -> None:
     """Run one agent turn, buffer text deltas, print assistant message when done"""
+    from dot.coding.render import ConsoleSink, StreamRenderer
+
     log.info("用户输入的内容: %s", user_input[:200])
 
-    buffer: list[str] = []
-    thinking_buffer: list[str] = []
-
+    renderer = StreamRenderer(ConsoleSink(log))
     try:
         async for event in harness.prompt(user_input):
-            _process_event(event, buffer, thinking_buffer)
+            renderer.process(event)
     except asyncio.CancelledError:
         log.info("Turn cancelled")
         # Flush partial text
-        if buffer:
-            print("".join(buffer))
+        renderer.flush_partial()
         raise
-
-
-def _process_event(event, buffer: list[str], thinking_buffer: list[str]) -> None:
-    """Process event: accumulate text deltas, flush on message end 给控制台调试使用的"""
-    from dot.agent.events import (
-        AgentEndEvent, AgentStartEvent, MessageEndEvent, MessageStartEvent,
-        MessageUpdateEvent, ToolExecutionEndEvent, ToolExecutionStartEvent,
-        ToolExecutionUpdateEvent, TurnEndEvent, TurnStartEvent,
-    )
-    from dot.ai.events import TextDeltaEvent, ThinkingDeltaEvent
-    from dot.ai.types import AssistantMessage
-
-    if isinstance(event, AgentStartEvent):
-        log.debug("[agent] start")
-    elif isinstance(event, AgentEndEvent):
-        log.debug("[agent] end")
-    elif isinstance(event, TurnStartEvent):
-        pass
-    elif isinstance(event, TurnEndEvent):
-        pass
-    elif isinstance(event, MessageStartEvent):
-        msg = event.message
-        if isinstance(msg, AssistantMessage) and msg.text:
-            buffer.append(msg.text)
-    elif isinstance(event, MessageEndEvent):
-        msg = event.message
-        if isinstance(msg, AssistantMessage):
-            text = "".join(buffer)
-            if text:
-                print(text)
-            buffer.clear()
-            log.info("[assistant] %s", text[:500])
-    elif isinstance(event, MessageUpdateEvent):
-        nested = getattr(event, "provider_event", None)
-        if isinstance(nested, TextDeltaEvent):
-            buffer.append(nested.delta)
-        elif isinstance(nested, ThinkingDeltaEvent):
-            thinking_buffer.append(nested.delta)
-    elif isinstance(event, ToolExecutionStartEvent):
-        print(f"- {event.tool_name}")
-    elif isinstance(event, ToolExecutionUpdateEvent):
-        pass  # skip intermediate updates
-    elif isinstance(event, ToolExecutionEndEvent):
-        status = "OK" if not event.is_error else "FAIL"
-        result_text = event.result.text[:200] if event.result else ""
-        print(f"  {status}: {result_text}")
 
 
 async def _run_workflow_turn(harness: AgentHarness, host: CodingHost, task: str) -> None:
     """Run the coding workflow using the console interaction handler."""
-    from dot.coding.workflow import create_context, run_workflow
-    from dot.workflow import WorkflowErrorEvent, WorkflowNodeStartEvent
+    from dot.coding.render import ConsoleSink, StreamRenderer
+    from dot.coding.workflow import start_workflow_turn
 
-    context = create_context(task)
-    buffer: list[str] = []
-    thinking_buffer: list[str] = []
-    async for event in run_workflow(
-            context,
-            host,
-            ui_mode="console",
-            harness=harness,
-    ):
-        if isinstance(event, WorkflowNodeStartEvent):
-            print(f"\n--- workflow: {event.node} ---")
-        elif isinstance(event, WorkflowErrorEvent):
-            print(f"workflow error: {event.error}")
-        _process_event(event, buffer, thinking_buffer)
+    turn = start_workflow_turn(host, task, ui_mode="console", harness=harness)
+    renderer = StreamRenderer(ConsoleSink(log))
+    async for event in turn.events:
+        renderer.process(event)
 
 
 def _execute_slash(text: str, host):

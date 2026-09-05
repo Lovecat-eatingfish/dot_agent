@@ -10,8 +10,8 @@ from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI
 
-from dot.agent.cancel import SimpleCancellationToken
 from dot.ai.config import OpenAISettings
+from dot.core.cancel import SimpleCancellationToken
 from dot.ai.events import (
     AssistantDoneEvent,
     AssistantErrorEvent,

@@ -86,6 +86,15 @@ class ToolExecutionEndEvent(WireModel):
     is_error: bool
 
 
+class ContextCompactedEvent(WireModel):
+    """上下文已自动压缩（turn 边界触发）"""
+    type: Literal["context_compacted"] = "context_compacted"
+    level: str = ""    # 已应用的级别，如 "L1+L2"
+    before: int = 0    # 压缩前消息数
+    after: int = 0     # 压缩后消息数
+    reason: str = ""   # 触发原因
+
+
 type AgentEvent = Annotated[
     AgentStartEvent
     | AgentEndEvent
@@ -96,6 +105,7 @@ type AgentEvent = Annotated[
     | MessageEndEvent
     | ToolExecutionStartEvent
     | ToolExecutionUpdateEvent
-    | ToolExecutionEndEvent,
+    | ToolExecutionEndEvent
+    | ContextCompactedEvent,
     Field(discriminator="type"),
 ]

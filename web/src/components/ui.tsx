@@ -1,101 +1,77 @@
-import { useState } from "react";
+// 通用 UI 组件（轻量自绘，配合 Tailwind）
+import type { ButtonHTMLAttributes, ReactNode } from "react";
 
-// 轻量 UI 组件（不引组件库，Tailwind 手写）
-
-export function Card({ children, className = "" }: { children: React.ReactNode; className?: string }) {
+export function Card({ title, children, className = "" }: { title?: ReactNode; children: ReactNode; className?: string }) {
   return (
-    <div className={`bg-white rounded-lg border border-slate-200 shadow-sm ${className}`}>
-      {children}
+    <div className={`rounded-xl border border-slate-200/70 bg-white shadow-card ${className}`}>
+      {title && (
+        <div className="border-b border-slate-100 px-4 py-3 text-[13px] font-semibold text-slate-700">{title}</div>
+      )}
+      <div className="p-4">{children}</div>
     </div>
   );
 }
 
-export function Button({
-  children,
-  onClick,
-  disabled,
-  variant = "primary",
-  className = "",
-}: {
-  children: React.ReactNode;
-  onClick?: () => void;
-  disabled?: boolean;
-  variant?: "primary" | "secondary" | "danger" | "ghost";
-  className?: string;
-}) {
-  const variants = {
-    primary: "bg-brand-600 text-white hover:bg-brand-700 disabled:bg-slate-300",
-    secondary: "bg-slate-100 text-slate-700 hover:bg-slate-200 disabled:opacity-50",
-    danger: "bg-red-50 text-red-600 hover:bg-red-100 border border-red-200",
-    ghost: "text-slate-600 hover:bg-slate-100",
-  };
+type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+  variant?: "primary" | "default" | "danger" | "ghost";
+  loading?: boolean;
+};
+
+export function Button({ variant = "default", loading, children, disabled, className = "", ...rest }: ButtonProps) {
+  const styles = {
+    primary: "bg-indigo-600 text-white shadow-sm hover:bg-indigo-500 active:bg-indigo-700 disabled:bg-indigo-300",
+    default: "bg-white text-slate-700 border border-slate-300 hover:border-slate-400 hover:bg-slate-50",
+    danger: "bg-white text-red-600 border border-red-200 hover:border-red-300 hover:bg-red-50",
+    ghost: "text-slate-500 hover:bg-slate-100 hover:text-slate-700",
+  }[variant];
   return (
     <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`px-4 py-2 rounded-md text-sm font-medium transition-colors disabled:cursor-not-allowed ${variants[variant]} ${className}`}
+      className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-[13px] font-medium transition disabled:cursor-not-allowed disabled:opacity-50 ${styles} ${className}`}
+      disabled={disabled || loading}
+      {...rest}
     >
+      {loading && <Spinner />}
       {children}
     </button>
   );
 }
 
-export function Badge({ children, color = "slate" }: { children: React.ReactNode; color?: "slate" | "red" | "green" | "amber" | "blue" }) {
-  const colors = {
-    slate: "bg-slate-100 text-slate-600",
-    red: "bg-red-100 text-red-700",
-    green: "bg-green-100 text-green-700",
-    amber: "bg-amber-100 text-amber-700",
-    blue: "bg-blue-100 text-blue-700",
-  };
+export function Spinner({ className = "h-3.5 w-3.5" }: { className?: string }) {
   return (
-    <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${colors[color]}`}>
+    <span className={`inline-block animate-spin rounded-full border-2 border-current border-t-transparent ${className}`} />
+  );
+}
+
+const BADGE_TONES = {
+  slate: "bg-slate-100 text-slate-600 border-slate-200",
+  green: "bg-emerald-50 text-emerald-700 border-emerald-200",
+  red: "bg-red-50 text-red-700 border-red-200",
+  blue: "bg-indigo-50 text-indigo-700 border-indigo-200",
+  amber: "bg-amber-50 text-amber-700 border-amber-200",
+} as const;
+
+export function Badge({ tone = "slate", children }: { tone?: keyof typeof BADGE_TONES; children: ReactNode }) {
+  return (
+    <span className={`inline-flex items-center rounded border px-1.5 py-px font-mono text-[11px] leading-4 ${BADGE_TONES[tone]}`}>
       {children}
     </span>
   );
 }
 
-export function Spinner({ className = "" }: { className?: string }) {
+export function EmptyState({ text, hint }: { text: string; hint?: string }) {
   return (
-    <svg className={`animate-spin h-4 w-4 ${className}`} viewBox="0 0 24 24" fill="none">
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-    </svg>
+    <div className="py-12 text-center">
+      <div className="mx-auto mb-3 h-8 w-8 rounded-full border border-dashed border-slate-300" />
+      <p className="text-sm text-slate-400">{text}</p>
+      {hint && <p className="mt-1 text-xs text-slate-300">{hint}</p>}
+    </div>
   );
 }
 
 export function ErrorBanner({ message }: { message: string }) {
   return (
-    <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-md text-sm">
+    <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 font-mono text-[13px] text-red-700">
       {message}
     </div>
   );
-}
-
-export function PageHeader({ title, subtitle }: { title: string; subtitle?: string }) {
-  return (
-    <div className="mb-6">
-      <h2 className="text-xl font-bold text-slate-800">{title}</h2>
-      {subtitle && <p className="text-sm text-slate-500 mt-1">{subtitle}</p>}
-    </div>
-  );
-}
-
-// 简单确认弹窗
-export function useConfirm() {
-  const [state, setState] = useState<{ msg: string; resolve: (v: boolean) => void } | null>(null);
-  const confirm = (msg: string): Promise<boolean> =>
-    new Promise((resolve) => setState({ msg, resolve }));
-  const node = state ? (
-    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50" onClick={() => { state.resolve(false); setState(null); }}>
-      <div className="bg-white rounded-lg p-6 max-w-sm w-full mx-4" onClick={(e) => e.stopPropagation()}>
-        <p className="text-sm text-slate-700 mb-4">{state.msg}</p>
-        <div className="flex justify-end gap-2">
-          <Button variant="secondary" onClick={() => { state.resolve(false); setState(null); }}>取消</Button>
-          <Button variant="danger" onClick={() => { state.resolve(true); setState(null); }}>确认</Button>
-        </div>
-      </div>
-    </div>
-  ) : null;
-  return { confirm, node };
 }

@@ -1,170 +1,202 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useSearchParams } from "react-router-dom";
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from "recharts";
-import { api } from "../api";
-import type { TraceResp, TraceStep } from "../types";
-import { Button, Card, PageHeader, Spinner, ErrorBanner, Badge } from "../components/ui";
+import { getTrace, listTraces } from "../api";
+import type { TraceDetail, TraceStep } from "../types";
+import { Badge, Button, Card, EmptyState, ErrorBanner } from "../components/ui";
 
 export default function TracePage() {
-  const [searchParams, setSearchParams] = useSearchParams();
-  const [traceId, setTraceId] = useState(searchParams.get("trace_id") || "");
-  const [result, setResult] = useState<TraceResp | null>(null);
+  const [traces, setTraces] = useState<TraceDetail[]>([]);
+  const [selected, setSelected] = useState<TraceDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [searchParams] = useSearchParams();
 
-  async function lookup(id: string) {
-    if (!id.trim()) return;
+  const refresh = useCallback(async () => {
     setLoading(true);
     setError("");
-    setResult(null);
     try {
-      const r = await api.getTrace(id.trim());
-      setResult(r);
-      setSearchParams({ trace_id: id.trim() });
+      setTraces((await listTraces()).traces);
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
-  }
-
-  // 带参跳转自动查询
-  useEffect(() => {
-    const tid = searchParams.get("trace_id");
-    if (tid) {
-      setTraceId(tid);
-      lookup(tid);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const trace = result?.trace;
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  // 支持 /trace?id=xxx 直达单条（问答页跳转过来）
+  useEffect(() => {
+    const id = searchParams.get("id");
+    if (id) openTrace(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  async function openTrace(id: string) {
+    setError("");
+    try {
+      setSelected(await getTrace(id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  const totalCost = (t: TraceDetail) => t.steps.reduce((sum, s) => sum + s.cost_ms, 0);
+  // 瀑布图时间轴总长：所有 span 的最大结束时间
+  const totalMs = selected ? Math.max(1, ...flattenSpans(selected.steps).map((r) => r.step.start_ms! + r.step.cost_ms)) : 1;
 
   return (
-    <div className="p-8 max-w-4xl">
-      <PageHeader title="链路追踪" subtitle="按 trace_id 查看单次请求的完整链路：每步召回/分数/耗时/降级" />
+    <div className="space-y-5">
+      <div className="flex items-center justify-between">
+        <h2 className="text-xl font-bold text-slate-800">链路追踪</h2>
+        <Button onClick={refresh} loading={loading}>
+          刷新
+        </Button>
+      </div>
 
-      <Card className="p-4 mb-4">
-        <div className="flex gap-2">
-          <input
-            value={traceId}
-            onChange={(e) => setTraceId(e.target.value)}
-            onKeyDown={(e) => e.key === "Enter" && lookup(traceId)}
-            className="flex-1 px-3 py-2 border border-slate-300 rounded-md text-sm font-mono focus:outline-none focus:border-brand-500"
-            placeholder="输入 trace_id，如 rag-trace-20260814-103045-a1b2c3"
-          />
-          <Button onClick={() => lookup(traceId)} disabled={loading || !traceId.trim()}>
-            {loading ? <Spinner /> : "查询"}
-          </Button>
-        </div>
+      {error && <ErrorBanner message={error} />}
+
+      {/* 列表 */}
+      <Card title="查询记录">
+        {traces.length === 0 ? (
+          <EmptyState text="还没有查询记录，去问答页提问后这里会显示完整链路" />
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+                <tr className="border-b border-slate-200 text-left font-mono text-[11px] uppercase tracking-wider text-slate-400">
+                  <th className="py-2 pr-3 font-medium">时间</th>
+                  <th className="py-2 pr-3 font-medium">问题</th>
+                  <th className="py-2 pr-3 font-medium">片段</th>
+                  <th className="py-2 pr-3 font-medium">总耗时</th>
+                  <th className="py-2 pr-3 font-medium">状态</th>
+                </tr>
+            </thead>
+            <tbody>
+              {traces.map((t) => (
+                <tr
+                  key={t.trace_id}
+                  onClick={() => openTrace(t.trace_id)}
+                  className={`cursor-pointer border-b border-slate-50 hover:bg-slate-50 ${
+                    selected?.trace_id === t.trace_id ? "bg-blue-50/60" : ""
+                  }`}
+                >
+                  <td className="py-2 pr-3 text-xs text-slate-400">{formatTime(t.created_at)}</td>
+                  <td className="max-w-[240px] truncate py-2 pr-3 text-slate-700">{t.question}</td>
+                  <td className="py-2 pr-3 text-slate-500">{t.chunk_count}</td>
+                  <td className="py-2 pr-3 text-slate-500">{Math.round(totalCost(t))}ms</td>
+                  <td className="py-2 pr-3">
+                    {t.status === "done" ? <Badge tone="green">done</Badge> : <Badge tone="red">error</Badge>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </Card>
 
-      {error && <div className="mb-4"><ErrorBanner message={error} /></div>}
-
-      {result && !result.ok && <ErrorBanner message={result.error || "未找到 trace"} />}
-
-      {trace && (
-        <div className="space-y-4">
-          {/* 概要 */}
-          <Card className="p-5">
-            <div className="grid grid-cols-3 gap-4">
-              <div>
-                <div className="text-xs text-slate-400">trace_id</div>
-                <div className="text-sm font-mono text-slate-700 truncate" title={trace.trace_id}>{trace.trace_id}</div>
-              </div>
-              <div>
-                <div className="text-xs text-slate-400">查询</div>
-                <div className="text-sm text-slate-700 truncate" title={trace.query}>{trace.query || "—"}</div>
-              </div>
-              <div>
-                <div className="text-xs text-slate-400">时间</div>
-                <div className="text-sm text-slate-700">{trace.created_at}</div>
-              </div>
+      {/* 详情 */}
+      {selected && (
+        <Card
+          title={
+            <span className="flex items-center gap-2">
+              链路详情 <Badge>{selected.trace_id}</Badge>
+            </span>
+          }
+        >
+          <div className="space-y-4">
+            <div>
+              <p className="text-xs font-medium text-slate-400">问题</p>
+              <p className="mt-1 text-sm text-slate-700">{selected.question}</p>
             </div>
-            {trace.degraded.length > 0 && (
-              <div className="mt-3 flex items-center gap-2 flex-wrap">
-                <span className="text-xs text-slate-400">降级标记:</span>
-                {trace.degraded.map((d, i) => <Badge key={i} color="red">{d}</Badge>)}
+
+            {/* span 树瀑布图 */}
+            <div>
+              <p className="font-mono text-[11px] uppercase tracking-wider text-slate-400">span 瀑布图</p>
+              <div className="mt-2 space-y-1">
+                {flattenSpans(selected.steps).map(({ step, depth }, i) => (
+                  <div
+                    key={i}
+                    className="group flex items-center gap-3 rounded-md py-1 pr-1 text-xs hover:bg-slate-50"
+                    style={{ paddingLeft: depth * 20 + 4 }}
+                  >
+                    <span
+                      className={`w-32 shrink-0 truncate font-mono text-[11px] ${
+                        depth === 0 ? "font-semibold text-slate-700" : "text-slate-500"
+                      }`}
+                    >
+                      {depth > 0 && <span className="mr-1 text-slate-300">└</span>}
+                      {step.stage}
+                    </span>
+                    <div
+                      className="relative h-4 flex-1 overflow-hidden rounded bg-slate-100"
+                      style={{
+                        backgroundImage:
+                          "repeating-linear-gradient(to right, rgba(148,163,184,0.28) 0 1px, transparent 1px 48px)",
+                      }}
+                    >
+                      <div
+                        className={`absolute top-0 h-full rounded ${SPAN_COLORS[Math.min(depth, SPAN_COLORS.length - 1)]}`}
+                        style={{
+                          left: `${((step.start_ms ?? 0) / totalMs) * 100}%`,
+                          width: `${Math.max(1.5, (step.cost_ms / totalMs) * 100)}%`,
+                        }}
+                        title={`${step.stage}: +${Math.round(step.start_ms ?? 0)}ms 起，耗时 ${Math.round(step.cost_ms)}ms`}
+                      />
+                    </div>
+                    <span className="w-20 shrink-0 text-right font-mono text-[11px] text-slate-500">
+                      {Math.round(step.cost_ms)}ms
+                    </span>
+                  </div>
+                ))}
               </div>
-            )}
-          </Card>
-
-          {/* 步骤耗时图（若有 ms 字段）*/}
-          {trace.steps.some((s) => typeof s.ms === "number") && (
-            <Card className="p-5">
-              <h3 className="text-sm font-semibold text-slate-700 mb-3">各步骤耗时</h3>
-              <ResponsiveContainer width="100%" height={220}>
-                <BarChart data={trace.steps.map((s) => ({ step: s.step, ms: Number(s.ms) || 0 }))}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
-                  <XAxis dataKey="step" tick={{ fontSize: 11 }} />
-                  <YAxis tick={{ fontSize: 11 }} />
-                  <Tooltip />
-                  <Bar dataKey="ms" fill="#2563eb" radius={[4, 4, 0, 0]} />
-                </BarChart>
-              </ResponsiveContainer>
-            </Card>
-          )}
-
-          {/* 时间线 */}
-          <Card className="p-5">
-            <h3 className="text-sm font-semibold text-slate-700 mb-4">步骤时间线（{trace.steps.length} 步）</h3>
-            <div className="relative">
-              {trace.steps.map((step, i) => (
-                <StepNode key={i} step={step} isLast={i === trace.steps.length - 1} />
-              ))}
+              <p className="mt-1.5 text-right font-mono text-[10px] text-slate-300">
+                时间轴 0 — {Math.round(totalMs)}ms
+              </p>
             </div>
-          </Card>
-        </div>
-      )}
 
-      {!trace && !loading && !error && (
-        <Card className="p-8 text-center text-sm text-slate-400">
-          输入 trace_id 查询链路，或从问答页点击 trace 链接跳转
+            <div>
+              <p className="text-xs font-medium text-slate-400">回答</p>
+              <p className="mt-1 whitespace-pre-wrap rounded-md bg-slate-50 p-3 text-sm leading-relaxed text-slate-700">
+                {selected.answer || "（无）"}
+              </p>
+            </div>
+
+            <div>
+              <p className="text-xs font-medium text-slate-400">原始数据</p>
+              <pre className="mt-1 max-h-48 overflow-auto rounded-md bg-slate-900 p-3 text-xs leading-relaxed text-slate-100">
+                {JSON.stringify(selected, null, 2)}
+              </pre>
+            </div>
+
+            <div className="text-right">
+              <Button onClick={() => setSelected(null)}>关闭详情</Button>
+            </div>
+          </div>
         </Card>
       )}
     </div>
   );
 }
 
-function StepNode({ step, isLast }: { step: TraceStep; isLast: boolean }) {
-  const extraKeys = Object.keys(step).filter(
-    (k) => !["step", "ts", "degraded"].includes(k),
-  );
-  return (
-    <div className="flex gap-3 pb-6 relative">
-      {/* 轴线 */}
-      {!isLast && <div className="absolute left-[7px] top-4 bottom-0 w-px bg-slate-200" />}
-      <div className="w-3.5 h-3.5 rounded-full bg-brand-500 mt-1.5 shrink-0 ring-4 ring-brand-50" />
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center gap-2 flex-wrap">
-          <span className="text-sm font-medium text-slate-800">{step.step}</span>
-          {typeof step.hits === "number" && <Badge color="blue">hits: {step.hits}</Badge>}
-          {typeof step.refs === "number" && <Badge color="green">refs: {step.refs}</Badge>}
-          {typeof step.ms === "number" && <Badge color="amber">{step.ms}ms</Badge>}
-        </div>
-        {/* 额外字段 */}
-        {extraKeys.length > 0 && (
-          <div className="mt-1 text-xs text-slate-500 space-y-0.5">
-            {extraKeys.map((k) => (
-              <div key={k} className="font-mono break-all">
-                <span className="text-slate-400">{k}:</span>{" "}
-                {formatValue(step[k])}
-              </div>
-            ))}
-          </div>
-        )}
-        <div className="text-xs text-slate-400 mt-0.5">{step.ts}</div>
-      </div>
-    </div>
-  );
+function formatTime(iso: string): string {
+  const d = new Date(iso);
+  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}:${String(d.getSeconds()).padStart(2, "0")}`;
 }
 
-function formatValue(v: unknown): string {
-  if (v === null || v === undefined) return "—";
-  if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") return String(v);
-  try {
-    return JSON.stringify(v);
-  } catch {
-    return String(v);
-  }
+// span 树 → 扁平行（保留深度用于缩进）；兼容旧格式（无 children 的平铺 steps）
+interface SpanRow {
+  step: TraceStep;
+  depth: number;
 }
+
+function flattenSpans(steps: TraceStep[], depth = 0, out: SpanRow[] = []): SpanRow[] {
+  for (const s of steps) {
+    out.push({ step: s, depth });
+    if (s.children?.length) flattenSpans(s.children, depth + 1, out);
+  }
+  return out;
+}
+
+const SPAN_COLORS = ["bg-slate-700/80", "bg-blue-500/80", "bg-emerald-500/80", "bg-amber-500/80"];

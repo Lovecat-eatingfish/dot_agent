@@ -15,6 +15,21 @@ dependencies = [
     "pydantic-settings>=2.0",
     "openai>=1.0",
     "textual>=8.0",
+    "langchain>=1.4.0",
+    "langchain-text-splitters>=1.1.2",
+    "langchain-huggingface>=1.2.2",
+    "sentence-transformers>=6.0.1",
+    "langchain-community>=0.4.2",
+    "pymilvus[milvus-lite]>=3.0.1",
+    "langchain-chroma>=1.1.0",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.52.3",
+    "python-multipart>=0.0.32",
+    "pypdf>=6.17.0",
+    "docx2txt>=0.9",
+    "pymupdf4llm>=1.28.2",
+    "rank-bm25>=0.2.2",
+    "jieba>=0.42.1",
 ]
 
 [project.scripts]

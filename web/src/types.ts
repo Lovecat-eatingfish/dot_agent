@@ -1,107 +1,87 @@
-// 后端 API 响应类型（对齐 src/mokioclaw/rag/service.py）
+// 后端 API 类型（对齐 src/dot/rag/server.py）
 
-export interface ApiOk {
-  ok: boolean;
+export interface DocumentRecord {
+  id: string;
+  filename: string;
+  path: string;
+  version: number;
+  chunk_count: number;
+  status: "active" | "deleted";
+  created_at: string;
+  updated_at: string;
 }
 
-export interface HealthResp extends ApiOk {
-  persist_dir: string;
+export interface IngestResult {
+  id: string;
+  filename: string;
+  version: number;
+  chunk_count: number;
 }
 
-export interface IngestResp extends ApiOk {
-  doc_id: string;
-  chunks: number;
-  source?: string;
-  error?: string;
-}
-
-export interface ChunkMeta {
-  source?: string;
-  doc_id?: string;
-  chunk_index?: number;
-  heading_path?: string;
-  page?: number;
-  char_start?: number;
-  char_end?: number;
-  parent_index?: number;
-  [k: string]: unknown;
+export interface IngestError {
+  filename: string;
+  error: string;
 }
 
 export interface ChunkItem {
-  content: string;
-  metadata: ChunkMeta;
+  source: string;
+  score: number | null;
+  text: string;        // 子块原文（检索命中粒度）
+  parent_text: string; // 父块文本（实际送入 LLM 的上下文）
 }
 
-export interface Citation {
-  index: number;
-  doc_id: string;
+export interface SplitFamily {
+  parent_id: string;
+  parent_text: string;
+  children: string[];
   source: string;
 }
 
-export interface QueryResp extends ApiOk {
-  query?: string;
-  answer?: string;
-  trace_id?: string;
-  cached?: boolean;
-  degraded?: string[];
-  citations?: Citation[];
-  chunks?: ChunkItem[];
-  error?: string;
-}
-
-export interface SplitPreviewResp extends ApiOk {
-  parents: ChunkItem[];
-  children: ChunkItem[];
-  stats: {
-    parent_count: number;
-    child_count: number;
-    avg_child_len: number;
-  };
-  error?: string;
-}
-
-export interface DocRecord {
-  doc_id: string;
-  source: string;
-  chunk_count: number;
-  version: number;
-}
-
-export interface DocumentsResp extends ApiOk {
-  documents: DocRecord[];
+export interface SplitPreviewResp {
+  families: SplitFamily[];
+  stats: { parents: number; children: number; chars: number };
 }
 
 export interface TraceStep {
-  step: string;
-  ts: string;
-  hits?: number;
-  scores?: unknown;
-  queries?: unknown;
-  ms?: number;
-  filter?: unknown;
-  refs?: number;
-  [k: string]: unknown;
+  stage: string;
+  cost_ms: number;
+  start_ms?: number;      // 相对查询开始的偏移（瀑布图用）
+  detail: Record<string, unknown>;
+  children?: TraceStep[]; // 子 span（层级链路）
 }
 
-export interface TraceRecord {
+export interface TraceDetail {
   trace_id: string;
-  query: string;
-  created_at: string;
+  question: string;
+  answer: string;
   steps: TraceStep[];
-  degraded: string[];
+  top_k: number;
+  chunk_count: number;
+  status: "done" | "error";
+  created_at: string;
 }
 
-export interface TraceResp extends ApiOk {
-  trace?: TraceRecord;
-  error?: string;
+export interface SessionRecord {
+  id: string;
+  title: string;
+  created_at: string;
+  updated_at: string;
 }
 
-export interface QueryReq {
-  query: string;
-  k: number;
-  filter?: Record<string, unknown>;
-  rewrite?: boolean;
-  self_query?: boolean;
-  generate_answer?: boolean;
-  use_cache?: boolean;
+export interface MessageRecord {
+  id: string;
+  session_id: string;
+  role: "user" | "assistant";
+  content: string;
+  trace_id: string;
+  sources: string[];
+  created_at: string;
 }
+
+// SSE 事件流
+export type RagEvent =
+  | { type: "stage"; stage: string; cost_ms: number; chunks: ChunkItem[] }
+  | { type: "delta"; text: string }
+  | { type: "session"; session_id: string; title: string }
+  | { type: "done"; trace_id: string; answer: string; sources: string[]; message_id?: string }
+  | { type: "error"; message: string };

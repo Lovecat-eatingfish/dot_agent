@@ -1,211 +1,148 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
-import { api } from "../api";
-import type { IngestResp } from "../types";
-import { Button, Card, PageHeader, Spinner, ErrorBanner, Badge } from "../components/ui";
-
-type Tab = "file" | "text" | "url";
+import { useRef, useState } from "react";
+import { ingestDir, ingestText, uploadDocuments } from "../api";
+import type { IngestError, IngestResult } from "../types";
+import { Badge, Button, Card, ErrorBanner } from "../components/ui";
+import { PageHeader } from "../App";
 
 export default function IngestPage() {
-  const [tab, setTab] = useState<Tab>("file");
-  const [loading, setLoading] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [results, setResults] = useState<IngestResult[]>([]);
+  const [errors, setErrors] = useState<IngestError[]>([]);
   const [error, setError] = useState("");
-  const [result, setResult] = useState<IngestResp | null>(null);
+  const [dragOver, setDragOver] = useState(false);
 
-  // 文本/URL 表单
+  // 粘贴文本
   const [text, setText] = useState("");
-  const [source, setSource] = useState("text");
-  const [url, setUrl] = useState("");
+  const [filename, setFilename] = useState("pasted_text.md");
 
-  // 文件
-  const [fileName, setFileName] = useState("");
+  const fileInput = useRef<HTMLInputElement>(null);
 
-  async function submitText() {
-    if (!text.trim()) return;
-    setLoading(true);
+  async function handleFiles(files: FileList | null) {
+    if (!files || files.length === 0) return;
+    setUploading(true);
     setError("");
-    setResult(null);
     try {
-      const r = await api.ingestText(text, source);
-      setResult(r);
-      setText("");
+      const resp = await uploadDocuments(Array.from(files));
+      setResults(resp.ingested);
+      setErrors(resp.errors);
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      setUploading(false);
     }
   }
 
-  async function submitUrl() {
-    if (!url.trim()) return;
-    setLoading(true);
+  async function handlePasteText() {
     setError("");
-    setResult(null);
+    setErrors([]);
+    setResults([]);
     try {
-      const r = await api.ingestUrl(url);
-      setResult(r);
+      const result = await ingestText(text, filename || "pasted_text.md");
+      setResults([result]);
     } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
+      setError(e instanceof Error ? e.message : String(e));
     }
   }
 
-  async function submitFile(file: File) {
-    setFileName(file.name);
-    setLoading(true);
+  async function handleIngestDir() {
+    setUploading(true);
     setError("");
-    setResult(null);
+    setResults([]);
+    setErrors([]);
     try {
-      const r = await api.ingestFile(file);
-      setResult(r);
+      const resp = await ingestDir();
+      setResults(resp.ingested);
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      setUploading(false);
     }
   }
-
-  const tabs: { key: Tab; label: string }[] = [
-    { key: "file", label: "上传文件" },
-    { key: "text", label: "文本内容" },
-    { key: "url", label: "URL 网页" },
-  ];
 
   return (
-    <div className="p-8 max-w-3xl">
-      <PageHeader title="文档入库" subtitle="上传文件 / 粘贴文本 / 抓取 URL，解析后结构感知分块入库" />
+    <div className="space-y-5">
+      <PageHeader
+        title="文档入库"
+        desc="三种接入方式：拖拽上传文件、直接粘贴文本、扫描服务端文档目录。同名文档重新入库自动版本 +1。"
+      />
 
-      <div className="flex gap-1 mb-4 border-b border-slate-200">
-        {tabs.map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-              tab === t.key
-                ? "border-brand-600 text-brand-700"
-                : "border-transparent text-slate-500 hover:text-slate-700"
-            }`}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
+      {error && <ErrorBanner message={error} />}
 
-      <Card className="p-5">
-        {tab === "file" && (
-          <div>
-            <label className="block">
-              <div className="border-2 border-dashed border-slate-300 rounded-lg p-8 text-center cursor-pointer hover:border-brand-400 transition-colors">
-                <input
-                  type="file"
-                  className="hidden"
-                  accept=".md,.txt,.pdf"
-                  onChange={(e) => {
-                    const f = e.target.files?.[0];
-                    if (f) submitFile(f);
-                  }}
-                />
-                {fileName ? (
-                  <div className="text-sm text-slate-700">
-                    <Badge color="blue">{fileName}</Badge>
-                  </div>
-                ) : (
-                  <div className="text-sm text-slate-500">
-                    点击或拖拽文件到此处上传
-                    <div className="text-xs text-slate-400 mt-1">支持 .md / .txt / .pdf</div>
-                  </div>
-                )}
-              </div>
-            </label>
-          </div>
-        )}
-
-        {tab === "text" && (
-          <div className="space-y-3">
-            <div>
-              <label className="block text-sm text-slate-600 mb-1">来源标识</label>
-              <input
-                value={source}
-                onChange={(e) => setSource(e.target.value)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:border-brand-500"
-                placeholder="text"
-              />
-            </div>
-            <div>
-              <label className="block text-sm text-slate-600 mb-1">文本内容</label>
-              <textarea
-                value={text}
-                onChange={(e) => setText(e.target.value)}
-                rows={10}
-                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm font-mono focus:outline-none focus:border-brand-500 resize-y"
-                placeholder="粘贴文本内容..."
-              />
-            </div>
-            <Button onClick={submitText} disabled={loading || !text.trim()}>
-              {loading ? <Spinner /> : "入库"}
-            </Button>
-          </div>
-        )}
-
-        {tab === "url" && (
-          <div className="space-y-3">
-            <div>
-              <label className="block text-sm text-slate-600 mb-1">URL 地址</label>
-              <input
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                className="w-full px-3 py-2 border border-slate-300 rounded-md text-sm focus:outline-none focus:border-brand-500"
-                placeholder="https://example.com/article"
-              />
-            </div>
-            <Button onClick={submitUrl} disabled={loading || !url.trim()}>
-              {loading ? <Spinner /> : "抓取并入库"}
-            </Button>
-          </div>
-        )}
+      {/* 文件上传 */}
+      <Card title="上传文件">
+        <div
+          className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed py-10 transition ${
+            dragOver ? "border-indigo-400 bg-indigo-50/60" : "border-slate-300 hover:border-indigo-300 hover:bg-slate-50"
+          }`}
+          onClick={() => fileInput.current?.click()}
+          onDragOver={(e) => {
+            e.preventDefault();
+            setDragOver(true);
+          }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            handleFiles(e.dataTransfer.files);
+          }}
+        >
+          <p className="text-sm text-slate-500">点击选择或拖拽文件到此处</p>
+          <p className="mt-1 font-mono text-[11px] text-slate-400">.txt / .md / .pdf / .docx</p>
+          <input
+            ref={fileInput}
+            type="file"
+            multiple
+            accept=".txt,.md,.pdf,.docx"
+            className="hidden"
+            onChange={(e) => handleFiles(e.target.files)}
+          />
+        </div>
+        <div className="mt-3 text-right">
+          <Button variant="primary" loading={uploading} onClick={handleIngestDir}>
+            扫描服务端目录入库（src/dot/rag/docs）
+          </Button>
+        </div>
       </Card>
 
-      {loading && (
-        <div className="mt-4 flex items-center gap-2 text-sm text-slate-500">
-          <Spinner /> 处理中...
+      {/* 粘贴文本 */}
+      <Card title="粘贴文本">
+        <input
+          value={filename}
+          onChange={(e) => setFilename(e.target.value)}
+          placeholder="文档名（如 产品手册.md）"
+          className="mb-2 w-full rounded-md border border-slate-300 px-3 py-1.5 text-sm focus:border-blue-500 focus:outline-none"
+        />
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="粘贴要入库的文本内容…"
+          rows={6}
+          className="w-full resize-y rounded-md border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
+        />
+        <div className="mt-2 text-right">
+          <Button variant="primary" disabled={!text.trim()} onClick={handlePasteText}>
+            入库
+          </Button>
         </div>
-      )}
+      </Card>
 
-      {error && <div className="mt-4"><ErrorBanner message={error} /></div>}
-
-      {result && (
-        <Card className="mt-4 p-5">
-          {result.ok ? (
-            <div className="space-y-2">
-              <div className="flex items-center gap-2">
-                <Badge color="green">成功</Badge>
-                <span className="text-sm text-slate-700">入库完成</span>
+      {/* 结果 */}
+      {(results.length > 0 || errors.length > 0) && (
+        <Card title="入库结果">
+          <div className="space-y-2">
+            {results.map((r) => (
+              <div key={r.id} className="flex items-center gap-2 text-sm">
+                <Badge tone="green">v{r.version}</Badge>
+                <span className="font-medium text-slate-700">{r.filename}</span>
+                <span className="text-slate-400">{r.chunk_count} 个 chunk</span>
               </div>
-              <div className="grid grid-cols-2 gap-3 text-sm">
-                <div>
-                  <span className="text-slate-400">doc_id:</span>
-                  <code className="ml-2 text-slate-700">{result.doc_id}</code>
-                </div>
-                <div>
-                  <span className="text-slate-400">chunks:</span>
-                  <span className="ml-2 font-medium text-brand-700">{result.chunks}</span>
-                </div>
-                {result.source && (
-                  <div>
-                    <span className="text-slate-400">source:</span>
-                    <span className="ml-2 text-slate-700">{result.source}</span>
-                  </div>
-                )}
+            ))}
+            {errors.map((e, i) => (
+              <div key={i} className="text-sm text-red-600">
+                {e.filename}: {e.error}
               </div>
-              <div className="flex gap-3 pt-2 text-sm">
-                <Link to="/split" className="text-brand-600 hover:underline">去切片预览 →</Link>
-                <Link to="/query" className="text-brand-600 hover:underline">去问答 →</Link>
-              </div>
-            </div>
-          ) : (
-            <ErrorBanner message={result.error || "入库失败"} />
-          )}
+            ))}
+          </div>
         </Card>
       )}
     </div>

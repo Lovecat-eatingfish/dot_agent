@@ -45,19 +45,10 @@ async def execute_tool_safely(
     if signal is not None and signal.is_cancelled():
         return _error_result("Operation aborted"), True
 
-    # 2. 参数准备
-    try:
-        if tool.prepare_arguments is not None:
-            args = tool.prepare_arguments(arguments)
-        else:
-            args = arguments
-    except Exception as exc:
-        return _error_result(f"Invalid arguments: {type(exc).__name__}: {exc}"), True
-
-    # 3. 超时 + 执行
+    # 2. 超时 + 执行（prepare_arguments 已统一在 tool.execute 内应用）
     try:
         result = await asyncio.wait_for(
-            tool.execute(tool_call_id, args, signal, on_update),
+            tool.execute(tool_call_id, arguments, signal, on_update),
             timeout=timeout,
         )
         return result, False

@@ -35,6 +35,7 @@ async def run_with_interaction(
         return value
 
     async for event in graph.run(ctx):
+        # 判断是不是 打断事件
         if isinstance(event, WorkflowInterruptEvent):
             resolution = asyncio.create_task(resolve(event))
             try:

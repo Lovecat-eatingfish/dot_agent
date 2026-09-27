@@ -16,6 +16,7 @@ call_tool 失败自动重连一次；close() 释放。
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
@@ -118,16 +119,35 @@ class MCPClient:
         return self._session is not None
 
     async def connect(self) -> None:
-        """建立会话并 initialize（重复调用先关闭旧连接）"""
+        """建立会话并 initialize（重复调用先关闭旧连接）
+
+        建连放在独立 task 中执行：mcp/anyio 建连失败会以 CancelledError
+        冒泡（来自内部 cancel scope），若发生在当前 task 会连带取消所在
+        的 anyio scope，把调用方（agent 主循环/workflow）一起带崩；
+        隔离到子 task 后，取消只终止建连本身。
+        """
         from mcp import ClientSession
 
         await self.close()
         self._http_gen = None
         self._sse_gen = None
-        self._stack = contextlib.AsyncExitStack()
-        streams = await self._open_streams()
-        self._session = await self._stack.enter_async_context(ClientSession(*streams))
-        await self._session.initialize()
+
+        async def _open() -> None:
+            self._stack = contextlib.AsyncExitStack()
+            try:
+                streams = await self._open_streams()
+                self._session = await self._stack.enter_async_context(ClientSession(*streams))
+                await self._session.initialize()
+            except BaseException:
+                # 半开连接在建连 task 自己的 scope 内清理，取消不外泄
+                await self.close()
+                raise
+
+        try:
+            # await 一个以取消收场的子 task 不会把取消传播到当前任务
+            await asyncio.create_task(_open())
+        except asyncio.CancelledError as exc:
+            raise RuntimeError(f"MCP session initialize failed: {self.url}") from exc
         logger.info("[mcp] Connected: %s (%s, transport=%s)", self.name, self.url, self.transport)
 
     async def _open_streams(self) -> tuple[Any, Any]:

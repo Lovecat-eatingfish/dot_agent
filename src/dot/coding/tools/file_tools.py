@@ -115,6 +115,8 @@ def create_read_tool(state: dict) -> AgentTool:
             "required": ["file_path"],
         },
         execute_fn=_read_file,
+        # 工具运行时状态（workspace/权限）由 host 闭包注入，LLM 传入的同名参数会被覆盖
+        prepare_arguments=lambda args: {**args, "_state": state},
     )
 
 
@@ -178,6 +180,7 @@ def create_write_tool(state: dict) -> AgentTool:
             "required": ["file_path", "content"],
         },
         execute_fn=_write_file,
+        prepare_arguments=lambda args: {**args, "_state": state},
     )
 
 
@@ -252,4 +255,5 @@ def create_edit_tool(state: dict) -> AgentTool:
             "required": ["file_path", "old_text", "new_text"],
         },
         execute_fn=_edit_file,
+        prepare_arguments=lambda args: {**args, "_state": state},
     )

@@ -48,6 +48,7 @@ from dot.workflow import (
 
 from .adapter import TuiEventAdapter
 from .autocomplete import build_completion_state, render_completions
+from .banner import build_banner
 from .state import TuiState
 from .widgets import QueueStatus, StatusBar, TranscriptView
 
@@ -120,7 +121,7 @@ class PermissionModal(ModalScreen[bool]):
     ]
 
     DEFAULT_CSS = """
-    PermissionDialog { width: 60; height: auto; border: thick $warning;
+    PermissionDialog { width: 64; height: auto; border: round $warning;
                        background: $panel; padding: 1 2; }
     """
 
@@ -160,7 +161,7 @@ class WorkflowInterventionModal(ModalScreen[bool]):
     ]
 
     DEFAULT_CSS = """
-    WorkflowInterventionDialog { width: 72; height: auto; border: thick $warning;
+    WorkflowInterventionDialog { width: 72; height: auto; border: round $warning;
                                  background: $panel; padding: 1 2; }
     """
 
@@ -200,12 +201,13 @@ class DotTUIApp(App[None]):
     CSS = """
     #main { height: 100%; }
     #transcript { height: 1fr; }
-    #input-area { height: auto; max-height: 12; border-top: solid $primary; padding: 0 1; }
+    #input-area { height: auto; max-height: 14; margin: 0 1 0 1; padding: 0 1;
+                  border: round #31418f; }
     #autocomplete { height: auto; max-height: 10; display: none;
                     background: $panel; margin: 0 1; }
     #autocomplete.visible { display: block; }
     #prompt { height: auto; max-height: 8; border: none; background: transparent; }
-    #prompt.running { border-left: thick $warning; }
+    #prompt.running { border-left: thick #f1662a; }
     """
 
     BINDINGS = [
@@ -216,13 +218,20 @@ class DotTUIApp(App[None]):
         Binding("escape", "cancel_agent", "Cancel"),
     ]
 
-    def __init__(self, host: CodingHost, *, system: str = "") -> None:
+    def __init__(
+        self,
+        host: CodingHost,
+        *,
+        system: str = "",
+        banner_notes: list[str] | None = None,
+    ) -> None:
         super().__init__()
         self.host = host
         self.commands = get_command_registry()
         self.commands.set_host(host)
         self.state = TuiState()
         self.adapter = TuiEventAdapter(self.state)
+        self._banner_notes = list(banner_notes or [])
         self._harness = host.create_harness(
             system=system or "You are a helpful coding assistant.",
         )
@@ -257,9 +266,11 @@ class DotTUIApp(App[None]):
             yield StatusBar()
         yield Footer()
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         self.query_one("#prompt", PromptInput).focus()
         self.set_interval(0.15, self._tick_status)
+        # 启动头图：logo 像素画 + 欢迎信息，置于会话记录最顶部（随内容上滚）
+        await self.query_one(TranscriptView).add_banner(build_banner(self._banner_notes))
         self._refresh_status()
         self.run_worker(self._startup_mcp(), exclusive=False)
 
@@ -630,11 +641,16 @@ class DotTUI:
         self.workspace = workspace or Path.cwd()
         self.mode = mode
         self.host = CodingHost(workspace=self.workspace, mode=self.mode)
+        self.banner_notes: list[str] = []
         if session_id:
             if not self.host.resume_session(session_id):
-                print(f"session not found: {session_id}, starting new session")
+                self.banner_notes.append(
+                    f"session not found: {session_id}, starting new session"
+                )
             else:
-                print(f"resumed {session_id} ({len(self.host.session.messages)} messages)")
+                self.banner_notes.append(
+                    f"resumed {session_id} ({len(self.host.session.messages)} messages)"
+                )
 
     def run(self) -> None:
-        DotTUIApp(self.host).run()
+        DotTUIApp(self.host, banner_notes=self.banner_notes).run()

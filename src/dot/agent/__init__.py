@@ -17,6 +17,7 @@ from .tools import AgentTool, AgentToolResult
 from .events import AgentEvent, ContextCompactedEvent
 from .harness import AgentHarness, AgentHarnessConfig, QueuedMessages
 from .loop import run_agent_loop
+from .loop_detector import ToolCallTracker, ToolLoopViolation
 from .types import TokenUsage
 from .cancel import ProviderCancellationToken, ToolCancellationToken
 from .compaction import CompactionGate, CompactionResult
@@ -37,6 +38,9 @@ __all__ = [
     "QueuedMessages",
     # loop
     "run_agent_loop",
+    # loop detector
+    "ToolCallTracker",
+    "ToolLoopViolation",
     # types
     "TokenUsage",
     # compaction contract

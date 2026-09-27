@@ -33,6 +33,7 @@ from dot.ai.types import (
 from .cancel import SimpleCancellationToken
 
 from .compaction import CompactionGate
+from .loop_detector import ToolCallTracker, ToolLoopViolation
 from .events import (
     AgentEndEvent,
     AgentEvent,
@@ -57,6 +58,7 @@ AfterToolCall = Callable[
     [ToolCall, AgentToolResult, bool],
     Awaitable[tuple[AgentToolResult, bool]],
 ]
+OnLoopDetected = Callable[[ToolLoopViolation], Awaitable[None]]
 
 
 async def run_agent_loop(
@@ -78,6 +80,8 @@ async def run_agent_loop(
     permission: PermissionGate | None = None,
     compaction: CompactionGate | None = None,
     agent_mode: str = "auto",
+    loop_detector: ToolCallTracker | None = None,
+    on_loop_detected: OnLoopDetected | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """运行 Provider/Tool 循环，发射 Agent 事件
 
@@ -99,6 +103,8 @@ async def run_agent_loop(
         permission: 权限管理器（None 表示跳过权限检查）
         compaction: 上下文压缩钩子（None 表示不自动压缩；在 turn 边界检查）
         agent_mode: 当前 agent 模式字符串（plan / edit / auto）
+        loop_detector: 工具循环检测器（None 表示不检测）
+        on_loop_detected: 检测到循环时的回调（在注入提示前调用）
 
     Yields:
         AgentEvent: Agent 生命周期事件
@@ -186,8 +192,23 @@ async def run_agent_loop(
             async for event in _run_tool_calls(
                 calls, tool_by_name, signal, before_tool_call, after_tool_call,
                 permission, agent_mode, messages, new_messages, tool_results,
+                loop_tracker=loop_detector,
             ):
                 yield event
+
+            # 检查工具循环
+            if loop_detector is not None:
+                violation = loop_detector.check_violation()
+                if violation:
+                    logger.warning("[agent-loop] Tool loop detected: %s", violation.description)
+                    if on_loop_detected is not None:
+                        await on_loop_detected(violation)
+                    # 注入提示消息
+                    hint = _create_loop_hint(violation)
+                    messages.append(hint)
+                    new_messages.append(hint)
+                    yield MessageStartEvent(message=hint)
+                    yield MessageEndEvent(message=hint)
 
             yield TurnEndEvent(message=assistant, tool_results=tool_results)
 
@@ -244,9 +265,14 @@ async def _run_tool_calls(
     messages: list[AgentMessage],
     new_messages: list[AgentMessage],
     tool_results: list[ToolResultMessage],
+    loop_tracker: ToolCallTracker | None = None,
 ) -> AsyncIterator[AgentEvent]:
     """顺序执行本轮工具调用，透传事件并把 tool result 消息写入历史"""
     for call in calls:
+        # 记录工具调用
+        if loop_tracker is not None:
+            loop_tracker.record(call.name, dict(call.arguments))
+
         async for event in _execute_tool_call(
             call,
             tool_by_name,
@@ -480,4 +506,27 @@ def _error_message(model: str, message: str) -> AssistantMessage:
         content=[],
         stop_reason="error",
         error_message=message,
+    )
+
+
+def _create_loop_hint(violation: ToolLoopViolation) -> ToolResultMessage:
+    """创建工具循环提示消息"""
+    hint_text = f"""⚠️ 检测到工具调用循环：
+
+{violation.description}
+
+建议：
+1. 尝试不同的方法或参数
+2. 如果任务无法完成，直接告知用户原因
+3. 避免重复相同的失败操作
+4. 考虑是否需要用户提供更多信息
+
+{violation.suggestion}"""
+
+    return ToolResultMessage(
+        tool_call_id="system_loop_hint",
+        tool_name="system",
+        content=[TextContent(text=hint_text)],
+        details={"violation_type": violation.violation_type, "tool_name": violation.tool_name},
+        is_error=False,
     )

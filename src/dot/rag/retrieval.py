@@ -10,10 +10,25 @@ dot.rag.retrieval — 检索管道（M1）
 所有开关默认值见 config；关闭全部开关时退化为纯向量检索（原行为）。
 
 BM25 语料来自 Chroma 中当前全部子块，入库/删除后由 pipeline 调 invalidate() 重建。
+
+
+查询文本
+    ↓
+┌─────────────────────────────────────────┐
+│  1. 向量召回 (Vector Search)             │  ← 语义相似度
+│  2. BM25 召回 (中文 jieba 分词)         │  ← 关键词匹配
+│  3. RRF 融合 ( Reciprocal Rank Fusion ) │  ← 排名融合
+│  4. 重排序 (CrossEncoder / LLM)          │  ← 精排
+│  5. 压缩过滤 (Embedding 余弦相似度)       │  ← 去噪
+└─────────────────────────────────────────┘
+    ↓
+子块命中列表
+
 """
 from __future__ import annotations
 
 import time
+import warnings
 from typing import Any
 
 from dot.ai.events import TextDeltaEvent
@@ -116,9 +131,13 @@ class HybridRetriever:
         candidates: dict[str, tuple[Document, float]] = {}  # key -> (doc, best_score)
 
         # ---- 向量召回 ----
+        # chroma 的相关性分数可能越界（如负分），这里静默该告警并统一 clamp 到 [0,1]，
+        # 下游 weighted 融合假设向量分数已归一
         t = time.perf_counter()
         vs = get_vectorstore(settings=s)
-        vec_hits = vs.similarity_search_with_relevance_scores(question, k=fetch_k)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message="Relevance scores must be between 0 and 1")
+            vec_hits = vs.similarity_search_with_relevance_scores(question, k=fetch_k)
         spans.append(TraceStep(
             stage="vector_search", start_ms=(t - t0) * 1000,
             cost_ms=(time.perf_counter() - t) * 1000, detail={"hits": len(vec_hits), "k": fetch_k},
@@ -126,7 +145,7 @@ class HybridRetriever:
         for doc, score in vec_hits:
             meta = doc.metadata
             key = _chunk_key(str(meta.get("doc_id", "")), meta, doc.page_content)
-            candidates[key] = (doc, float(score))
+            candidates[key] = (doc, min(1.0, max(0.0, float(score))))
 
         # ---- BM25 召回 + 融合 ----
         if s.hybrid_enabled and s.bm25_enabled:

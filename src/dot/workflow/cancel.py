@@ -17,7 +17,7 @@ class WorkflowCancellationToken(Protocol):
         ...
 
 
-class SimpleWorkflowCancellationToken:
+class SimpleWorkflowCancellationToken(WorkflowCancellationToken):
     """简单的可写取消令牌（调用方持有，通过 WorkflowContext 暴露只读视图）"""
 
     def __init__(self) -> None:

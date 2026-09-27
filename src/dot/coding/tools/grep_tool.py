@@ -106,4 +106,5 @@ def create_grep_tool(state: dict) -> AgentTool:
             "required": ["pattern"],
         },
         execute_fn=_grep,
+        prepare_arguments=lambda args: {**args, "_state": state},
     )

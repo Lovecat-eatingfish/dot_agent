@@ -65,4 +65,5 @@ def create_glob_tool(state: dict) -> AgentTool:
             "required": ["pattern"],
         },
         execute_fn=_glob_search,
+        prepare_arguments=lambda args: {**args, "_state": state},
     )

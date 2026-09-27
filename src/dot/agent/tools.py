@@ -105,4 +105,8 @@ class AgentTool:
         signal: object | None = None,
         on_update: ToolUpdateCallback | None = None,
     ) -> AgentToolResult:
+        # prepare_arguments 统一在唯一执行入口应用（所有调用方都经过这里），
+        # 返回值覆盖 LLM 原始参数，宿主可借此注入运行时状态
+        if self.prepare_arguments is not None:
+            arguments = self.prepare_arguments(arguments)
         return await self.execute_fn(tool_call_id, arguments, signal, on_update)

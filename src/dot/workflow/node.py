@@ -21,6 +21,7 @@ from typing import Any, Protocol
 
 from .context import WorkflowContext
 
+
 class WorkflowNode(Protocol):
     """workflow 节点协议（结构化，零继承）"""
 
@@ -32,7 +33,7 @@ class WorkflowNode(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
-class FunctionNode:
+class FunctionNode(WorkflowNode):
     """普通工作流节点：执行 fn(ctx)，返回值写入 ctx.results[name]"""
     name: str
     fn: Callable[[WorkflowContext], Any]
@@ -62,6 +63,10 @@ class ParallelNode:
     分支应为纯函数（不产事件、不做人工等待）；任一分支抛异常时
     取消其余分支并把异常交给引擎（按节点策略重试/补偿）。
     聚合结果 {分支名: 返回值} 写入 ctx.results[name]。
+
+    注意：不可继承 ParallelBranch——dataclass 基类字段（name, fn）会
+    排在子类字段之前，导致 branches 不再是第二个位置参数，且并行节点
+    本身没有 fn。
     """
     name: str
     branches: tuple[ParallelBranch, ...]

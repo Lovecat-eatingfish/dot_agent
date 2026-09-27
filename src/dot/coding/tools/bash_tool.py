@@ -107,4 +107,6 @@ def create_bash_tool(state: dict) -> AgentTool:
             "required": ["command"],
         },
         execute_fn=_run_bash,
+        # 工具运行时状态（workspace/权限）由 host 闭包注入，LLM 传入的同名参数会被覆盖
+        prepare_arguments=lambda args: {**args, "_state": state},
     )

@@ -57,7 +57,8 @@ class CodingHost:
             extra_extension_dirs: list[Path] | None = None,
             auto_compact: bool = True,
     ) -> None:
-        self.workspace = workspace or Path.cwd()
+        # resolve 成绝对路径：相对 workspace 会让 git 快照 / 工具路径拼接产生歧义
+        self.workspace = (workspace or Path.cwd()).resolve()
         self.mode = mode
         self.auto_compact = auto_compact
 

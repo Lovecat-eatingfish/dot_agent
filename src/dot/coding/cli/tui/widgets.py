@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import time
 
+from rich.markup import escape
 from textual.containers import VerticalScroll
 from textual.widgets import Markdown, Static
 
 from .state import ChatItem, TuiState, format_tool_call_block
+
+ACCENT = "#f1662a"  # dot agent 主色（logo 橙）
 
 
 class TranscriptView(VerticalScroll):
@@ -21,7 +24,8 @@ class TranscriptView(VerticalScroll):
 
     DEFAULT_CSS = """
     TranscriptView { padding: 0 1; }
-    TranscriptView .msg-user { color: $accent; margin: 1 0 0 0; }
+    TranscriptView .msg-banner { margin: 0 0 1 0; }
+    TranscriptView .msg-user { color: $text; margin: 1 0 0 0; }
     TranscriptView .msg-assistant { margin: 0 0 1 0; }
     TranscriptView .msg-thinking { color: $text-muted; text-style: italic; margin: 0 0 1 2; }
     TranscriptView .tool-line { color: $warning; margin: 0 0 0 2; }
@@ -82,16 +86,22 @@ class TranscriptView(VerticalScroll):
     # 各类消息行
     # ============================================================
 
+    async def add_banner(self, markup: str) -> None:
+        """启动横幅（logo 像素画），挂在会话记录最顶部"""
+        await self.append(Static(markup, classes="msg-banner"))
+
     async def add_user(self, text: str) -> None:
         await self.finish_streaming()
-        await self.append(Static(f"❯ {text}", classes="msg-user"))
+        await self.append(
+            Static(f"[bold {ACCENT}]❯[/bold {ACCENT}] {escape(text)}", classes="msg-user")
+        )
 
     async def add_thinking(self, text: str) -> None:
         preview = text if len(text) <= 300 else text[:300] + "…"
-        await self.append(Static(f"· thinking: {preview}", classes="msg-thinking"))
+        await self.append(Static(f"· thinking: {escape(preview)}", classes="msg-thinking"))
 
     async def add_error(self, text: str) -> None:
-        await self.append(Static(f"✗ {text}", classes="msg-error"))
+        await self.append(Static(f"✗ {escape(text)}", classes="msg-error"))
 
     async def add_status(self, text: str) -> None:
         await self.append(Static(text, classes="msg-status"))
@@ -139,11 +149,11 @@ class ToolLine(Static):
     def _rerender(self) -> None:
         item = self.item
         invocation = item.text or format_tool_call_block_from_item(item)
-        lines = [f"→ {invocation}"]
+        lines = [f"[dim]│[/dim] [bold {ACCENT}]{escape(invocation)}[/bold {ACCENT}]"]
         if item.tool_result_text is not None:
-            lines.append(item.tool_result_text)
+            lines.append(escape(item.tool_result_text))
         elif item.update_text:
-            lines.append(f"  … {item.update_text[:120]}")
+            lines.append(f"  [dim]… {escape(item.update_text[:120])}[/dim]")
         self.update("\n".join(lines))
 
 
@@ -166,10 +176,18 @@ class StatusBar(Static):
     """
 
     def render_state(self, state: TuiState, *, mode_label: str, workspace, session_id: str) -> None:
-        spinner = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10] if state.running else "✓"
-        status = f"{spinner} running" if state.running else "idle"
+        if state.running:
+            frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+            spinner = f"[bold {ACCENT}]{frames[int(time.monotonic() * 10) % 10]}[/bold {ACCENT}]"
+            status = f"{spinner} running"
+        else:
+            status = "[dim]✓ idle[/dim]"
+        separator = "[dim]│[/dim]"
         self.update(
-            f" {mode_label} │ {workspace} │ session {session_id} │ {status} │ /help for commands"
+            f" [bold {ACCENT}]{escape(mode_label)}[/bold {ACCENT}] {separator} "
+            f"{escape(str(workspace))} {separator} "
+            f"session {escape(str(session_id))} {separator} "
+            f"{status} {separator} [dim]/help for commands[/dim]"
         )
 
 
@@ -197,4 +215,4 @@ class QueueStatus(Static):
         if len(preview) > 100:
             preview = preview[:97] + "..."
         suffix = f": {preview}" if preview else ""
-        return f"{label} {len(messages)}{suffix}"
+        return f"[dim]{label} {len(messages)}{escape(suffix)}[/dim]"

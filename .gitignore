@@ -31,3 +31,11 @@ design/
 .agents
 data/
 求职/
+evals/.run/
+evals/results/
+.venv/
+doc/
+.ruff_cache/
+deepeval/
+scripts/
+tests/

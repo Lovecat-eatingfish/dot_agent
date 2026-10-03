@@ -1,0 +1,8 @@
+# 通用 CLI agent 接入示例：复制为 evals/agents/<name>.yaml 即可被 runner 发现
+# .venv/Scripts/python.exe evals/runner.py --agents dot_agent,claude-code
+name: claude-code
+argv: ["claude", "-p", "{task}"]
+# 指定工作目录的 agent 示例：
+# argv: ["claude", "--cwd", "{workspace}", "-p", "{task}"]
+env: {}
+timeout_s: 480

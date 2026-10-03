@@ -25,6 +25,7 @@ from dot.agent.harness import AgentHarness, AgentHarnessConfig
 from dot.agent.tools import AgentTool
 from dot.ai.catalog import ProviderCatalog
 from dot.ai.providers.openai import OpenAIProvider
+from dot.ai.types import UserMessage
 from dot.workflow import WorkflowEvent
 
 from .compress.compactor import ContextCompactor
@@ -37,6 +38,7 @@ from .review import ReviewService
 from .session import Session
 from .session.manager import SessionManager
 from .trace.controller import TraceController
+from .webui.bridge import WebUIApprovalBridge
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +95,14 @@ class CodingHost:
         self._review = ReviewService(
             workspace=self.workspace,
             git_provider=lambda: self._session_manager.git,
+            store_provider=lambda: self._session_manager.review_ledger_store(),
+        )
+        self._review.notify_revert = self._notify_reverts
+        self._review.reload_session()  # 恢复会话时回灌已持久化的 pending 列表
+
+        # WebUI 环境审批桥（ASK 挂起 → HTTP 响应 → 恢复执行；见 dot.coding.webui）
+        self._webui_bridge = WebUIApprovalBridge(
+            on_accept_all=self.permission.enable_session_accept_edits,
         )
 
         # 工具列表（内置 + 扩展注册）
@@ -203,6 +213,32 @@ class CodingHost:
     def review(self) -> ReviewService:
         """文件变更评审服务（TUI/Console/命令层读取 pending、裁决 accept/revert）"""
         return self._review
+
+    @property
+    def webui_bridge(self) -> WebUIApprovalBridge:
+        """WebUI 环境审批桥（serve 时注册为 approval handler，HTTP 响应恢复执行）"""
+        return self._webui_bridge
+
+    def _notify_reverts(self, records) -> None:
+        """revert 后向 agent 注入回滚通知（UserMessage，能穿过 tool 历史自愈保留）
+
+        agent 的对话历史仍认为修改已生效；不通知会导致它基于被撤销的
+        文件状态继续工作（old_text 失配 / 基于不存在的内容修改）。
+        """
+        if self._harness is None or not records:
+            return
+        lines = [
+            "<system-reminder>文件变更评审：用户已回滚以下变更，磁盘文件已恢复到修改前状态：",
+        ]
+        for record in records:
+            if record.kind == "create":
+                lines.append(f"- #{record.id} {record.path}（新建文件，已删除）")
+            else:
+                lines.append(f"- #{record.id} {record.path}（已恢复为修改前内容）")
+        lines.append(
+            "请基于当前文件的真实内容继续工作；不要假设被回滚的修改仍然存在。</system-reminder>"
+        )
+        self._harness.append_message(UserMessage(content="\n".join(lines)))
 
     # ============================================================
     # 链路追踪（委托 TraceController）
@@ -354,8 +390,8 @@ class CodingHost:
         self._session = session
         if self._harness is not None:
             self._harness.replace_messages(session.messages)
-        # 台账/会话级评审状态归属旧会话，一并重置
-        self._review.reset_session()
+        # 台账（从新会话的持久化文件回灌）/会话级评审状态归属旧会话，一并重置
+        self._review.reload_session()
         self.permission.reset_session_state()
         return True
 

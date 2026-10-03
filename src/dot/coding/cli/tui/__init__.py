@@ -12,6 +12,7 @@ from .app import (
     DotTUIApp,
     PermissionModal,
     PromptInput,
+    ReviewPanel,
     WorkflowInterventionModal,
 )
 from .state import ChatItem, TuiState
@@ -22,6 +23,7 @@ __all__ = [
     "DotTUIApp",
     "ChangeReviewModal",
     "PermissionModal",
+    "ReviewPanel",
     "WorkflowInterventionModal",
     "PromptInput",
     "TuiState",

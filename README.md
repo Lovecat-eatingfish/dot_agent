@@ -110,6 +110,10 @@ class AgentTool:
 
 - **事前**：ASK 审批弹窗展示执行前 unified diff，接受 / 拒绝 / 本会话全部接受（`a`）；拒绝时 agent 收到明确拒绝原因可调整方案。
 - **事后**：AUTO 模式写操作直接落盘但登记进会话级变更台账（ChangeLedger）；turn 结束展示变更汇总；`/review` 随时查看/接受/回滚（undo 栈逐级回退，内存快照超限时走 SessionGit git 快照兜底）。无头环境 turn 结束自动接受并留痕。
+- **TUI 评审面板**：turn 结束有 pending 变更时弹出阻塞式面板（↑/↓ 选择 · d 看 diff · a/r 单条裁决 · A/R 全量 · Esc 跳过）。
+- **回滚通知**：revert 后向 agent 注入 `<system-reminder>` 通知，避免其基于被撤销的文件状态继续工作。
+- **台账持久化**：pending 评审列表随会话落盘（review-ledger.json + 内容快照），/resume 后恢复可评审可回滚。
+- **WebUI 审批桥**：`python -m dot.coding.webui` 启动服务端闭环（prompt → ASK 挂起 → HTTP 审批 → 恢复 → 事后评审 API）。
 - 黑名单 DENY 不可被任何评审/确认放行。
 
 ### 三级压缩

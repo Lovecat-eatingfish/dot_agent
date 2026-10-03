@@ -216,6 +216,149 @@ def test_auto_mode_revert_restores_file_content(tmp_path: Path) -> None:
 
 
 # ============================================================
+# P1-1：revert 后向 agent 注入回滚通知
+# ============================================================
+
+def test_revert_injects_rollback_notice_to_agent(tmp_path: Path) -> None:
+    """revert 后 harness 消息历史出现 UserMessage 通知，agent 下轮可知文件被回滚"""
+    host = _make_host(tmp_path, AgentMode.AUTO)
+    _script_provider(host, [[_write_call("c1", "app.py", "v2\n")], "done"])
+    (tmp_path / "app.py").write_text("v1\n", encoding="utf-8", newline="\n")
+    asyncio.run(_run_turn(host, "改成 v2"))
+    host.end_turn()
+
+    registry = get_command_registry()
+    registry.set_host(host)
+    registry.execute("/review revert 1")
+
+    from dot.ai.types import UserMessage
+
+    notice = host._harness.messages[-1]
+    assert isinstance(notice, UserMessage)
+    assert "<system-reminder>" in notice.text
+    assert "已回滚" in notice.text
+    assert "app.py" in notice.text
+    assert "已恢复为修改前内容" in notice.text
+
+
+def test_cascade_revert_sends_single_batched_notice(tmp_path: Path) -> None:
+    """同文件多次写入级联回滚：只注入一条汇总通知，列出全部被回滚记录"""
+    (tmp_path / "app.py").write_text("v1\n", encoding="utf-8", newline="\n")
+    host = _make_host(tmp_path, AgentMode.AUTO)
+    _script_provider(host, [
+        [_write_call("c1", "app.py", "v2\n")],
+        [_write_call("c2", "app.py", "v3\n")],
+        "done",
+    ])
+
+    async def _turns() -> None:
+        async for _ in host._harness.prompt("first"):
+            pass
+        host.end_turn()
+        async for _ in host._harness.prompt("second"):
+            pass
+
+    asyncio.run(_turns())
+    host.review.revert("1")  # 级联回滚 #1 #2
+
+    from dot.ai.types import UserMessage
+
+    notices = [m for m in host._harness.messages
+               if isinstance(m, UserMessage) and "已回滚" in m.text]
+    assert len(notices) == 1
+    assert "#1" in notices[0].text and "#2" in notices[0].text
+
+
+def test_revert_notice_skipped_without_harness(tmp_path: Path) -> None:
+    """无 harness（如纯 CLI 评审）时通知静默跳过"""
+    host = _make_host(tmp_path, AgentMode.AUTO)
+    host._harness = None
+    host._review.notify_revert = host._notify_reverts  # 重新绑定（host 闭包不变，直接调用）
+    service_call = ToolCall(id="c1", name="write_file",
+                            arguments={"file_path": "x.py", "content": "x\n"})
+    host.review.before_tool_call(service_call)
+    (tmp_path / "x.py").write_text("x\n", encoding="utf-8", newline="\n")
+    host.review.after_tool_call(service_call, None, False)
+    host.review.revert("1")  # 不应抛异常
+    assert not (tmp_path / "x.py").exists()
+
+
+# ============================================================
+# P1-3：TUI 阻塞式评审面板
+# ============================================================
+
+def test_tui_review_panel_blocks_turn_end_and_reverts(tmp_path: Path) -> None:
+    pytest.importorskip("textual")
+    asyncio.run(_run_tui_review_panel(tmp_path))
+
+
+async def _run_tui_review_panel(tmp_path: Path) -> None:
+    from textual.screen import ModalScreen
+
+    from dot.coding.cli.tui.app import DotTUIApp, PromptInput, ReviewPanel
+
+    reset_permission_manager()
+    host = CodingHost(workspace=tmp_path, mode=AgentMode.AUTO)
+    app = DotTUIApp(host, system="sys")
+    harness = app._harness
+    harness._config.provider = ScriptedProvider(
+        [[_write_call("c1", "auto.py", "x = 1\n")], "done"],
+    )
+
+    async with app.run_test(size=(110, 32)) as pilot:
+        prompt = app.query_one("#prompt", PromptInput)
+        prompt.text = "write it"
+        await pilot.pause()
+        await pilot.press("enter")
+
+        # turn 结束后评审面板阻塞弹出（running 保持到面板关闭）
+        for _ in range(100):
+            await pilot.pause(0.1)
+            if isinstance(app.screen, ReviewPanel):
+                break
+        assert isinstance(app.screen, ReviewPanel)
+        assert (tmp_path / "auto.py").exists()
+
+        # d 打开 diff 预览 → r 回滚选中记录
+        await pilot.press("d")
+        await pilot.pause(0.2)
+        await pilot.press("r")
+        await pilot.pause(0.2)
+
+        # 回滚生效 + 面板列表清空自动关闭
+        assert not (tmp_path / "auto.py").exists()
+        for _ in range(50):
+            await pilot.pause(0.1)
+            if not isinstance(app.screen, ReviewPanel):
+                break
+        assert not isinstance(app.screen, ReviewPanel)
+
+        # 回滚通知已注入 agent 消息历史
+        from dot.ai.types import UserMessage
+
+        notices = [m for m in harness.messages
+                   if isinstance(m, UserMessage) and "已回滚" in m.text]
+        assert len(notices) == 1
+        assert "auto.py" in notices[0].text
+
+        # Esc 跳过路径：再跑一轮产生新 pending，Esc 后 pending 保留
+        harness._config.provider = ScriptedProvider(
+            [[_write_call("c2", "second.py", "y = 2\n")], "done"],
+        )
+        prompt.text = "write again"
+        await pilot.pause()
+        await pilot.press("enter")
+        for _ in range(100):
+            await pilot.pause(0.1)
+            if isinstance(app.screen, ReviewPanel):
+                break
+        assert isinstance(app.screen, ReviewPanel)
+        await pilot.press("escape")
+        await pilot.pause(0.3)
+        assert not isinstance(app.screen, ReviewPanel)
+        assert host.review.pending_count == 1  # 跳过 → pending 保留
+
+# ============================================================
 # TUI 评审弹窗（textual pilot）
 # ============================================================
 

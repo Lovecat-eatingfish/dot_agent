@@ -22,7 +22,8 @@ from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Footer, Markdown, Static, TextArea
+from textual.widgets import Footer, Markdown, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 
 from dot.agent.events import (
     AgentEndEvent,
@@ -208,6 +209,140 @@ class ChangeReviewModal(ModalScreen[bool]):
 
 # 兼容旧名称
 PermissionModal = ChangeReviewModal
+
+
+class ReviewPanel(ModalScreen[None]):
+    """事后评审面板（turn 结束阻塞弹出）：逐条查看 diff 并裁决，Esc 跳过保持 pending"""
+
+    BINDINGS = [
+        Binding("d", "toggle_diff", "Diff"),
+        Binding("a", "accept_one", "Accept"),
+        Binding("r", "revert_one", "Revert"),
+        Binding("A", "accept_all", "Accept all"),
+        Binding("R", "revert_all", "Revert all"),
+        Binding("escape", "skip", "Skip", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    ReviewPanel { align-horizontal: center; align-vertical: middle; }
+    ReviewPanelDialog { width: 96; max-width: 95%; height: auto; max-height: 85%;
+                        border: round $accent; background: $panel; padding: 1 2; }
+    ReviewPanelDialog #review-list { height: auto; max-height: 8; margin: 1 0; }
+    ReviewPanelDialog #panel-diff { height: auto; max-height: 14; display: none;
+                                    padding: 0 1; background: $surface; }
+    ReviewPanelDialog #panel-diff.visible { display: block; }
+    """
+
+    def __init__(self, review) -> None:
+        super().__init__()
+        self._review = review  # ReviewService
+        self._diff_visible = False
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(
+            Static("", id="panel-header"),
+            OptionList(id="review-list"),
+            VerticalScroll(Static("", id="panel-diff-body"), id="panel-diff"),
+            Static(
+                "[dim]↑/↓ 选择 · d 看diff · a 接受 · r 回滚"
+                " · A 全部接受 · R 全部回滚 · Esc 跳过[/dim]",
+            ),
+            classes="ReviewPanelDialog",
+        )
+
+    def on_mount(self) -> None:
+        self._refresh()
+        self.query_one("#review-list", OptionList).focus()
+
+    # ---- 数据 ----
+
+    def _selected(self):
+        pending = self._review.ledger.pending_records()
+        index = self.query_one("#review-list", OptionList).highlighted
+        if index is None or index >= len(pending):
+            return None
+        return pending[index]
+
+    def _refresh(self) -> None:
+        pending = self._review.ledger.pending_records()
+        selected = self._selected()
+        prev_id = selected.id if selected is not None else None
+
+        self.query_one("#panel-header", Static).update(
+            f"[bold yellow]File change review[/bold yellow] — {len(pending)} pending"
+        )
+        option_list = self.query_one("#review-list", OptionList)
+        option_list.clear_options()
+        if not pending:
+            option_list.add_option(Option("(all changes resolved)", disabled=True))
+        else:
+            for record in pending:
+                turn = f"turn {record.turn_id}" if record.turn_id else "current"
+                fallback = "  [git-only]" if record.fallback_git else ""
+                option_list.add_option(Option(
+                    f"#{record.id}  {record.kind:<6} {record.path}"
+                    f"  (+{record.lines_added}/-{record.lines_removed})  {turn}{fallback}",
+                    id=str(record.id),
+                ))
+            # clear_options 会清掉高亮：恢复到之前的选中（或第一条）
+            option_list.highlighted = next(
+                (i for i, r in enumerate(pending) if r.id == prev_id), 0,
+            )
+        self._update_diff_body()
+        self.query_one("#panel-diff", VerticalScroll).set_class(
+            self._diff_visible and self._selected() is not None, "visible",
+        )
+
+    def _update_diff_body(self) -> None:
+        selected = self._selected()
+        body = self.query_one("#panel-diff-body", Static)
+        if selected is not None and selected.diff:
+            body.update(_colorize_diff(selected.diff))
+        else:
+            body.update("(no diff — select a change and it shows here)" if selected is None
+                        else "(no text diff — binary or empty change)")
+
+    def on_option_list_option_highlighted(self, event) -> None:
+        del event
+        if self._diff_visible:
+            self._update_diff_body()
+
+    # ---- 动作 ----
+
+    def action_toggle_diff(self) -> None:
+        self._diff_visible = not self._diff_visible
+        self._refresh()
+
+    def action_accept_one(self) -> None:
+        selected = self._selected()
+        if selected is None:
+            return
+        self._review.accept(str(selected.id))
+        self._refresh()
+        self._maybe_close()
+
+    def action_revert_one(self) -> None:
+        selected = self._selected()
+        if selected is None:
+            return
+        self._review.revert(str(selected.id))
+        self._refresh()
+        self._maybe_close()
+
+    def action_accept_all(self) -> None:
+        self._review.accept("all")
+        self.dismiss(None)
+
+    def action_revert_all(self) -> None:
+        self._review.revert("all")
+        self.dismiss(None)
+
+    def action_skip(self) -> None:
+        self.dismiss(None)
+
+    def _maybe_close(self) -> None:
+        if self._review.pending_count == 0:
+            self.dismiss(None)
 
 
 class WorkflowInterventionModal(ModalScreen[bool]):
@@ -475,6 +610,7 @@ class DotTUIApp(App[None]):
             summary = self.host.review.pending_summary_text()
             if summary:
                 await transcript.add_status(summary)
+            await self._maybe_review_panel(transcript)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -668,6 +804,31 @@ class DotTUIApp(App[None]):
     def _accept_session_edits(self) -> None:
         """评审弹窗 a 键：本会话剩余写操作跳过审批（黑名单仍生效）"""
         self.host.permission.enable_session_accept_edits()
+
+    async def _maybe_review_panel(self, transcript: TranscriptView) -> None:
+        """turn 结束：有 pending 变更时弹出阻塞式评审面板（Esc 跳过保持 pending）"""
+        review = self.host.review
+        if not review.turn_end_panel or review.pending_count == 0:
+            return
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[None] = loop.create_future()
+
+        def _push() -> None:
+            if not fut.done():
+                self.push_screen(
+                    ReviewPanel(review),
+                    callback=lambda _result: (None if fut.done() else fut.set_result(None)),
+                )
+
+        self.call_later(_push)
+        await fut
+        remaining = review.pending_count
+        if remaining:
+            await transcript.add_status(
+                f"· review panel closed, {remaining} pending change(s) remain (/review to inspect)"
+            )
+        else:
+            await transcript.add_status("· review panel: all changes resolved")
 
     def _make_workflow_intervention_handler(self):
         async def _intervene(event: WorkflowInterruptEvent) -> bool:

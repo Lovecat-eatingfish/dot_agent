@@ -130,8 +130,8 @@ class ChangeLedger:
         """调用被拦截/取消时丢弃快照（after 也会兜底清理）"""
         self._pending.pop(call_id, None)
 
-    def after(self, call: ToolCall, result: AgentToolResult, is_error: bool) -> None:
-        """工具执行后登记变更；执行失败或内容未变不登记"""
+    def after(self, call: ToolCall, result: AgentToolResult, is_error: bool) -> FileChangeRecord | None:
+        """工具执行后登记变更；执行失败或内容未变不登记。返回新记录（或 None）"""
         pre = self._pending.pop(call.id, None)
         if pre is None or call.name not in FILE_WRITE_TOOLS:
             return
@@ -173,6 +173,7 @@ class ChangeLedger:
         self._records.append(record)
         logger.info("[review] #%d %s %s (%+d/-%d)", record.id, record.kind, record.path,
                     record.lines_added, record.lines_removed)
+        return record
 
     # ============================================================
     # 裁决：accept / revert
@@ -207,33 +208,46 @@ class ChangeLedger:
 
     def revert(self, record_id: int) -> str:
         """回滚一条变更；同路径更晚的未回滚记录级联回滚（undo 栈语义）"""
+        return self.revert_collecting(record_id)[0]
+
+    def revert_collecting(self, record_id: int) -> tuple[str, list[FileChangeRecord]]:
+        """revert 的结构化版本：返回 (消息, 实际回滚的记录列表，含级联)"""
         record = self._find(record_id)
         if record is None:
-            return f"no such change: #{record_id}"
+            return f"no such change: #{record_id}", []
         if not record.revertible:
-            return f"#{record_id} already reverted"
+            return f"#{record_id} already reverted", []
         later = [
             r for r in self._records
             if r.path == record.path and r.id > record.id and r.revertible
         ]
+        reverted: list[FileChangeRecord] = []
         for r in reversed(later):
-            self._revert_one(r)
-        self._revert_one(record)
+            if self._revert_one(r):
+                reverted.append(r)
+        if self._revert_one(record):
+            reverted.append(record)
         cascade = f" (+{len(later)} cascaded)" if later else ""
-        return f"reverted #{record.id} {record.path}{cascade}"
+        return f"reverted #{record.id} {record.path}{cascade}", reverted
 
     def revert_all(self) -> str:
         """回滚全部未回滚记录（从晚到早）"""
+        return self.revert_all_collecting()[0]
+
+    def revert_all_collecting(self) -> tuple[str, list[FileChangeRecord]]:
+        """revert_all 的结构化版本：返回 (消息, 实际回滚的记录列表)"""
         targets = [r.id for r in self._records if r.revertible]
         if not targets:
-            return "no pending changes to revert"
+            return "no pending changes to revert", []
+        reverted: list[FileChangeRecord] = []
         for rid in reversed(targets):
             record = self._find(rid)
-            if record is not None and record.revertible:
-                self._revert_one(record)
-        return f"reverted {len(targets)} change(s)"
+            if record is not None and record.revertible and self._revert_one(record):
+                reverted.append(record)
+        return f"reverted {len(reverted)} change(s)", reverted
 
-    def _revert_one(self, record: FileChangeRecord) -> None:
+    def _revert_one(self, record: FileChangeRecord) -> bool:
+        """执行单条回滚；返回是否成功（失败保持原状态可重试）"""
         path = self._workspace / record.path
         try:
             if record.existed_before and record.before_text is not None:
@@ -246,12 +260,13 @@ class ChangeLedger:
                 self._revert_via_git(record)
         except Exception as exc:
             logger.warning("[review] revert #%s failed: %s", record.id, exc)
-            return  # 状态不变，可重试
+            return False
         record.status = STATUS_REVERTED
         if record.before_text is not None:
             self._stored_bytes = max(0, self._stored_bytes - record.snapshot_bytes)
             record.before_text = None
             record.snapshot_bytes = 0
+        return True
 
     def _revert_via_git(self, record: FileChangeRecord) -> None:
         git = self._git_provider()
@@ -290,6 +305,23 @@ class ChangeLedger:
         self._pending.clear()
         self._next_id = 1
         self._stored_bytes = 0
+        self._turn_head = ""
+        self._turn_head_captured = False
+
+    # ============================================================
+    # 持久化状态导入/导出（review.persistence 使用）
+    # ============================================================
+
+    def export_state(self) -> tuple[list[FileChangeRecord], int]:
+        """导出记录与下一个 id（供 LedgerStore.save）"""
+        return list(self._records), self._next_id
+
+    def import_state(self, records: list[FileChangeRecord], next_id: int) -> None:
+        """导入持久化记录（供 LedgerStore.load）；快照字节量按记录重算"""
+        self._records = list(records)
+        self._next_id = max(1, int(next_id))
+        self._stored_bytes = sum(r.snapshot_bytes for r in self._records)
+        self._pending.clear()
         self._turn_head = ""
         self._turn_head_captured = False
 

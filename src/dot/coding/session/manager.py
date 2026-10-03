@@ -45,6 +45,17 @@ class SessionManager:
     def git(self) -> SessionGit | None:
         return self._git
 
+    def review_ledger_store(self):
+        """当前会话的文件变更台账存储（无活跃会话返回 None）
+
+        延迟导入避免 session 层静态依赖 review 包。
+        """
+        if self._active is None:
+            return None
+        from ..review.persistence import LedgerStore
+
+        return LedgerStore(self._storage.session_dir(self._active.session_id))
+
     def get_or_create(self, session_id: str | None = None) -> Session:
         """获取或创建会话"""
         if session_id and self._storage.exists(session_id):

@@ -359,6 +359,69 @@ async def _run_tui_review_panel(tmp_path: Path) -> None:
         assert host.review.pending_count == 1  # 跳过 → pending 保留
 
 # ============================================================
+# EDIT 模式：edit_file 完整循环（接受 / 拒绝）
+# ============================================================
+
+def _edit_call(call_id: str, rel: str, old: str, new: str) -> ToolCall:
+    return ToolCall(id=call_id, name="edit_file",
+                    arguments={"file_path": rel, "old_text": old, "new_text": new})
+
+
+def test_edit_mode_edit_file_approve_applies_and_records(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8", newline="\n")
+    host = _make_host(tmp_path, AgentMode.EDIT)
+    seen: dict = {}
+    host.permission.set_approval_handler(lambda info: seen.update(info) or True)
+    _script_provider(host, [[_edit_call("c1", "app.py", "value = 1", "value = 2")], "done"])
+
+    events = asyncio.run(_run_turn(host, "改掉它"))
+    assert not [e for e in events if isinstance(e, ToolExecutionEndEvent) and e.is_error]
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 2\n"
+
+    # 审批信息是 update 预览，含 -旧 +新
+    preview = seen["preview"]
+    assert preview["kind"] == "update"
+    assert "-value = 1" in preview["diff"] and "+value = 2" in preview["diff"]
+
+    host.review.auto_resolve = False
+    host.end_turn()
+    record = host.review.ledger.pending_records()[0]
+    assert record.kind == "update"
+    assert record.before_text == "value = 1\n"
+
+    host.review.revert("1")
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_edit_mode_edit_file_reject_keeps_file(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("value = 1\n", encoding="utf-8", newline="\n")
+    host = _make_host(tmp_path, AgentMode.EDIT)
+    host.permission.set_approval_handler(lambda info: False)
+    _script_provider(host, [[_edit_call("c1", "app.py", "value = 1", "value = 2")], "done"])
+
+    events = asyncio.run(_run_turn(host, "改掉它"))
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "value = 1\n"  # 未被修改
+    tool_ends = [e for e in events if isinstance(e, ToolExecutionEndEvent)]
+    assert tool_ends[0].is_error
+    assert "user rejected the change" in tool_ends[0].result.text
+    host.end_turn()
+    assert host.review.ledger.records == ()  # 被拒调用不进台账
+
+
+def test_edit_mode_edit_ambiguous_match_rejected_via_preview(tmp_path: Path) -> None:
+    """old_text 多次命中：审批框提前暴露错误，agent 收到可读原因"""
+    (tmp_path / "app.py").write_text("dup\ndup\n", encoding="utf-8", newline="\n")
+    host = _make_host(tmp_path, AgentMode.EDIT)
+    seen: dict = {}
+    host.permission.set_approval_handler(lambda info: seen.update(info) or False)
+    _script_provider(host, [[_edit_call("c1", "app.py", "dup", "x")], "done"])
+
+    asyncio.run(_run_turn(host, "改掉它"))
+    assert "2 times" in seen["preview"]["error"]  # 预览提前暴露
+    assert (tmp_path / "app.py").read_text(encoding="utf-8") == "dup\ndup\n"
+
+
+# ============================================================
 # TUI 评审弹窗（textual pilot）
 # ============================================================
 

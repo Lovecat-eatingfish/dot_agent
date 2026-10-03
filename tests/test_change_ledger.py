@@ -165,6 +165,43 @@ def test_revert_all_rolls_back_everything(tmp_path: Path) -> None:
     assert not (tmp_path / "b.py").exists()
 
 
+def test_binary_write_recorded_without_diff_and_revert_deletes(tmp_path: Path) -> None:
+    """写入含 NUL 的内容：登记但 diff 为空（二进制无意义），新建类回滚即删除"""
+    ledger = ChangeLedger(tmp_path)
+    call = ToolCall(id="b1", name="write_file",
+                    arguments={"file_path": "blob.py", "content": "a\x00b"})
+    ledger.before(call)
+    (tmp_path / "blob.py").write_bytes(b"a\x00b")
+    ledger.after(call, AgentToolResult(), False)
+
+    record = ledger.pending_records()[0]
+    assert record.kind == "create"
+    assert record.diff == ""  # 二进制不做文本 diff
+    ledger.revert(1)
+    assert not (tmp_path / "blob.py").exists()
+
+
+def test_binary_update_existing_uses_git_fallback(tmp_path: Path) -> None:
+    """二进制旧文件被覆盖：无内存快照 → fallback_git，revert 走 SessionGit"""
+    git = SessionGit(tmp_path / ".dot" / "sessions" / "s1", tmp_path)
+    git.init()
+    (tmp_path / "blob.bin").write_bytes(b"old\x00bytes")
+    git.commit_turn(0)
+
+    ledger = ChangeLedger(tmp_path, git_provider=lambda: git)
+    call = ToolCall(id="b1", name="write_file",
+                    arguments={"file_path": "blob.bin", "content": "new"})
+    ledger.before(call)
+    (tmp_path / "blob.bin").write_bytes(b"new\x00data")
+    ledger.after(call, AgentToolResult(), False)
+
+    record = ledger.pending_records()[0]
+    assert record.fallback_git is True
+    assert record.pre_commit == git.head()
+    ledger.revert(1)
+    assert (tmp_path / "blob.bin").read_bytes() == b"old\x00bytes"
+
+
 def test_revert_unknown_id(tmp_path: Path) -> None:
     ledger = ChangeLedger(tmp_path)
     assert "no such change" in ledger.revert(99)

@@ -155,6 +155,34 @@ def test_resume_session_restores_ledger(tmp_path: Path) -> None:
     assert (tmp_path / "app.py").read_text(encoding="utf-8") == "v1\n"
 
 
+def test_two_sessions_isolated_ledgers(tmp_path: Path) -> None:
+    """同一 workspace 的两个会话台账互不串扰；切回旧会话只看到旧记录"""
+    host1 = CodingHost(workspace=tmp_path, mode=AgentMode.AUTO)
+    harness1 = host1.create_harness(system="t")
+    harness1._config.provider = ScriptedProvider(
+        [[_write_call("c1", "from-s1.py", "s1\n")], "done"],
+    )
+    _run_prompt(harness1, "s1 写文件")
+    host1.end_turn()
+    sid1 = host1.session_id
+
+    # 同 workspace 新 host → 新会话 s2 → 写另一个文件
+    host2 = CodingHost(workspace=tmp_path, mode=AgentMode.AUTO)
+    harness2 = host2.create_harness(system="t")
+    harness2._config.provider = ScriptedProvider(
+        [[_write_call("c2", "from-s2.py", "s2\n")], "done"],
+    )
+    _run_prompt(harness2, "s2 写文件")
+    host2.end_turn()
+    assert sid1 != host2.session_id
+
+    # 切回 s1：只有 s1 的记录
+    assert host2.resume_session(sid1) is True
+    records = host2.review.ledger.records
+    assert len(records) == 1
+    assert records[0].path == "from-s1.py"
+
+
 def test_resume_session_restores_pending_review(tmp_path: Path) -> None:
     """交互模式（auto_resolve=False）下 pending 列表跨进程恢复"""
     host1 = CodingHost(workspace=tmp_path, mode=AgentMode.AUTO)

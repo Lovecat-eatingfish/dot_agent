@@ -186,6 +186,66 @@ async def _full_flow(tmp_path: Path) -> None:
                    for m in host._harness.messages)
 
 
+def test_webui_reject_flow_keeps_file_and_notifies(tmp_path: Path) -> None:
+    """HTTP 拒绝：文件不落盘，agent 收到 'user rejected the change'"""
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    asyncio.run(_reject_flow(tmp_path))
+
+
+async def _reject_flow(tmp_path: Path) -> None:
+    from httpx import ASGITransport, AsyncClient
+
+    from dot.coding.host import CodingHost
+    from dot.coding.permission import reset_permission_manager
+    from dot.coding.webui.server import create_app
+
+    reset_permission_manager()
+    host = CodingHost(workspace=tmp_path, mode=AgentMode.EDIT)
+    harness = host.create_harness(system="t")
+    harness._config.provider = ScriptedProvider(
+        [[_write_call("c1", "denied.py", "x = 1\n")], "done"],
+    )
+    host.permission.set_approval_handler(host.webui_bridge.handler)
+    app = create_app(host)
+
+    async with AsyncClient(transport=ASGITransport(app=app),
+                           base_url="http://test") as client:
+        prompt_task = asyncio.ensure_future(
+            client.post("/api/agent/prompt", json={"text": "write"}),
+        )
+        for _ in range(100):
+            await asyncio.sleep(0.05)
+            response = await client.get("/api/agent/approvals")
+            requests = response.json()["requests"]
+            if requests:
+                break
+        assert len(requests) == 1
+
+        response = await client.post(
+            f"/api/agent/approvals/{requests[0]['request_id']}",
+            json={"approved": False},  # 前端点"拒绝"
+        )
+        assert response.json()["ok"] is True
+
+        result = await prompt_task
+        assert result.status_code == 200
+        assert result.json()["pending_changes"] == 0  # 被拒调用不进台账
+        assert not (tmp_path / "denied.py").exists()
+
+        # 从 harness 历史确认拒绝原因已返回给 agent
+        from dot.ai.types import ToolResultMessage
+
+        rejects = [
+            m for m in host._harness.messages
+            if isinstance(m, ToolResultMessage)
+            and "user rejected the change" in "".join(
+                block.text for block in m.content if hasattr(block, "text")
+            )
+        ]
+        assert len(rejects) == 1
+
+
 def test_webui_respond_unknown_returns_404(tmp_path: Path) -> None:
     pytest.importorskip("fastapi")
     pytest.importorskip("httpx")

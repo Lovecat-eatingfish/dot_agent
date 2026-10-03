@@ -33,6 +33,7 @@ from .extensions.builtins.mcp.manager import McpConnector
 from .extensions.runtime import ExtensionRuntime
 from .modes import AgentMode
 from .permission import get_permission_manager
+from .review import ReviewService
 from .session import Session
 from .session.manager import SessionManager
 from .trace.controller import TraceController
@@ -87,6 +88,12 @@ class CodingHost:
             workspace=self.workspace,
         )
         self._session = self._session_manager.get_or_create()
+
+        # 文件变更评审（事后台账；无头默认 turn 结束自动接受，交互 UI 启动时置 False）
+        self._review = ReviewService(
+            workspace=self.workspace,
+            git_provider=lambda: self._session_manager.git,
+        )
 
         # 工具列表（内置 + 扩展注册）
         self._builtin_tools: list[AgentTool] = []
@@ -152,7 +159,7 @@ class CodingHost:
             compaction=AutoCompactor(self._compactor) if self.auto_compact else None,
             agent_mode=self.mode.value,
         )
-        before_hook, after_hook = self.extensions.make_tool_hooks()
+        before_hook, after_hook = self._compose_tool_hooks()
         config.before_tool_call = before_hook
         config.after_tool_call = after_hook
         self._harness = AgentHarness(config, messages=self._session.messages)
@@ -161,6 +168,41 @@ class CodingHost:
         # 订阅和初始化 TraceCollector
         self._trace.attach(self._harness)
         return self._harness
+
+    # ============================================================
+    # 工具 hook 链组合：扩展 hooks × 评审台账登记
+    # ============================================================
+
+    def _compose_tool_hooks(self) -> tuple:
+        """扩展 before/after hook 与评审台账的组合链
+
+        before：台账先拍文件快照 → 扩展 hook（可拦截；拦截则丢弃快照）
+        after ：扩展 hook 先处理（可改结果）→ 台账登记（is_error=True 时自动丢弃）
+        """
+        ext_before, ext_after = self.extensions.make_tool_hooks()
+        review = self._review
+
+        async def before_tool_call(call):
+            review.before_tool_call(call)
+            blocked, reason = False, None
+            if ext_before is not None:
+                blocked, reason = await ext_before(call)
+                if blocked:
+                    review.discard_tool_state(call.id)
+            return blocked, reason
+
+        async def after_tool_call(call, result, is_error):
+            if ext_after is not None:
+                result, is_error = await ext_after(call, result, is_error)
+            review.after_tool_call(call, result, is_error)
+            return result, is_error
+
+        return before_tool_call, after_tool_call
+
+    @property
+    def review(self) -> ReviewService:
+        """文件变更评审服务（TUI/Console/命令层读取 pending、裁决 accept/revert）"""
+        return self._review
 
     # ============================================================
     # 链路追踪（委托 TraceController）
@@ -191,7 +233,7 @@ class CodingHost:
         if self._harness is not None:
             self._harness.set_tools(self._tools)
             self._harness._config.system = self._compose_system(self._base_system)
-            before_hook, after_hook = self.extensions.make_tool_hooks()
+            before_hook, after_hook = self._compose_tool_hooks()
             self._harness._config.before_tool_call = before_hook
             self._harness._config.after_tool_call = after_hook
         self._sync_extension_commands()
@@ -270,12 +312,14 @@ class CodingHost:
     def end_turn(self) -> int:
         """一轮对话结束：把 harness 消息同步进 session，增量落盘 + git 快照
 
+        台账 checkpoint：回填 turn_id；无头环境（auto_resolve）自动接受 pending。
         返回本轮 turn_id。
         """
         if self._harness is not None:
             self._session.messages = list(self._harness.messages)
         new_messages = self._session.messages[self._session._persisted_count:]
         turn_id = self._session_manager.commit_turn(new_messages)
+        self._review.checkpoint_turn(turn_id)
         return turn_id
 
     def list_turns(self) -> list[dict]:
@@ -287,6 +331,8 @@ class CodingHost:
         commit = self._session_manager.rewind(turn_id)
         if self._harness is not None:
             self._harness.replace_messages(self._session.messages)
+        # 被回滚 turn 的台账记录文件已由 git reset 还原，同步标记 reverted
+        self._review.on_rewind(turn_id)
         return {
             "turn_id": turn_id, "commit": commit,
             "messages": len(self._session.messages),
@@ -308,6 +354,9 @@ class CodingHost:
         self._session = session
         if self._harness is not None:
             self._harness.replace_messages(session.messages)
+        # 台账/会话级评审状态归属旧会话，一并重置
+        self._review.reset_session()
+        self.permission.reset_session_state()
         return True
 
     def list_sessions(self) -> list[dict]:

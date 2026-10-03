@@ -9,6 +9,10 @@ dot.coding.permission — PermissionManager 权限管控
 决策三态：ALLOW / ASK / DENY。
 ASK 审批：有 UI 时弹确认框，无 UI 时自动降级 DENY（无头兜底）。
 权限检查在 hooks 之前执行，不可被用户扩展。
+
+文件变更评审（doc/文件变更评审机制设计.md）：
+- EDIT 模式下文件写操作 ASK（带 diff 预览），对标 Claude Code 的编辑审批；
+- 会话级 accept-edits：审批框按 a 后本会话写操作直接放行（黑名单仍生效）。
 """
 from __future__ import annotations
 
@@ -111,6 +115,8 @@ class PermissionManager:
         self._project = ProjectSecurityConfig()
         self._workspace: Path | None = None
         self._approval_handler: Callable[[dict[str, Any]], bool] | None = None
+        # 会话级 accept-edits（审批框 a 键开启；切换会话时重置）
+        self._session_accept_edits = False
 
     def load_project(self, workspace: Path) -> None:
         self._workspace = Path(workspace)
@@ -118,6 +124,17 @@ class PermissionManager:
 
     def set_approval_handler(self, handler: ApprovalHandler | None) -> None:
         self._approval_handler = handler
+
+    def enable_session_accept_edits(self) -> None:
+        """本会话剩余时间内文件写操作跳过 ASK（系统/项目黑名单不受影响）"""
+        self._session_accept_edits = True
+
+    def session_accepts_edits(self) -> bool:
+        return self._session_accept_edits
+
+    def reset_session_state(self) -> None:
+        """切换/新建会话时重置会话级评审状态"""
+        self._session_accept_edits = False
 
     def check(
             self,
@@ -181,6 +198,14 @@ class PermissionManager:
         if approved:
             return PermissionDecision(Decision.ALLOW, "mode", f"approved-once ({mode.value})")
 
+        # 会话级 accept-edits：仅豁免模式层的写操作 ASK（PLAN 语义不豁免，黑名单在前面已拦）
+        if (
+            self._session_accept_edits
+            and mode is not AgentMode.PLAN
+            and tool_name in FILE_WRITE_TOOLS
+        ):
+            return PermissionDecision(Decision.ALLOW, "mode", "session accept-edits")
+
         if mode == AgentMode.PLAN:
             if tool_name == "bash":
                 return PermissionDecision(Decision.DENY, "mode", "plan mode: bash denied")
@@ -191,6 +216,8 @@ class PermissionManager:
         if mode == AgentMode.EDIT:
             if tool_name == "bash":
                 return PermissionDecision(Decision.ASK, "mode", "edit mode: bash needs approval")
+            if tool_name in FILE_WRITE_TOOLS:
+                return PermissionDecision(Decision.ASK, "mode", "edit mode: file write needs review")
             return PermissionDecision(Decision.ALLOW, "mode", "edit mode")
 
         return PermissionDecision(Decision.ALLOW, "mode", "auto mode")
@@ -203,7 +230,12 @@ class PermissionManager:
             *,
             agent_mode: str = "",
     ) -> bool | Awaitable[bool]:
-        """发起人工审批；无交互能力时自动降级 DENY"""
+        """发起人工审批；无交互能力时自动降级 DENY
+
+        文件写操作会在 info["preview"] 附带执行前的 diff 预览；
+        用户明确拒绝时在 decision 上标记覆盖文案，agent 收到
+        "user rejected the change" 而非笼统的权限拦截原因。
+        """
         info = {
             "tool_name": tool_name,
             "agent_mode": agent_mode,
@@ -211,6 +243,8 @@ class PermissionManager:
             "reason": decision.reason,
             "args": dict(args),
         }
+        if tool_name in FILE_WRITE_TOOLS:
+            info["preview"] = self._build_preview(tool_name, args)
         handler = self._approval_handler
         if handler is None:
             return False
@@ -218,11 +252,25 @@ class PermissionManager:
             result = handler(info)
             if isawaitable(result):
                 result = await result
-            return bool(result)
+            result = bool(result)
+            if not result:
+                decision.deny_override = "user rejected the change"
+            return result
         except (EOFError, KeyboardInterrupt):
             return False
         except Exception:
             return False
+
+    def _build_preview(self, tool_name: str, args: dict[str, Any]) -> dict[str, Any] | None:
+        """写操作执行前预览（失败折价为 None，不阻塞审批）"""
+        try:
+            from .review.previewer import build_preview
+
+            workspace = self._workspace or Path.cwd()
+            return build_preview(tool_name, dict(args), workspace).to_dict()
+        except Exception:
+            logger.exception("[permission] build preview failed for %s", tool_name)
+            return None
 
     @staticmethod
     def _extract_path(args: dict[str, Any]) -> str:

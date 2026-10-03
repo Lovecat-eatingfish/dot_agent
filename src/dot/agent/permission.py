@@ -30,12 +30,16 @@ class PermissionDecision:
     decision: Decision
     source: str = ""  # system | project | mode
     reason: str = ""
+    # 人工审批拒绝时的覆盖文案（coding 层 ask_user 拒绝时填写；空串 = 用默认拼接）
+    deny_override: str = ""
 
     @property
     def allowed(self) -> bool:
         return self.decision is Decision.ALLOW
 
     def deny_message(self) -> str:
+        if self.deny_override:
+            return self.deny_override
         if self.source == "system":
             return f"Blocked by system security rule: {self.reason}"
         if self.source == "project":

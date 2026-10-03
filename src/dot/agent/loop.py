@@ -8,6 +8,7 @@ steering / follow-up 双队列消息注入。
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from time import monotonic_ns
 
@@ -52,6 +53,8 @@ from .history import repair_tool_history
 from .permission import Decision, PermissionGate
 from .tools import AgentTool, AgentToolResult
 from ..ai.providers import OpenAIProvider
+
+logger = logging.getLogger(__name__)
 
 BeforeToolCall = Callable[[ToolCall], Awaitable[tuple[bool, str | None]]]
 AfterToolCall = Callable[

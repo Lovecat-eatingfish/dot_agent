@@ -175,7 +175,8 @@ class StatusBar(Static):
     StatusBar { dock: bottom; height: 1; background: $panel; color: $text-muted; padding: 0 1; }
     """
 
-    def render_state(self, state: TuiState, *, mode_label: str, workspace, session_id: str) -> None:
+    def render_state(self, state: TuiState, *, mode_label: str, workspace, session_id: str,
+                     pending_changes: int = 0) -> None:
         if state.running:
             frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
             spinner = f"[bold {ACCENT}]{frames[int(time.monotonic() * 10) % 10]}[/bold {ACCENT}]"
@@ -183,10 +184,12 @@ class StatusBar(Static):
         else:
             status = "[dim]✓ idle[/dim]"
         separator = "[dim]│[/dim]"
+        pending = f" {separator} [yellow]pending {pending_changes}[/yellow]" if pending_changes else ""
         self.update(
             f" [bold {ACCENT}]{escape(mode_label)}[/bold {ACCENT}] {separator} "
             f"{escape(str(workspace))} {separator} "
-            f"session {escape(str(session_id))} {separator} "
+            f"session {escape(str(session_id))}"
+            f"{pending} {separator} "
             f"{status} {separator} [dim]/help for commands[/dim]"
         )
 

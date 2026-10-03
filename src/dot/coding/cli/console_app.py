@@ -41,8 +41,10 @@ def run_console(
         ],
     )
 
+    # 交互 console：turn 结束不自动接受 pending 变更，等用户 /review 裁决
+    host.review.auto_resolve = False
     # 设置审批处理函数 ==> 不需要在 harness 里面绑定
-    host.permission.set_approval_handler(approval_handler)
+    host.permission.set_approval_handler(make_console_approval_handler(host))
 
     # 恢复会话
     if session_id:
@@ -166,6 +168,7 @@ async def _console_loop(harness: AgentHarness, host: CodingHost) -> None:
                 try:
                     await _run_turn(harness, result.text)
                     host.end_turn()
+                    _print_pending_changes(host)
                 except asyncio.CancelledError:
                     print("interrupted")
                 except Exception as exc:
@@ -175,6 +178,7 @@ async def _console_loop(harness: AgentHarness, host: CodingHost) -> None:
                 try:
                     await _run_workflow_turn(harness, host, result.text)
                     host.end_turn()
+                    _print_pending_changes(host)
                 except asyncio.CancelledError:
                     print("interrupted")
                 except Exception as exc:
@@ -185,11 +189,22 @@ async def _console_loop(harness: AgentHarness, host: CodingHost) -> None:
         try:
             await _run_turn(harness, user_input)
             host.end_turn()
+            _print_pending_changes(host)
         except asyncio.CancelledError:
             print("interrupted")
         except Exception as exc:
             log.error("Turn failed: %s", exc, exc_info=True)
             print(f"error: {exc}")
+
+
+def _print_pending_changes(host: CodingHost) -> None:
+    """turn 收尾：有待评审变更时打印一行汇总"""
+    try:
+        summary = host.review.pending_summary_text()
+    except Exception:
+        return
+    if summary:
+        print(summary)
 
 
 async def _run_turn(harness: AgentHarness, user_input: str) -> None:
@@ -226,8 +241,62 @@ def _execute_slash(text: str, host):
     return get_command_registry().execute(text)
 
 
+def make_console_approval_handler(host: CodingHost):
+    """console 审批 handler：展示 diff 预览，y 接受 / n 拒绝 / a 本会话全部接受"""
+
+    def handler(info: dict) -> bool:
+        preview = info.get("preview") or {}
+        log.info("permission required: %s (%s)", info.get("tool_name", ""), info.get("reason", ""))
+        header = f"  【文件变更评审】 {info.get('tool_name', '')}"
+        if preview:
+            kind = preview.get("kind", "")
+            path = preview.get("path", "")
+            if kind in ("create", "update"):
+                header += f" → {path} ({kind}, +{preview.get('lines_added', 0)}/-{preview.get('lines_removed', 0)})"
+                print(header)
+                diff = preview.get("diff", "")
+                if diff:
+                    print(indent_diff(diff))
+                else:
+                    print("  (no text diff — binary or empty change)")
+                if preview.get("truncated"):
+                    print("  … diff truncated")
+                if preview.get("error"):
+                    print(f"  preview error: {preview['error']}")
+            else:
+                # binary / preview error：显示摘要
+                print(header)
+                print(f"  file: {path}  kind: {kind}")
+                if preview.get("error"):
+                    print(f"  {preview['error']}")
+        else:
+            # 非 diff 审批（bash / plan 等场景）：展示参数摘要
+            args_text = str(info.get("args", {}))[:400]
+            print(f"  【权限审批】 {info.get('tool_name', '')} ({info.get('reason', '')})")
+            print(f"  args: {args_text}")
+        try:
+            answer = input("  approve? [y]es / [n]o / [a]ccept edits this session: ").strip().lower()
+            if answer in ("a", "all"):
+                host.permission.enable_session_accept_edits()
+                print("  · file edits will be auto-approved for this session")
+                log.info("approval: session accept-edits enabled")
+                return True
+            result = answer in ("y", "yes")
+            log.info("approval: %s", result)
+            return result
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+    return handler
+
+
+def indent_diff(diff: str, prefix: str = "  ") -> str:
+    """diff 每行加缩进（+/- 着色留给支持富文本的 UI，console 纯文本）"""
+    return "\n".join(f"{prefix}{line}" for line in diff.splitlines())
+
+
 def approval_handler(info: dict) -> bool:
-    """Simple approval handler"""
+    """兼容旧入口：无 host 的简单 Y/N 审批（不展示 diff）"""
     log.info(f"permission required: {info.get('tool_name', '')} ({info.get('reason', '')})")
     try:
         answer = input("  approve? Y/N: ").strip().lower()

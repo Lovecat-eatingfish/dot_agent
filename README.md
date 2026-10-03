@@ -96,6 +96,22 @@ class AgentTool:
 
 决策三态：ALLOW / ASK / DENY。ASK 无 UI 时自动降级 DENY。
 
+模式规则（文件写 = write_file / edit_file）：
+
+| 模式 | 文件写 | bash | 说明 |
+| --- | --- | --- | --- |
+| plan | ASK（带 diff 预览） | DENY | 纯只读规划 |
+| edit | ASK（带 diff 预览） | ASK | 对标 Claude Code 编辑审批；审批框 `a` 键可会话级免确认 |
+| auto | ALLOW | ALLOW | 自动落盘，配合事后评审 |
+
+### 文件变更评审
+
+对标 Claude Code 事前审批 + Codex auto 模式事后评审：
+
+- **事前**：ASK 审批弹窗展示执行前 unified diff，接受 / 拒绝 / 本会话全部接受（`a`）；拒绝时 agent 收到明确拒绝原因可调整方案。
+- **事后**：AUTO 模式写操作直接落盘但登记进会话级变更台账（ChangeLedger）；turn 结束展示变更汇总；`/review` 随时查看/接受/回滚（undo 栈逐级回退，内存快照超限时走 SessionGit git 快照兜底）。无头环境 turn 结束自动接受并留痕。
+- 黑名单 DENY 不可被任何评审/确认放行。
+
 ### 三级压缩
 
 | 级别 | 阈值 | 操作 | 需要 LLM |

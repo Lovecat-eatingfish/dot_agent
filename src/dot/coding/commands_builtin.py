@@ -35,6 +35,7 @@ def register_builtin_commands(registry: "CommandRegistry") -> None:
     r.register(SlashCommand("resume", "/resume <id>", "switch to a saved session", partial(_cmd_resume, r)))
     r.register(SlashCommand("trace", "/trace [on|off]", "show or toggle tracing", partial(_cmd_trace, r)))
     r.register(SlashCommand("rewind", "/rewind [n]", "rewind to turn n (messages + files)", partial(_cmd_rewind, r)))
+    r.register(SlashCommand("review", "/review [show|accept|revert] [id|all]", "inspect pending file changes", partial(_cmd_review, r)))
     r.register(SlashCommand("workflow", "/workflow <task>", "run plan → code → validate", partial(_cmd_workflow, r)))
 
 
@@ -227,6 +228,52 @@ def _cmd_rewind(registry: "CommandRegistry", args: str) -> SlashResult:
         kind="toast", level="info",
         text=f"rewound to turn {turn_id}: {result['messages']} messages kept{git_note}",
     )
+
+
+def _cmd_review(registry: "CommandRegistry", args: str) -> SlashResult:
+    """事后评审：查看/接受/回滚 agent 产生的文件变更"""
+    host = registry._host
+    if host is None or not hasattr(host, "review"):
+        return SlashResult(kind="toast", level="error", text="/review requires host context")
+    review = host.review
+
+    parts = args.strip().split(None, 1)
+    sub = parts[0].lower() if parts else ""
+    target = parts[1].strip() if len(parts) > 1 else ""
+
+    try:
+        if not sub or sub == "list":
+            return SlashResult(kind="message", text=review.list_text())
+        if sub == "show":
+            record_id = None if not target else _parse_review_id(target)
+            if target and record_id is None:
+                return SlashResult(kind="toast", level="error", text=f"invalid change id: {target}")
+            return SlashResult(kind="message", text=review.show_text(record_id))
+        if sub == "accept":
+            return SlashResult(kind="toast", level="info", text=review.accept(target))
+        if sub == "revert":
+            return SlashResult(kind="toast", level="info", text=review.revert(target))
+        if sub == "auto":
+            if target in ("on", "off"):
+                review.auto_resolve = target == "on"
+                return SlashResult(kind="toast", level="info",
+                                   text=f"turn-end auto-accept: {target}")
+            state = "on" if review.auto_resolve else "off"
+            return SlashResult(kind="message", text=f"turn-end auto-accept: {state}")
+    except Exception as exc:
+        log.exception("/review failed")
+        return SlashResult(kind="toast", level="error", text=f"/review error: {exc}")
+    return SlashResult(
+        kind="message",
+        text="usage: /review [list | show <id> | accept <id|all> | revert <id|all> | auto on|off]",
+    )
+
+
+def _parse_review_id(text: str) -> int | None:
+    try:
+        return int(text.strip().lstrip("#"))
+    except ValueError:
+        return None
 
 
 def _cmd_compact(registry: "CommandRegistry", args: str) -> SlashResult:

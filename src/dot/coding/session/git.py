@@ -91,6 +91,26 @@ class SessionGit:
         """把 workspace 恢复到指定 commit（未跟踪的新文件保留，不执行 clean）"""
         self._git("reset", "--hard", commit)
 
+    def restore_paths(self, paths: list[str], commit: str | None = None) -> None:
+        """把指定路径恢复到某 commit（默认 HEAD）的版本
+
+        用于文件变更评审的 git 兜底回滚：内存快照不可用时，
+        按记录登记时的 HEAD 恢复单个文件；commit 中不存在的路径按
+        新文件处理（删除）。路径用 workspace 相对 posix 格式。
+        """
+        target = commit or self.head()
+        for rel in paths:
+            normalized = rel.replace("\\", "/").lstrip("/")
+            if target and self._path_in_commit(target, normalized):
+                self._git("checkout", target, "--", normalized)
+            else:
+                # 目标 commit 中不存在：该路径是新文件 → 删除
+                (self._work_tree / normalized).unlink(missing_ok=True)
+
+    def _path_in_commit(self, commit: str, rel_path: str) -> bool:
+        out = self._git("ls-tree", "--name-only", commit, "--", rel_path, check=False)
+        return bool(out)
+
     def head(self) -> str:
         """当前 HEAD hash（不可用时返回空）"""
         try:

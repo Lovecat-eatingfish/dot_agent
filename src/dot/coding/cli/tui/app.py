@@ -13,10 +13,11 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.message import Message
 from textual.screen import ModalScreen
@@ -108,47 +109,105 @@ class PromptInput(TextArea):
 
 
 # ============================================================
-# 权限审批弹窗
+# 文件变更评审弹窗（权限审批 + diff 预览）
 # ============================================================
 
-class PermissionModal(ModalScreen[bool]):
-    """工具权限审批：显示工具名/来源/原因/参数，y 批准，n / Esc 拒绝"""
+_KIND_BADGE = {
+    "create": "[green]create[/green]",
+    "update": "[yellow]update[/yellow]",
+    "binary": "[magenta]binary[/magenta]",
+    "error": "[red]preview error[/red]",
+}
+
+
+def _colorize_diff(diff: str) -> str:
+    """unified diff → rich 着色标记（+绿 -红 @@青）"""
+    lines = []
+    for line in diff.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            lines.append(f"[green]{escape(line)}[/green]")
+        elif line.startswith("-") and not line.startswith("---"):
+            lines.append(f"[red]{escape(line)}[/red]")
+        elif line.startswith("@@"):
+            lines.append(f"[cyan]{escape(line)}[/cyan]")
+        else:
+            lines.append(escape(line))
+    return "\n".join(lines)
+
+
+class ChangeReviewModal(ModalScreen[bool]):
+    """文件变更评审：diff 预览，y 接受 / n·Esc 拒绝 / a 本会话全部接受"""
 
     BINDINGS = [
-        Binding("y", "approve", "Approve"),
-        Binding("n", "deny", "Deny"),
-        Binding("escape", "deny", "Deny", show=False),
+        Binding("y", "approve", "Accept"),
+        Binding("n", "deny", "Reject"),
+        Binding("a", "accept_all", "Accept edits this session"),
+        Binding("escape", "deny", "Reject", show=False),
     ]
 
     DEFAULT_CSS = """
-    PermissionDialog { width: 64; height: auto; border: round $warning;
-                       background: $panel; padding: 1 2; }
+    ChangeReviewDialog { width: 90; max-width: 95%; height: auto; max-height: 80%;
+                         border: round $warning; background: $panel; padding: 1 2; }
+    ChangeReviewDialog #review-diff { height: auto; max-height: 22; margin: 1 0;
+                                      padding: 0 1; background: $surface; }
     """
 
-    def __init__(self, info: dict[str, Any]) -> None:
+    def __init__(self, info: dict[str, Any], *, on_accept_all=None) -> None:
         super().__init__()
         self._info = info
+        self._on_accept_all = on_accept_all
 
     def compose(self) -> ComposeResult:
         info = self._info
-        args_text = str(info.get("args", {}))[:400]
-        yield Vertical(
-            Static(
-                f"[bold yellow]Permission required[/bold yellow]\n\n"
-                f"tool:   {info.get('tool_name', '')}\n"
-                f"source: {info.get('source', '')}\n"
-                f"reason: {info.get('reason', '')}\n"
-                f"args:   {args_text}\n\n"
-                f"[dim]y = approve · n / esc = deny[/dim]",
-            ),
-            classes="PermissionDialog",
+        preview = info.get("preview") or {}
+        header: list[str] = ["[bold yellow]File change review[/bold yellow]", ""]
+        header.append(
+            f"tool: {info.get('tool_name', '')}   mode: {info.get('agent_mode', '')}"
+            f"   source: {info.get('source', '')}"
         )
+        kind = preview.get("kind", "")
+        if preview:
+            stat = ""
+            if kind in ("create", "update"):
+                stat = f"   (+{preview.get('lines_added', 0)}/-{preview.get('lines_removed', 0)})"
+            header.append(f"file: {preview.get('path', '')}   {_KIND_BADGE.get(kind, '')}{stat}")
+            if preview.get("error"):
+                header.append(f"[red]error: {escape(str(preview['error']))}[/red]")
+            if preview.get("truncated"):
+                header.append("[dim]… diff truncated, full diff in tool result[/dim]")
+        else:
+            args_text = str(info.get("args", {}))[:400]
+            header.append(f"args: {escape(args_text)}")
+
+        body = ""
+        if preview and preview.get("diff"):
+            body = _colorize_diff(preview["diff"])
+
+        children: list[Widget] = [Static("\n".join(header))]
+        if body:
+            children.append(VerticalScroll(Static(body), id="review-diff"))
+        children.append(Static(
+            "[dim]y = accept · n / esc = reject · a = accept edits this session[/dim]",
+        ))
+        yield Vertical(*children, classes="ChangeReviewDialog")
 
     def action_approve(self) -> None:
         self.dismiss(True)
 
     def action_deny(self) -> None:
         self.dismiss(False)
+
+    def action_accept_all(self) -> None:
+        if self._on_accept_all is not None:
+            try:
+                self._on_accept_all()
+            except Exception:
+                pass
+        self.dismiss(True)
+
+
+# 兼容旧名称
+PermissionModal = ChangeReviewModal
 
 
 class WorkflowInterventionModal(ModalScreen[bool]):
@@ -227,6 +286,8 @@ class DotTUIApp(App[None]):
     ) -> None:
         super().__init__()
         self.host = host
+        # 交互 TUI：turn 结束不自动接受 pending 变更，等用户评审（/review 或汇总面板）
+        host.review.auto_resolve = False
         self.commands = get_command_registry()
         self.commands.set_host(host)
         self.state = TuiState()
@@ -411,6 +472,9 @@ class DotTUIApp(App[None]):
                 self._refresh_status()
                 await self._apply_event_to_transcript(event)
             self.host.end_turn()
+            summary = self.host.review.pending_summary_text()
+            if summary:
+                await transcript.add_status(summary)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -508,6 +572,7 @@ class DotTUIApp(App[None]):
             mode_label=self.host.mode.label,
             workspace=self.host.workspace,
             session_id=self.host.session_id,
+            pending_changes=self.host.review.pending_count,
         )
 
     async def _render_slash_result(self, result) -> None:
@@ -589,7 +654,7 @@ class DotTUIApp(App[None]):
                 if fut.done():
                     return
                 self.push_screen(
-                    PermissionModal(info),
+                    ChangeReviewModal(info, on_accept_all=self._accept_session_edits),
                     callback=lambda approved: (
                         None if fut.done() else fut.set_result(bool(approved))
                     ),
@@ -599,6 +664,10 @@ class DotTUIApp(App[None]):
             return await fut
 
         return _approve
+
+    def _accept_session_edits(self) -> None:
+        """评审弹窗 a 键：本会话剩余写操作跳过审批（黑名单仍生效）"""
+        self.host.permission.enable_session_accept_edits()
 
     def _make_workflow_intervention_handler(self):
         async def _intervene(event: WorkflowInterruptEvent) -> bool:

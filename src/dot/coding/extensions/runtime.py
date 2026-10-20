@@ -144,6 +144,7 @@ class ExtensionRuntime:
 
     def load(self) -> int:
         """扫描并加载所有扩展，返回成功加载数"""
+        # 去指定模块 加载 py 模块
         self._loader.scan()
         # 清空注册表
         self._tools.clear()

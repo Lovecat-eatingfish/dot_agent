@@ -10,6 +10,8 @@ The system implements a dual-loop architecture:
 - **Outer loop**: WorkflowGraph orchestrates phases (plan → code → validate)
 - **Inner loop**: Agent loop handles LLM streaming + tool execution
 
+**Key Differentiator**: Includes an evaluation framework (evals/) for automated testing of agent behaviors across different adapters.
+
 ## Quick Commands
 
 ### Installation & Setup
@@ -49,6 +51,9 @@ python -m dot.kg serve         # Knowledge-graph RAG server (port 8001)
 
 # Run specific test
 .venv/Scripts/python.exe -m pytest tests/test_workflow_engine.py::test_duplicate_node_rejected -v
+
+# Run evaluation framework (requires test tasks in evals/tasks/)
+.venv/Scripts/python.exe -m pytest evals/ -v
 ```
 
 **Environment**: Windows + Git Bash. The TUI is textual and has had mouse-rendering conflicts—test TUI changes in a real terminal, not WSL.
@@ -101,16 +106,34 @@ dot.workflow ────────────────────┘
 3. Pattern rules (plan/edit/auto modes)
 - Decision states: ALLOW / ASK / DENY (ASK auto-degrades to DENY without UI)
 
-**5. Context Compression** (3-tier)
+**5. File Change Review System** (Recent addition)
+- **Pre-execution approval**: ASK mode shows unified diff preview before write/edit operations
+- **Post-execution review**: AUTO mode writes immediately but registers in ChangeLedger for later review
+- **Review panel**: TUI shows blocking panel at turn end when pending changes exist (↑/↓ navigate, d=diff, a/r=single, A/R=all, Esc=skip)
+- **Rollback support**: Undo stack with SessionGit fallback; agent receives `<system-reminder>` after revert
+- **Persistence**: Review ledger persists to `review-ledger.json` with content snapshots
+- **WebUI bridge**: `python -m dot.coding.webui` for HTTP-based approval workflow
+- Tests: `test_review_e2e.py`, `test_change_ledger.py`, `test_review_persistence.py`
+
+**6. Context Compression** (3-tier)
 - L1 (≥50%): Remove recoverable tool results (read_file), keep paths (no LLM)
 - L2 (≥70%): Delete old tool calls (bash/grep output) (no LLM)
 - L3 (≥85%): LLM generates structured summary (requires LLM)
 
-**6. RAG Module** (optional, uses langchain exception)
-- Parent-child chunking strategy
-- Hybrid retrieval (vector + BM25 + RRF fusion)
-- See `docs/RAG_MODULE_GUIDE.md` for complete details
-- Backends: ChromaDB (vectors) + JSON files (parent text)
+**7. Evaluation Framework** (`evals/`)
+- Generic agent evaluation system with pluggable adapters
+- Adapter protocol: `run(task, workspace) → RunResult` + `collect_trajectory → Trajectory`
+- Supports dot_agent, Claude Code, aider, or any CLI agent
+- Automated verification with `verify.py` scripts per task
+- Metrics: turns, LLM calls, tool calls, tokens, retries, workspace escape detection
+- Judge: Optional 5-dimension LLM scoring (functional, safety, efficiency, style, recovery)
+- Test files: `test_eval_framework.py`, `test_eval_metrics.py`
+
+**8. RAG Module** (`dot.rag`, `dot.kg` — optional services, the langchain exception)
+- `dot.rag`: FastAPI + ChromaDB server; parent-child chunking, hybrid retrieval (vector + BM25 + RRF fusion)
+- `dot.kg`: Knowledge-graph RAG server (port 8001, `python -m dot.kg serve`)
+- See `docs/RAG_MODULE_GUIDE.md` and `src/dot/rag/README.md` for complete details
+- Note: only `dot.rag`/`dot.kg` may use langchain; the rest of the codebase must not
 
 ## Critical Rules & Gotchas
 
@@ -124,6 +147,8 @@ dot.workflow ────────────────────┘
 - `tests/conftest.py` puts `src/` first on `sys.path` (don't bypass this)
 - `tests/mcp_server.py` is a fixture server, NOT a test file
 - `tests/conftest.py` deletes `RAG_API_TOKEN` from env (don't re-add it in tests)
+- Test naming convention: `test_<feature>.py` with descriptive function names
+- Use fixtures from `conftest.py` for common setup (e.g., sample workspace, mock providers)
 
 ### Environment Configuration
 - Config file is `.env` (copy from `.env_example`)
@@ -142,6 +167,20 @@ dot.workflow ────────────────────┘
 - Uses Textual library
 - Has had mouse-rendering conflicts in the past
 - Test in a real terminal, not WSL or VS Code integrated terminal
+
+### Extension System
+- Extensions register via `setup(ext, ctx)` entry point
+- `ExtensionContext` provides workspace, host, logger, config
+- Hooks: `before_tool_call`, `after_tool_call`, `agent_start/end`, `turn_start/end`, etc.
+- Fail-closed by default: hook exceptions block execution unless explicitly handled
+- Generation liveness token: `/reload` creates new generation, old references invalidate immediately
+- Location: `src/dot/coding/extensions/` (api.py, runtime.py, loader.py, builtins/mcp/)
+
+### Session & Trace Data
+- Sessions stored in `.dot/sessions/<session_id>/` as JSONL
+- Traces collected via `TraceCollector` and exported as JSONL
+- Change ledger persists to `.dot/review-ledger.json` for review operations
+- Don't commit `.dot/` directory (runtime data)
 
 ### File Organization
 - `src/dot/` - Main Python package
@@ -173,6 +212,7 @@ dot.workflow ────────────────────┘
 11. `doc/trace-design.md` - Tracing system design
 12. `doc/extension-design.md` - Extension system design
 13. `doc/eval-design.md` - Evaluation framework design (new)
+14. `evals/README.md` - Evaluation framework guide
 
 ## Package Structure
 

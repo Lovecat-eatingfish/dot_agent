@@ -70,11 +70,11 @@ class CodingHost:
         self.catalog = ProviderCatalog.load()
         self.provider = OpenAIProvider()
 
-        # 权限管理
+        # 权限管理： 从文件加载bash的禁止的命令 + 进制阅读的文件的文件路径
         self.permission = get_permission_manager()
         self.permission.load_project(self.workspace)
 
-        # 扩展运行时
+        # 扩展运行时： 加载 扩展模块 直接执行setUp函数传递 参数：_RuntimeAPI 把 tool，command，prompt，hook都加载导 _RuntimeAPI 里面去
         self.extensions = ExtensionRuntime(
             workspace=self.workspace,
             extra_dirs=extra_extension_dirs,
@@ -82,6 +82,8 @@ class CodingHost:
         self.extensions.set_runtime_dep("host", self)
         self.extensions.load()
         self._ext_command_names: set[str] = set()
+
+        # 加载 command
         self._sync_extension_commands()
 
         # 会话管理（保存在 workspace 下，不污染用户主目录）
